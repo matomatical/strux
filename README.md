@@ -17,6 +17,8 @@ import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Float, PRNGKeyArray
 
+from typing import Self
+
 import strux
 
 @strux.struct

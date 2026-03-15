@@ -35,9 +35,13 @@ def struct(Class, static_fieldnames=()):
         meta_fields=meta_fields,
     )
     
-    # overwrite string render methods to use custom pretty printing.
-    Dataclass.__str__ = to_str
-    Dataclass.__format__ = format
+    # overwrite string render methods to use pretty printing
+    if "__repr__" not in Class.__dict__:
+        Dataclass.__repr__ = to_str
+    if "__str__" not in Class.__dict__:
+        Dataclass.__str__ = to_str
+    if "__format__" not in Class.__dict__:
+        Dataclass.__format__ = format_tree
     
     # add some other convenience methods
     Dataclass.replace = dataclasses.replace
@@ -81,7 +85,7 @@ def to_str(
                 _put(f"{prefix}{type(tree).__name__}(...){suffix}", depth=depth)
             else:
                 _put(f"{prefix}{type(tree).__name__}(", depth=depth)
-                state = tree.__getstate__() or {}
+                state = vars(tree)
                 for field, value in state.items():
                     _walk(value, prefix=f"{field}=", suffix=",", depth=depth+1)
                 _put(f"){suffix}", depth=depth)
@@ -111,7 +115,7 @@ def to_str(
                 _put(f"}}{suffix}", depth=depth)
         elif isinstance(tree, np.ndarray):
             dtype = tree.dtype.name
-            shape = str(tree.shape).strip("()").replace(",","")
+            shape = str(tree.shape).strip("(,)").replace(" ","")
             _put(f"{prefix}np.{dtype}[{shape}]{suffix}", depth=depth)
         elif isinstance(tree, jnp.ndarray):
             dtype = tree.dtype.name
@@ -129,7 +133,7 @@ def to_str(
     return "\n".join(lines)
 
 
-def format(tree, format_spec: str) -> str:
+def format_tree(tree, format_spec: str) -> str:
     """
     A version of `to_str` for use with format strings. `format_spec` should be
     a string in one of the following formats:
@@ -152,8 +156,8 @@ def format(tree, format_spec: str) -> str:
         else:
             max_depth = int(format_spec)
             indent_size = 2
-    except:
-        print(f"Invalid format specifier for struct: {format_spec}")
+    except (ValueError, TypeError):
+        raise ValueError(f"Invalid format specifier for struct: {format_spec!r}")
     # render tree
     return to_str(
         tree,
