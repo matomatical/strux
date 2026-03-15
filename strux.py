@@ -194,6 +194,15 @@ def to_str(
                 for field, value in state.items():
                     _walk(value, prefix=f"{field}=", suffix=",", depth=depth+1)
                 _put(f"){suffix}", depth=depth)
+        elif isinstance(tree, tuple) and hasattr(tree, '_fields'):
+            # namedtuple
+            if depth == max_depth:
+                _put(f"{prefix}{type(tree).__name__}(...){suffix}", depth=depth)
+            else:
+                _put(f"{prefix}{type(tree).__name__}(", depth=depth)
+                for field, value in zip(tree._fields, tree):
+                    _walk(value, prefix=f"{field}=", suffix=",", depth=depth+1)
+                _put(f"){suffix}", depth=depth)
         elif isinstance(tree, tuple):
             if depth == max_depth:
                 _put(f"{prefix}(...){suffix}", depth=depth)
@@ -227,8 +236,12 @@ def to_str(
             shape = str(tree.shape).strip("(,)").replace(" ","")
             _put(f"{prefix}jnp.{dtype}[{shape}]{suffix}", depth=depth)
         elif callable(tree):
-            _put(f"{prefix}<fn:{tree.__name__}>{suffix}", depth=depth)
-        elif isinstance(tree, (bool, int, float, str)):
+            name = getattr(tree, '__name__', None)
+            if name is not None:
+                _put(f"{prefix}<fn:{name}>{suffix}", depth=depth)
+            else:
+                _put(f"{prefix}{repr(tree)}{suffix}", depth=depth)
+        elif isinstance(tree, (bool, int, float, complex, str)):
             _put(f"{prefix}{type(tree).__name__}({tree!r}){suffix}", depth=depth)
         elif tree is None:
             _put(f"{prefix}None{suffix}", depth=depth)
