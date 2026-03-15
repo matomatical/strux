@@ -56,7 +56,8 @@ def struct(Class=None, *, static_fieldnames: typing.Sequence[str] = ()):
     
     # add some other convenience methods
     Dataclass.replace = dataclasses.replace
-    Dataclass.size = property(tree_size)
+    if "size" not in fields:
+        Dataclass.size = property(tree_size)
 
     # allow type subscripting for annotating batched/vmapped pytrees,
     Dataclass._is_strux_struct = True
