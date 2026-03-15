@@ -1,11 +1,13 @@
 import dataclasses
+import functools
+import typing
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
 
-def struct(Class, static_fieldnames=()):
+def struct(Class, static_fieldnames: typing.Sequence[str] = ()):
     """
     Transform a class into an immutable dataclass that is also registered as a
     JAX PyTree. Intended to be used as a wrapper, as in:
@@ -27,6 +29,8 @@ def struct(Class, static_fieldnames=()):
     missing_fields = set(static_fieldnames) - set(meta_fields)
     if missing_fields:
         raise ValueError(f"Invalid static_fieldnames {missing_fields}")
+    Dataclass._data_fields = data_fields
+    Dataclass._meta_fields = meta_fields
     
     # register dataclass as a JAX pytree node
     jax.tree_util.register_dataclass(
@@ -41,16 +45,84 @@ def struct(Class, static_fieldnames=()):
     if "__str__" not in Class.__dict__:
         Dataclass.__str__ = to_str
     if "__format__" not in Class.__dict__:
-        Dataclass.__format__ = format_tree
+        Dataclass.__format__ = tree_format
     
     # add some other convenience methods
     Dataclass.replace = dataclasses.replace
-    Dataclass.size = property(lambda self: size(self))
+    Dataclass.size = property(tree_size)
 
-    # allow type indexing
-    # TODO: make this work properly with jaxtyping
-    Dataclass.__class_getitem__ = classmethod(lambda cls, _: cls)
+    # allow type subscripting for annotating batched/vmapped pytrees,
+    Dataclass._is_strux_struct = True
+    Dataclass.__class_getitem__ = classmethod(_make_struct_annotation)
+    
+    # done!
     return Dataclass
+
+
+@functools.lru_cache(maxsize=None)
+def _make_struct_annotation(struct_cls, dims):
+    """
+    Create a type annotation representing a batched/vmapped struct.
+
+    For example, given:
+
+        @strux.struct
+        class Env:
+            pos: Int[Array, "2"]
+            walls: Bool[Array, "h w"]
+
+    Then Env["batch"] produces a type where isinstance checks verify as if it
+    were defined:
+
+        @strux.struct
+        class Envs:
+            pos: Int[Array, "batch 2"]
+            walls: Bool[Array, "batch h w"]
+    """
+    hints = typing.get_type_hints(struct_cls, include_extras=True)
+    expanded = {}
+    for name, hint in hints.items():
+        # don't propagate dims to meta fields
+        if name in struct_cls._meta_fields:
+            continue
+        # propagate dims to jaxtype and struct fields
+        is_jaxtype = (
+            isinstance(hint, type)
+            and hasattr(hint, 'dtype')
+            and hasattr(hint, 'array_type')
+            and hasattr(hint, 'dim_str')
+        )
+        is_struct = getattr(hint, '_is_strux_struct', False)
+        if is_jaxtype:
+            new_dims = f"{dims} {hint.dim_str}".strip()
+            expanded[name] = hint.dtype[hint.array_type, new_dims]
+        elif is_struct:
+            expanded[name] = hint[dims]
+        # unclear how to propagate otherwise
+        else:
+            raise TypeError(
+                f"Cannot batch data field '{name}' of {struct_cls.__name__}: "
+                f"type {hint} is not a jaxtyping annotation or strux struct"
+            )
+    return _StructAnnotationMeta(
+        f'{struct_cls.__name__}["{dims}"]',
+        (),
+        {
+            '_struct_type': struct_cls,
+            '_field_hints': expanded,
+        },
+    )
+
+
+class _StructAnnotationMeta(type):
+    """Metaclass for batched struct type annotations with isinstance support."""
+    def __instancecheck__(cls, instance):
+        if not isinstance(instance, cls._struct_type):
+            return False
+        for field_name, expected_type in cls._field_hints.items():
+            if not isinstance(getattr(instance, field_name), expected_type):
+                return False
+        return True
 
 
 def to_str(
@@ -133,7 +205,7 @@ def to_str(
     return "\n".join(lines)
 
 
-def format_tree(tree, format_spec: str) -> str:
+def tree_format(tree, format_spec: str) -> str:
     """
     A version of `to_str` for use with format strings. `format_spec` should be
     a string in one of the following formats:
@@ -166,6 +238,6 @@ def format_tree(tree, format_spec: str) -> str:
     )
 
 
-def size(tree) -> int:
+def tree_size(tree) -> int:
     """Calculates the total number of parameters in the PyTree."""
     return sum(jnp.size(x) for x in jax.tree.leaves(tree))

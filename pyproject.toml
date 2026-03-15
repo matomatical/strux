@@ -18,6 +18,13 @@ dependencies = [
     "jax",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "jaxtyping",
+    "pytest",
+    "beartype",
+]
+
 [project.urls]
 Homepage = "https://github.com/matomatical/strux"
 Issues = "https://github.com/matomatical/strux/issues"
