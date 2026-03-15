@@ -120,10 +120,23 @@ def _make_struct_annotation(struct_cls, dims):
             expanded[name] = hint[dims]
         # unclear how to propagate otherwise
         else:
-            raise TypeError(
+            _scalar_hints = {
+                float: 'Float[Array, ""]',
+                int: 'Int[Array, ""]',
+                bool: 'Bool[Array, ""]',
+                complex: 'Complex[Array, ""]',
+            }
+            msg = (
                 f"Cannot batch data field '{name}' of {struct_cls.__name__}: "
                 f"type {hint} is not a jaxtyping annotation or strux struct"
             )
+            if hint in _scalar_hints:
+                msg += (
+                    f". If '{name}' is a scalar array, consider "
+                    f"annotating it as {_scalar_hints[hint]} instead of "
+                    f"{hint.__name__}"
+                )
+            raise TypeError(msg)
     return _StructAnnotationMeta(
         f'{struct_cls.__name__}["{dims}"]',
         (),

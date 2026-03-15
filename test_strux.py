@@ -133,6 +133,15 @@ class TestAnnotationExpansion:
         with pytest.raises(TypeError, match="Cannot batch data field 'name'"):
             Bad["batch"]
 
+    def test_scalar_type_hint_in_error(self):
+        @strux.struct
+        class Bad:
+            pos: Int[Array, "2"]
+            loss: float
+
+        with pytest.raises(TypeError, match='Float\\[Array, ""\\]'):
+            Bad["batch"]
+
     def test_scalar_fields_no_trailing_space(self):
         # Float[Array, ""] is a scalar; batching should give "batch", not "batch "
         ann = Point["batch"]
