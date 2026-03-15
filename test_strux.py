@@ -28,7 +28,7 @@ class World:
     score: Float[Array, ""]
 
 
-@lambda cls: strux.struct(cls, static_fieldnames=("name",))
+@strux.struct(static_fieldnames=("name",))
 class WithMeta:
     pos: Int[Array, "2"]
     name: str

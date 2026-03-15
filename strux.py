@@ -7,18 +7,25 @@ import jax.numpy as jnp
 import numpy as np
 
 
-def struct(Class, static_fieldnames: typing.Sequence[str] = ()):
+def struct(Class=None, *, static_fieldnames: typing.Sequence[str] = ()):
     """
     Transform a class into an immutable dataclass that is also registered as a
-    JAX PyTree. Intended to be used as a wrapper, as in:
+    JAX PyTree. Can be used as a bare decorator or with keyword arguments:
 
     ```
     @strux.struct
     class MyDataClass:
         field1: int
         # etc.
+
+    @strux.struct(static_fieldnames=("label",))
+    class MyOtherDataClass:
+        field1: int
+        label: str
     ```
     """
+    if Class is None:
+        return functools.partial(struct, static_fieldnames=static_fieldnames)
     # wrap class as an immutable Python dataclass
     Dataclass = dataclasses.dataclass(Class, frozen=True)
 
