@@ -1,3 +1,5 @@
+import warnings
+
 import jax
 import jax.numpy as jnp
 import pytest
@@ -32,6 +34,52 @@ class World:
 class WithMeta:
     pos: Int[Array, "2"]
     name: str
+
+
+# --- Field name collision guards ---
+
+class TestFieldCollisions:
+    def test_size_field_warns(self):
+        with pytest.warns(UserWarning, match="field named 'size'"):
+            @strux.struct
+            class HasSize:
+                size: int
+                x: float
+
+    def test_size_field_still_works(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            @strux.struct
+            class HasSize:
+                size: int
+                x: float
+        obj = HasSize(size=3, x=1.0)
+        assert obj.size == 3
+
+    def test_replace_field_warns(self):
+        with pytest.warns(UserWarning, match="field named 'replace'"):
+            @strux.struct
+            class HasReplace:
+                replace: int
+                x: float
+
+    def test_replace_field_still_works(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            @strux.struct
+            class HasReplace:
+                replace: int
+                x: float
+        obj = HasReplace(replace=42, x=1.0)
+        assert obj.replace == 42
+
+    def test_no_warning_without_collision(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            @strux.struct
+            class Normal:
+                x: float
+                y: float
 
 
 # --- Annotation expansion (static behaviour) ---

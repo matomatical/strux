@@ -1,6 +1,7 @@
 import dataclasses
 import functools
 import typing
+import warnings
 
 import jax
 import jax.numpy as jnp
@@ -55,9 +56,20 @@ def struct(Class=None, *, static_fieldnames: typing.Sequence[str] = ()):
         Dataclass.__format__ = tree_format
     
     # add some other convenience methods
-    Dataclass.replace = dataclasses.replace
+    if "replace" not in fields:
+        Dataclass.replace = dataclasses.replace
+    else:
+        warnings.warn(
+            f"{Class.__name__} has a field named 'replace', so the "
+            f"convenience method .replace() will not be available",
+        )
     if "size" not in fields:
         Dataclass.size = property(tree_size)
+    else:
+        warnings.warn(
+            f"{Class.__name__} has a field named 'size', so the "
+            f"convenience property .size will not be available",
+        )
 
     # allow type subscripting for annotating batched/vmapped pytrees,
     Dataclass._is_strux_struct = True
