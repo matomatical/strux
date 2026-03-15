@@ -269,3 +269,26 @@ envs = checked_step(envs, actions)
 # this would fail: actions has wrong batch size
 # checked_step(envs, jnp.array([1, 2]))  # beartype raises!
 ```
+
+Roadmap
+-------
+
+Basics:
+
+- [x] Frozen dataclass + JAX pytree registration via `@strux.struct` wrapper
+- [x] Pretty printing with shape/dtype summaries for arrays
+- [x] Static field support via `static_fieldnames`
+- [x] Decorator syntax with keyword arguments (`@strux.struct(...)`)
+- [x] Annotation-only batched type subscripting (`MyStruct["batch"]`)
+
+Advanced features:
+
+- [x] `isinstance` support and integrate with jaxtyping + beartype
+- [ ] Pretty print registered pytree classes that aren't dataclasses
+- [ ] Save/load structs to/from disk (e.g. serialisation with pytree structure)
+
+Project:
+
+- [x] Test suite (59 tests)
+- [ ] Documentation
+- [ ] List on PyPI
