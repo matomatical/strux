@@ -88,7 +88,7 @@ class AffineTransform:
     ) -> Float[Array, "num_outputs"]:
         return x @ self.weights + self.biases
 
-key = jax.random.key(seed=42)
+key = jax.random.key(seed=0)
 net = AffineTransform.init(key=key, num_inputs=10, num_outputs=1)
 print(net)
 out = net.forward(jnp.ones(10))
@@ -129,7 +129,7 @@ class MLP:
     @jax.jit(static_argnames=("features", "hidden", "outputs", "activate"))
     def init(
         key: PRNGKeyArray,
-	features: int,
+        features: int,
         hidden: int,
         outputs: int,
         activate: Callable = jax.nn.relu,
@@ -176,23 +176,26 @@ each (non-static) field's jaxtyping annotation.
 ```python
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Int, Bool  # pip install jaxtyping
+from jaxtyping import Array, Int, Bool, PRNGKeyArray  # pip install jaxtyping
 from typing import Self  # python 3.11+
 import strux
 
-@strux.struct(static_fieldnames=("size",))
+@strux.struct
 class GridWorld:
     hero_pos: Int[Array, "2"]
     walls: Bool[Array, "size size"]
-    size: int
+
+    @property
+    def size(self: Self) -> int:
+        return self.walls.shape[0]
 
     @staticmethod
     @jax.jit
-    def init(key, size: int = 5) -> Self:
+    def init(key: PRNGKeyArray, size: int = 5) -> Self:
         walls = jax.random.bernoulli(key, 0.3, (size, size))
         hero_pos = jnp.array([0, 0])
         walls = walls.at[0, 0].set(False)
-        return GridWorld(hero_pos=hero_pos, walls=walls, size=size)
+        return GridWorld(hero_pos=hero_pos, walls=walls)
 
     @jax.jit
     def step(self: Self, action: Int[Array, ""]) -> Self:
@@ -218,7 +221,6 @@ print(envs.hero_pos)
 # GridWorld["batch"] expands each field's annotation:
 #   hero_pos: Int[Array, "batch 2"]
 #   walls:    Bool[Array, "batch size size"]
-# (static fields like 'size' are not affected)
 def batched_step(
     envs: GridWorld["batch"],
     actions: Int[Array, "batch"],
