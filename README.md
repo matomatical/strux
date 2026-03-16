@@ -1,7 +1,7 @@
 strux
 =====
 
-A rough JAX utility library for easily creating jit-able dataclasses.
+A JAX utility library for easily creating jit-able dataclasses.
 
 Installation
 ------------
@@ -17,8 +17,9 @@ Dependencies: `numpy`, `jax`.
 Basic usage
 -----------
 
-A strux struct is a frozen dataclass registered as a JAX pytree, so it works
-with `jax.jit`, `jax.vmap`, `jax.tree.map`, and friends:
+At the most basic level a strux struct is just a frozen dataclass registered as
+a JAX pytree. It works with `jax.jit`, `jax.vmap`, `jax.tree.map`, and friends,
+and supports pretty printing by default.
 
 ```python
 import jax
@@ -46,11 +47,12 @@ Point(
 )
 ```
 
-Neural network example
-----------------------
+Modules with methods
+--------------------
 
-Structs can hold arrays and define jit-compiled methods. You can use this to
-define neural network modules, for example.
+Structs can hold arrays and define jit-compiled methods. Among other things,
+you can use this to define neural network modules. For example, here is a
+simple biased linear transformation layer module.
 
 ```python
 import jax
@@ -88,9 +90,12 @@ class AffineTransform:
     ) -> Float[Array, "num_outputs"]:
         return x @ self.weights + self.biases
 
-key = jax.random.key(seed=0)
+# initialisation
+key = jax.random.key(seed=42)
 net = AffineTransform.init(key=key, num_inputs=10, num_outputs=1)
 print(net)
+
+# inference
 out = net.forward(jnp.ones(10))
 print(out)
 ```
@@ -104,12 +109,18 @@ AffineTransform(
 [0.47424078]
 ```
 
-Static fields
--------------
+Submodules and static fields
+----------------------------
 
-Use `static_fieldnames` for fields that shouldn't be traced through by JAX
-(e.g. configuration, activation functions). These fields are excluded from
-`jax.vmap`, `jax.tree.map`, etc.:
+Structs can be nested arbitrarily, allowing one to easily implement complex
+neural networks (among other things). For example, here is a multi-layer
+perceptron module that combines two of the previous AffineTransform modules.
+
+You can use the `static_fieldnames` flag for fields that shouldn't be traced
+by JAX (e.g. configuration, shapes, activation functions). These fields are
+excluded from `jax.jit` and `jax.tree.map` (unlike equinox, no need for
+filters). In the below example we use this to make the activation function of
+the MLP configurable.
 
 ```python
 import jax
@@ -169,9 +180,17 @@ MLP(
 Vmapping and batch annotations
 ------------------------------
 
-Structs work naturally with `jax.vmap`. You can annotate batched structs using
-type subscripting, e.g. `GridWorld["batch"]`, which prepends the dimension to
-each (non-static) field's jaxtyping annotation.
+Structs work naturally with vectorisation and `jax.vmap`, for example for
+batches of data, parameters, or anything else. You can define your struct for
+the individual elements of the batch, and then annotate batched structs using
+type subscripting (e.g. `Image["batch_size"]`). The result is a new struct type
+with the batch dimension(s) prepended to each (non-static) field's jaxtyping
+annotation.
+
+We could use this to implement a data batch or a neural network ensemble, or
+even depth-wise batches of layer parameters for use as inputs to
+`jax.lax.scan`.  Here we give an example of a batched gridworld for collecting
+parallel rollouts.
 
 ```python
 import jax
@@ -185,10 +204,6 @@ class GridWorld:
     hero_pos: Int[Array, "2"]
     walls: Bool[Array, "size size"]
 
-    @property
-    def size(self: Self) -> int:
-        return self.walls.shape[0]
-
     @staticmethod
     @jax.jit
     def init(key: PRNGKeyArray, size: int = 5) -> Self:
@@ -200,7 +215,7 @@ class GridWorld:
     @jax.jit
     def step(self: Self, action: Int[Array, ""]) -> Self:
         deltas = jnp.array([[0,0], [-1,0], [0,-1], [1,0], [0,1]])
-        new_pos = jnp.clip(self.hero_pos + deltas[action], 0, self.size - 1)
+        new_pos = jnp.clip(self.hero_pos + deltas[action], 0, self.walls.shape[0] - 1)
         blocked = self.walls[new_pos[0], new_pos[1]]
         new_pos = jnp.where(blocked, self.hero_pos, new_pos)
         return self.replace(hero_pos=new_pos)
@@ -250,9 +265,9 @@ hero positions after step:
 Runtime type checking
 ---------------------
 
-The batch annotations also work with jaxtyping's runtime type checking.
-Combined with a typechecker like beartype, shape and dtype mismatches are
-caught at function boundaries:
+Strux works together with jaxtyping's runtime type checking. For example,
+if you combine it with a typechecker like beartype, shape and dtype mismatches
+are caught at function boundaries.
 
 ```python
 from jaxtyping import jaxtyped  # pip install jaxtyping
@@ -266,7 +281,7 @@ def checked_step(
     return jax.vmap(GridWorld.step)(envs, actions)
 
 # this passes: shapes and dtypes are consistent
-envs = checked_step(envs, actions)
+envs = checked_step(envs, actions) # envs, actions from previous example
 
 # this would fail: actions has wrong batch size
 # checked_step(envs, jnp.array([1, 2]))  # beartype raises!
