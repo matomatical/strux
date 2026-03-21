@@ -14,6 +14,12 @@ import strux
 
 
 @strux.struct
+class Point:
+    x: Float[Array, ""]
+    y: Float[Array, ""]
+
+
+@strux.struct
 class Environment:
     hero_pos: Int[Array, "2"]
     goal_pos: Int[Array, "2"]
@@ -361,10 +367,6 @@ class TestAnnotationExpansion:
 
     def test_scalar_fields_no_trailing_space(self):
         # Float[Array, ""] is a scalar; batching should give "batch", not "batch "
-        @strux.struct
-        class Point:
-            x: Float[Array, ""]
-            y: Float[Array, ""]
         ann = Point["batch"]
         assert ann._field_hints["x"].dim_str == "batch"
         assert ann._field_hints["y"].dim_str == "batch"
@@ -471,10 +473,6 @@ class TestInstanceCheck:
         assert isinstance(obj, WithMeta["batch"])
 
     def test_scalar_struct_batched(self):
-        @strux.struct
-        class Point:
-            x: Float[Array, ""]
-            y: Float[Array, ""]
         point = Point(
             x=jnp.array([1.0, 2.0, 3.0]),
             y=jnp.array([4.0, 5.0, 6.0]),
@@ -544,4 +542,140 @@ class TestJaxtypedIntegration:
         with pytest.raises(Exception):
             step(env)
 
+
+# # #
+# Batch shape
+
+
+class TestShape:
+    def test_unbatched(self):
+        env = Environment(
+            hero_pos=jnp.array([1, 2], dtype=jnp.int32),
+            goal_pos=jnp.array([3, 4], dtype=jnp.int32),
+            walls=jnp.zeros((5, 5), dtype=bool),
+        )
+        assert env.shape == ()
+
+    def test_single_batch_dim(self):
+        env = Environment(
+            hero_pos=jnp.ones((4, 2), dtype=jnp.int32),
+            goal_pos=jnp.ones((4, 2), dtype=jnp.int32),
+            walls=jnp.zeros((4, 5, 5), dtype=bool),
+        )
+        assert env.shape == (4,)
+
+    def test_multi_batch_dims(self):
+        env = Environment(
+            hero_pos=jnp.ones((4, 3, 2), dtype=jnp.int32),
+            goal_pos=jnp.ones((4, 3, 2), dtype=jnp.int32),
+            walls=jnp.zeros((4, 3, 5, 5), dtype=bool),
+        )
+        assert env.shape == (4, 3)
+
+    def test_scalar_fields(self):
+        p = Point(x=jnp.array([1.0, 2.0]), y=jnp.array([3.0, 4.0]))
+        assert p.shape == (2,)
+
+    def test_nested_struct(self):
+        world = World(
+            env=Environment(
+                hero_pos=jnp.ones((4, 2), dtype=jnp.int32),
+                goal_pos=jnp.ones((4, 2), dtype=jnp.int32),
+                walls=jnp.zeros((4, 5, 5), dtype=bool),
+            ),
+            score=jnp.array([1.0, 2.0, 3.0, 4.0]),
+        )
+        assert world.shape == (4,)
+
+    def test_inconsistent_batch_raises(self):
+        env = Environment(
+            hero_pos=jnp.ones((3, 2), dtype=jnp.int32),
+            goal_pos=jnp.ones((4, 2), dtype=jnp.int32),
+            walls=jnp.zeros((3, 5, 5), dtype=bool),
+        )
+        with pytest.raises(ValueError, match="Inconsistent batch shapes"):
+            env.shape
+
+    def test_shape_field_collision_warns(self):
+        with pytest.warns(UserWarning, match="field named 'shape'"):
+            @strux.struct
+            class HasShape:
+                shape: int
+                x: float
+
+
+# # #
+# Indexing
+
+
+class TestGetitem:
+    def test_integer_index(self):
+        env = Environment(
+            hero_pos=jnp.ones((4, 2), dtype=jnp.int32),
+            goal_pos=jnp.ones((4, 2), dtype=jnp.int32),
+            walls=jnp.zeros((4, 5, 5), dtype=bool),
+        )
+        e = env[0]
+        assert isinstance(e, Environment)
+        assert e.hero_pos.shape == (2,)
+        assert e.walls.shape == (5, 5)
+
+    def test_slice(self):
+        env = Environment(
+            hero_pos=jnp.ones((4, 2), dtype=jnp.int32),
+            goal_pos=jnp.ones((4, 2), dtype=jnp.int32),
+            walls=jnp.zeros((4, 5, 5), dtype=bool),
+        )
+        e = env[1:3]
+        assert isinstance(e, Environment)
+        assert e.hero_pos.shape == (2, 2)
+        assert e.walls.shape == (2, 5, 5)
+
+    def test_multi_batch_index(self):
+        env = Environment(
+            hero_pos=jnp.ones((4, 3, 2), dtype=jnp.int32),
+            goal_pos=jnp.ones((4, 3, 2), dtype=jnp.int32),
+            walls=jnp.zeros((4, 3, 5, 5), dtype=bool),
+        )
+        e = env[0]
+        assert e.hero_pos.shape == (3, 2)
+        assert e.walls.shape == (3, 5, 5)
+        e2 = env[0, 1]
+        assert e2.hero_pos.shape == (2,)
+        assert e2.walls.shape == (5, 5)
+
+    def test_advanced_indexing(self):
+        env = Environment(
+            hero_pos=jnp.ones((4, 2), dtype=jnp.int32),
+            goal_pos=jnp.ones((4, 2), dtype=jnp.int32),
+            walls=jnp.zeros((4, 5, 5), dtype=bool),
+        )
+        e = env[jnp.array([0, 2])]
+        assert e.hero_pos.shape == (2, 2)
+        assert e.walls.shape == (2, 5, 5)
+
+    def test_nested_struct_index(self):
+        world = World(
+            env=Environment(
+                hero_pos=jnp.ones((4, 2), dtype=jnp.int32),
+                goal_pos=jnp.ones((4, 2), dtype=jnp.int32),
+                walls=jnp.zeros((4, 5, 5), dtype=bool),
+            ),
+            score=jnp.array([1.0, 2.0, 3.0, 4.0]),
+        )
+        w = world[0]
+        assert isinstance(w, World)
+        assert isinstance(w.env, Environment)
+        assert w.env.hero_pos.shape == (2,)
+        assert w.score.shape == ()
+
+    def test_index_preserves_values(self):
+        env = Environment(
+            hero_pos=jnp.array([[10, 20], [30, 40]], dtype=jnp.int32),
+            goal_pos=jnp.array([[50, 60], [70, 80]], dtype=jnp.int32),
+            walls=jnp.zeros((2, 5, 5), dtype=bool),
+        )
+        e = env[1]
+        assert jnp.array_equal(e.hero_pos, jnp.array([30, 40]))
+        assert jnp.array_equal(e.goal_pos, jnp.array([70, 80]))
 

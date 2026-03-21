@@ -68,6 +68,14 @@ def struct(Class=None, *, static_fieldnames: typing.Sequence[str] = ()):
             f"{Class.__name__} has a field named 'size', so the "
             f"convenience property .size will not be available",
         )
+    if "shape" not in fields:
+        Dataclass.shape = property(tree_shape)
+    else:
+        warnings.warn(
+            f"{Class.__name__} has a field named 'shape', so the "
+            f"convenience property .shape will not be available",
+        )
+    Dataclass.__getitem__ = tree_getitem
 
     # allow type subscripting for annotating batched/vmapped pytrees,
     Dataclass._is_strux_struct = True
@@ -280,6 +288,50 @@ def tree_format(tree, format_spec: str) -> str:
         indent=" " * indent_size,
         max_depth=max_depth,
     )
+
+
+def tree_shape(tree) -> tuple[int, ...]:
+    """
+    Return the batch shape of a struct, i.e. the leading dimensions beyond
+    each field's base annotation.
+
+    Uses type hints to determine how many trailing dimensions belong to each
+    field's base type, and returns the remaining leading (batch) dimensions.
+    All data fields must agree on the batch shape.
+    """
+    cls = type(tree)
+    hints = typing.get_type_hints(cls, include_extras=True)
+    batch_shape = None
+    for name in cls._data_fields:
+        hint = hints[name]
+        val = getattr(tree, name)
+        is_jaxtype = (
+            isinstance(hint, type)
+            and hasattr(hint, 'dtype')
+            and hasattr(hint, 'array_type')
+            and hasattr(hint, 'dim_str')
+        )
+        is_struct = getattr(hint, '_is_strux_struct', False)
+        if is_jaxtype:
+            base_ndim = len(hint.dim_str.split()) if hint.dim_str else 0
+            bs = val.shape[:val.ndim - base_ndim] if base_ndim > 0 else val.shape
+        elif is_struct:
+            bs = val.shape
+        else:
+            continue
+        if batch_shape is None:
+            batch_shape = bs
+        elif bs != batch_shape:
+            raise ValueError(
+                f"Inconsistent batch shapes in {cls.__name__}: "
+                f"field '{name}' has batch shape {bs}, expected {batch_shape}"
+            )
+    return batch_shape if batch_shape is not None else ()
+
+
+def tree_getitem(tree, index):
+    """Index into the batch dimensions of a struct."""
+    return jax.tree.map(lambda x: x[index], tree)
 
 
 def tree_size(tree) -> int:
