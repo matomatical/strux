@@ -22,6 +22,7 @@ dependencies = [
 dev = [
     "jaxtyping",
     "pytest",
+    "pytest-codeblocks",
     "beartype",
 ]
 
@@ -37,4 +38,8 @@ build-backend = "flit_core.buildapi"
 name = "strux"
 
 [tool.pytest.ini_options]
-testpaths = ["tests.py"]
+testpaths = [
+    "tests.py",
+    "README.md",
+]
+addopts = ["--codeblocks"]

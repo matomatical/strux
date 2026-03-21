@@ -76,7 +76,7 @@ class AffineTransform:
         key: PRNGKeyArray,
         num_inputs: int,
         num_outputs: int,
-    ) -> AffineTransform:
+    ) -> Self:
         bound = jax.lax.rsqrt(jnp.float32(num_inputs))
         weights=jax.random.uniform(
             key=key,
@@ -125,6 +125,7 @@ excluded from `jax.jit` and `jax.tree.map` (unlike equinox, no need for
 filters). In the below example we use this to make the activation function of
 the MLP configurable.
 
+<!--pytest-codeblocks:cont-->
 ```python
 import jax
 import jax.numpy as jnp
@@ -264,12 +265,60 @@ hero positions after step:
  [0 1]]
 ```
 
+### Indexing and shape for batched structs
+
+Batched structs support `.shape` and indexing. The `.shape` property returns the
+batch dimensions (the leading dimensions beyond each field's base annotation).
+Indexing with `env[i]` or slicing with `env[i:j]` indexes into the batch
+dimensions of every field at once.
+
+<!--pytest-codeblocks:cont-->
+```python
+# continuing from the previous example...
+
+# .shape returns the batch dimensions
+print(envs.shape)
+
+# integer indexing extracts a single element from the batch
+env0 = envs[0]
+print(env0)
+
+# slicing selects a range of elements from the batch
+some_envs = envs[1:3]
+print(some_envs.shape)
+print(some_envs)
+```
+
+Output:
+```console
+(4,)
+GridWorld(
+  hero_pos=jnp.int32[2],
+  walls=jnp.bool[5,5],
+)
+(2,)
+GridWorld(
+  hero_pos=jnp.int32[2,2],
+  walls=jnp.bool[2,5,5],
+)
+```
+
+These are convenience shortcuts for common operations on batched structs.
+For other element-wise operations, use `jax.tree.map`:
+
+<!--pytest-codeblocks:cont-->
+```python
+# adding a constant to every field isn't built in, but jax.tree.map works:
+shifted = jax.tree.map(lambda x: x + 1, env0)
+```
+
 ### Runtime type checking
 
 Strux works together with jaxtyping's runtime type checking. For example,
 if you combine it with a typechecker like beartype, shape and dtype mismatches
 are caught at function boundaries.
 
+<!--pytest-codeblocks:cont-->
 ```python
 from jaxtyping import jaxtyped  # pip install jaxtyping
 from beartype import beartype   # pip install beartype
@@ -297,7 +346,8 @@ Development has some additional optional dependencies:
 uv pip install -e ".[dev]"
 ```
 
-Installs normal dependencies plus also `jaxtyping`, `beartype`, `pytest`.
+Installs normal dependencies plus also `jaxtyping`, `beartype`, `pytest`,
+`pytest-codeblocks`.
 
 ### Notes
 
@@ -327,11 +377,12 @@ Advanced features:
 
 - [x] `isinstance` support and integrate with jaxtyping + beartype
 - [ ] Save/load structs to/from disk (e.g. serialisation with pytree structure)
-- [ ] Support indexing and shape directly on batched structs, e.g., `env[0]`.
+- [x] Support indexing and shape directly on batched structs, e.g., `env[0]`.
 - [ ] Pretty print registered pytree classes that aren't dataclasses
 
 Project:
 
-- [x] Test suite
+- [x] Unit tests
+- [x] README example tests
 - [ ] Documentation
 - [ ] List on PyPI
