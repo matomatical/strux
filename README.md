@@ -326,9 +326,9 @@ Basics:
 Advanced features:
 
 - [x] `isinstance` support and integrate with jaxtyping + beartype
-- [ ] Pretty print registered pytree classes that aren't dataclasses
 - [ ] Save/load structs to/from disk (e.g. serialisation with pytree structure)
 - [ ] Support indexing and shape directly on batched structs, e.g., `env[0]`.
+- [ ] Pretty print registered pytree classes that aren't dataclasses
 
 Project:
 
