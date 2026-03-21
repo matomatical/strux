@@ -54,6 +54,8 @@ def struct(Class=None, *, static_fieldnames: typing.Sequence[str] = ()):
         Dataclass.__str__ = to_str
     if "__format__" not in Class.__dict__:
         Dataclass.__format__ = tree_format
+        # TODO: if __str__ is overridden, then format with no spec should match.
+        # TODO: if __repr__ is overriden, then format !r should respect that too.
     
     # add some other convenience methods
     if "replace" not in fields:

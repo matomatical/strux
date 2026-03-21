@@ -9,12 +9,8 @@ from beartype import beartype
 import strux
 
 
-# --- Test structs ---
-
-@strux.struct
-class Point:
-    x: Float[Array, ""]
-    y: Float[Array, ""]
+# # # 
+# Common example test structs (other bespoke ones defined inline)
 
 
 @strux.struct
@@ -30,13 +26,9 @@ class World:
     score: Float[Array, ""]
 
 
-@strux.struct(static_fieldnames=("name",))
-class WithMeta:
-    pos: Int[Array, "2"]
-    name: str
+# # # 
+# Field name collision guards
 
-
-# --- Field name collision guards ---
 
 class TestFieldCollisions:
     def test_size_field_warns(self):
@@ -82,7 +74,9 @@ class TestFieldCollisions:
                 y: float
 
 
-# --- Pretty printing (to_str) ---
+# # # 
+# Pretty printing (to_str)
+
 
 class TestToStr:
     # scalars
@@ -240,7 +234,9 @@ class TestToStr:
         assert "UNKNOWN_LEAF" in result
 
 
-# --- Annotation expansion (static behaviour) ---
+# # # 
+# Annotation expansion (static behaviour)
+
 
 class TestAnnotationExpansion:
     def test_jaxtyping_fields_prepended(self):
@@ -275,6 +271,10 @@ class TestAnnotationExpansion:
         assert hints["score"].dim_str == "batch"
 
     def test_meta_fields_skipped(self):
+        @strux.struct(static_fieldnames=("name",))
+        class WithMeta:
+            pos: Int[Array, "2"]
+            name: str
         ann = WithMeta["batch"]
         hints = ann._field_hints
         # jaxtyping data field is expanded
@@ -302,6 +302,10 @@ class TestAnnotationExpansion:
 
     def test_scalar_fields_no_trailing_space(self):
         # Float[Array, ""] is a scalar; batching should give "batch", not "batch "
+        @strux.struct
+        class Point:
+            x: Float[Array, ""]
+            y: Float[Array, ""]
         ann = Point["batch"]
         assert ann._field_hints["x"].dim_str == "batch"
         assert ann._field_hints["y"].dim_str == "batch"
@@ -332,7 +336,9 @@ class TestAnnotationExpansion:
         assert ann.__name__ == 'Environment["batch"]'
 
 
-# --- Runtime isinstance checks ---
+# # # 
+# Runtime isinstance checks
+
 
 class TestInstanceCheck:
     def test_base_type_still_works(self):
@@ -394,14 +400,22 @@ class TestInstanceCheck:
         assert not isinstance(world, World["batch"])
 
     def test_meta_field_not_checked(self):
-        # meta field (name) is not checked during isinstance
+        @strux.struct(static_fieldnames=("name",))
+        class WithMeta:
+            pos: Int[Array, "2"]
+            name: str
         obj = WithMeta(
             pos=jnp.ones((3, 2), dtype=jnp.int32),
             name="hello",
         )
+        # check that meta field (name) is not checked during isinstance
         assert isinstance(obj, WithMeta["batch"])
 
     def test_scalar_struct_batched(self):
+        @strux.struct
+        class Point:
+            x: Float[Array, ""]
+            y: Float[Array, ""]
         point = Point(
             x=jnp.array([1.0, 2.0, 3.0]),
             y=jnp.array([4.0, 5.0, 6.0]),
@@ -409,7 +423,9 @@ class TestInstanceCheck:
         assert isinstance(point, Point["batch"])
 
 
-# --- Integration with jaxtyping + beartype runtime type checking ---
+# # # 
+# Integration with jaxtyping + beartype runtime type checking
+
 
 class TestJaxtypedIntegration:
     def test_correct_annotation_passes(self):
@@ -468,3 +484,5 @@ class TestJaxtypedIntegration:
         )
         with pytest.raises(Exception):
             step(env)
+
+

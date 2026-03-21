@@ -12,10 +12,15 @@ Install:
 pip install git+https://github.com/matomatical/strux.git
 ```
 
-Dependencies: `numpy`, `jax`.
+Dependencies: `jax`, `numpy`.
 
-Basic usage
------------
+Examples
+--------
+
+Note that some readme examples use `Self` which requires python 3.11, but these
+annotations are optional and otherwise strux only requires python 3.9.
+
+### Basic usage
 
 At the most basic level a strux struct is just a frozen dataclass registered as
 a JAX pytree. It works with `jax.jit`, `jax.vmap`, `jax.tree.map`, and friends,
@@ -47,8 +52,7 @@ Point(
 )
 ```
 
-Modules with methods
---------------------
+### Modules with methods
 
 Structs can hold arrays and define jit-compiled methods. Among other things,
 you can use this to define neural network modules. For example, here is a
@@ -109,8 +113,7 @@ AffineTransform(
 [0.47424078]
 ```
 
-Submodules and static fields
-----------------------------
+### Submodules and static fields
 
 Structs can be nested arbitrarily, allowing one to easily implement complex
 neural networks (among other things). For example, here is a multi-layer
@@ -177,8 +180,7 @@ MLP(
 )
 ```
 
-Vmapping and batch annotations
-------------------------------
+### Vmapping and batch annotations
 
 Structs work naturally with vectorisation and `jax.vmap`, for example for
 batches of data, parameters, or anything else. You can define your struct for
@@ -262,8 +264,7 @@ hero positions after step:
  [0 1]]
 ```
 
-Runtime type checking
----------------------
+### Runtime type checking
 
 Strux works together with jaxtyping's runtime type checking. For example,
 if you combine it with a typechecker like beartype, shape and dtype mismatches
@@ -287,8 +288,32 @@ envs = checked_step(envs, actions) # envs, actions from previous example
 # checked_step(envs, jnp.array([1, 2]))  # beartype raises!
 ```
 
-Roadmap
--------
+Development
+-----------
+
+Development has some additional optional dependencies:
+
+```
+uv pip install -e ".[dev]"
+```
+
+Installs normal dependencies plus also `jaxtyping`, `beartype`, `pytest`.
+
+### Notes
+
+Single-file implementation (`strux.py`, though see `tests.py` for tests).
+
+Jaxtyping is optional for non-development installations, people should be able
+to install and use strux for easily creating jit-compatible dataclasses even if
+they don't use jaxtyping for type annotations. Strux detects jaxtyping
+annotations via duck typing (`hasattr(hint, 'dtype')` etc.).
+
+### Testing
+
+Run tests with `pytest`. Make sure this passes before committing, or at least
+before merging to main.
+
+### Roadmap
 
 Basics:
 
@@ -303,9 +328,10 @@ Advanced features:
 - [x] `isinstance` support and integrate with jaxtyping + beartype
 - [ ] Pretty print registered pytree classes that aren't dataclasses
 - [ ] Save/load structs to/from disk (e.g. serialisation with pytree structure)
+- [ ] Support indexing and shape directly on batched structs, e.g., `env[0]`.
 
 Project:
 
-- [x] Test suite (59 tests)
+- [x] Test suite
 - [ ] Documentation
 - [ ] List on PyPI

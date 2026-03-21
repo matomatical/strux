@@ -36,3 +36,5 @@ build-backend = "flit_core.buildapi"
 [tool.flit.module]
 name = "strux"
 
+[tool.pytest.ini_options]
+testpaths = ["tests.py"]
