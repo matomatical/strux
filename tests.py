@@ -234,7 +234,66 @@ class TestToStr:
         assert "UNKNOWN_LEAF" in result
 
 
-# # # 
+# # #
+# Format/str/repr method resolution
+
+
+class TestMethodResolution:
+    """
+    Test that strux's auto-assigned __format__ delegates to str(self) for
+    empty format specs, and uses tree_format parsing for non-empty specs.
+    User overrides always win.
+    """
+
+    # -- __str__ / __format__ interaction (the interesting part) --
+
+    def test_neither_overridden(self):
+        @strux.struct
+        class S:
+            x: int
+        obj = S(x=1)
+        expected = strux.to_str(obj)
+        assert str(obj) == expected
+        assert f'{obj}' == expected
+        assert f'{obj:0}' == strux.to_str(obj, max_depth=0)
+
+    def test_str_overridden(self):
+        @strux.struct
+        class S:
+            x: int
+            def __str__(self):
+                return "custom_str"
+        obj = S(x=1)
+        assert str(obj) == "custom_str"
+        assert f'{obj}' == "custom_str"
+        # non-empty spec still uses strux tree_format
+        assert f'{obj:0}' == strux.to_str(obj, max_depth=0)
+
+    def test_format_overridden(self):
+        @strux.struct
+        class S:
+            x: int
+            def __format__(self, spec):
+                return f"custom_format:{spec}"
+        obj = S(x=1)
+        assert str(obj) == strux.to_str(obj)
+        assert f'{obj}' == "custom_format:"
+        assert f'{obj:2}' == "custom_format:2"
+
+    def test_str_and_format_overridden(self):
+        @strux.struct
+        class S:
+            x: int
+            def __str__(self):
+                return "custom_str"
+            def __format__(self, spec):
+                return "custom_format"
+        obj = S(x=1)
+        assert str(obj) == "custom_str"
+        assert f'{obj}' == "custom_format"
+
+
+# # #
 # Annotation expansion (static behaviour)
 
 

@@ -48,14 +48,10 @@ def struct(Class=None, *, static_fieldnames: typing.Sequence[str] = ()):
     )
     
     # overwrite string render methods to use pretty printing
-    if "__repr__" not in Class.__dict__:
-        Dataclass.__repr__ = to_str
     if "__str__" not in Class.__dict__:
         Dataclass.__str__ = to_str
     if "__format__" not in Class.__dict__:
         Dataclass.__format__ = tree_format
-        # TODO: if __str__ is overridden, then format with no spec should match.
-        # TODO: if __repr__ is overriden, then format !r should respect that too.
     
     # add some other convenience methods
     if "replace" not in fields:
@@ -264,12 +260,12 @@ def tree_format(tree, format_spec: str) -> str:
     Where the `indent` parameter to `to_str` becomes `" "*indent_length`
     (default "  ").
     """
+    # empty spec -> delegate to str(self), matching Python's default behaviour
+    if not format_spec:
+        return str(tree)
     # parse format spec
     try:
-        if not format_spec:
-            max_depth = None
-            indent_size = 2
-        elif '.' in format_spec:
+        if '.' in format_spec:
             max_depth_str, indent_size_str = format_spec.split('.')
             max_depth = int(max_depth_str) if max_depth_str else None
             indent_size = int(indent_size_str) if indent_size_str else 2
