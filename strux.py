@@ -422,17 +422,21 @@ def from_dict(d: dict, *, template):
     The template determines the pytree structure, field order, and static field
     values. Only the data (array) leaves are replaced with values from `d`.
 
-    Keys in `d` that don't correspond to any field in the template are silently
-    ignored (useful when loading a subset from a larger checkpoint).
-
-    Raises KeyError if `d` is missing any key required by the template.
+    The keys in `d` must exactly match the keys expected by the template.
+    Raises KeyError on missing or extra keys.
     """
     paths_and_leaves, treedef = jax.tree.flatten_with_path(template)
-    keys = [_keypath_to_str(path) for path, _ in paths_and_leaves]
-    missing = [k for k in keys if k not in d]
-    if missing:
-        raise KeyError(f"Missing keys in dict: {missing}")
-    leaves = [jnp.asarray(d[k]) for k in keys]
+    keys = set(_keypath_to_str(path) for path, _ in paths_and_leaves)
+    missing = keys - d.keys()
+    extra = d.keys() - keys
+    if missing or extra:
+        parts = []
+        if missing:
+            parts.append(f"missing keys: {sorted(missing)}")
+        if extra:
+            parts.append(f"extra keys: {sorted(extra)}")
+        raise KeyError(f"Key mismatch in from_dict: {'; '.join(parts)}")
+    leaves = [jnp.asarray(d[_keypath_to_str(path)]) for path, _ in paths_and_leaves]
     return jax.tree.unflatten(treedef, leaves)
 
 

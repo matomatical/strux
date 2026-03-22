@@ -776,11 +776,11 @@ class TestFromDict:
         with pytest.raises(KeyError, match="walls"):
             strux.from_dict(d, template=_make_env())
 
-    def test_extra_keys_ok(self):
+    def test_extra_keys_raises(self):
         d = strux.to_dict(_make_env())
         d["extra"] = jnp.zeros(3)
-        restored = strux.from_dict(d, template=_make_env())
-        _assert_equal(restored.hero_pos, _make_env().hero_pos)
+        with pytest.raises(KeyError, match="extra keys"):
+            strux.from_dict(d, template=_make_env())
 
     def test_static_fields_from_template(self):
         @strux.struct(static_fieldnames=("label",))
