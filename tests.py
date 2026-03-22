@@ -860,3 +860,28 @@ class TestSaveLoadErrors:
         # compressed is strictly smaller than uncompressed
         assert path_default.stat().st_size < path_uncompressed.stat().st_size
 
+
+class TestSaveRestoreMethods:
+    def test_save_and_restore(self, tmp_path):
+        original = _make_world()
+        path = tmp_path / "world.npz"
+        original.save(path)
+        restored = original.restore(path)
+        assert isinstance(restored, World)
+        assert jnp.array_equal(restored.score, original.score)
+        assert jnp.array_equal(restored.env.hero_pos, original.env.hero_pos)
+
+    def test_save_field_collision_warns(self):
+        with pytest.warns(UserWarning, match="field named 'save'"):
+            @strux.struct
+            class HasSave:
+                save: int
+                x: float
+
+    def test_restore_field_collision_warns(self):
+        with pytest.warns(UserWarning, match="field named 'restore'"):
+            @strux.struct
+            class HasRestore:
+                restore: int
+                x: float
+

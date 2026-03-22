@@ -77,6 +77,26 @@ def struct(Class=None, *, static_fieldnames: typing.Sequence[str] = ()):
             f"convenience property .shape will not be available",
         )
     Dataclass.__getitem__ = tree_getitem
+    if "save" not in fields:
+        def _save_method(self, path, *, format=None):
+            """Save this struct to disk. See strux.save for details."""
+            return save(path, self, format=format)
+        Dataclass.save = _save_method
+    else:
+        warnings.warn(
+            f"{Class.__name__} has a field named 'save', so the "
+            f"convenience method .save() will not be available",
+        )
+    if "restore" not in fields:
+        def _restore_method(self, path, *, format=None):
+            """Load from disk using this struct as the template. See strux.load."""
+            return load(path, template=self, format=format)
+        Dataclass.restore = _restore_method
+    else:
+        warnings.warn(
+            f"{Class.__name__} has a field named 'restore', so the "
+            f"convenience method .restore() will not be available",
+        )
 
     # allow type subscripting for annotating batched/vmapped pytrees,
     Dataclass._is_strux_struct = True
