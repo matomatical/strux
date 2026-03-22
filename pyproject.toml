@@ -28,6 +28,7 @@ dev = [
     "pytest-codeblocks",
     "beartype",
     "safetensors[numpy]",
+    "orbax-checkpoint",
 ]
 
 [project.urls]

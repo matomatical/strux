@@ -181,6 +181,68 @@ MLP(
 )
 ```
 
+### Saving and loading
+
+Structs can be saved to disk and restored later using the `save` and `restore`
+methods.
+
+<!--pytest-codeblocks:cont-->
+```python
+import os, tempfile
+
+# save the MLP to disk
+path = os.path.join(tempfile.mkdtemp(), "mlp.npz")
+net.save(path)
+
+# restore from disk using a fresh MLP as a template
+template = MLP.init(jax.random.key(999), features=4, hidden=8, outputs=1)
+restored = template.restore(path)
+
+# the restored model matches the original, not the template
+print(jax.tree.all(jax.tree.map(jnp.array_equal, net, restored)))
+```
+
+Output:
+```console
+True
+```
+
+For saving, if the filename has a `.npz` extension then the data fields are
+saved in compressed numpy format. If the filename has `.safetensors` extension,
+and strux is installed with the optional `safetensors` dependency (`pip install
+strux[safetensors]`, then strux uses the
+[safetensors](https://huggingface.co/docs/safetensors/) memory-mapped format.
+
+For loading, by default the format of the file is inferred from the file
+extension. Strux requires a template struct, complete with values for all
+static fields, to load the data into memory. The shapes and data types of the
+arrays are overridden by those in the saved checkpoint.
+
+You can also use `strux.to_dict` / `strux.from_dict` to convert structs to /
+from flat dictionaries of arrays, for use with other serialisation tools. In
+the case of [orbax](https://orbax.readthedocs.io/), structs can be checkpointed
+out of the box since they are just pytrees:
+
+<!--pytest-codeblocks:cont-->
+```python
+import orbax.checkpoint as ocp # pip install orbax-checkpoint
+
+orbax_path = os.path.join(tempfile.mkdtemp(), "mlp_orbax")
+
+# save
+ocp.StandardCheckpointer().save(orbax_path, net)
+
+# restore
+restored = ocp.StandardCheckpointer().restore(orbax_path, target=template)
+
+print(jax.tree.all(jax.tree.map(jnp.array_equal, net, restored)))
+```
+
+Output:
+```console
+True
+```
+
 ### Vmapping and batch annotations
 
 Structs work naturally with vectorisation and `jax.vmap`, for example for
@@ -378,6 +440,7 @@ Advanced features:
 - [x] `isinstance` support and integrate with jaxtyping + beartype
 - [ ] Save/load structs to/from disk (e.g. serialisation with pytree structure)
 - [x] Support indexing and shape directly on batched structs, e.g., `env[0]`.
+- [ ] Construct empty structs from type annotations (for use as load templates)
 - [ ] Pretty print registered pytree classes that aren't dataclasses
 
 Project:
