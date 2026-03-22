@@ -484,6 +484,16 @@ def save(path, tree, *, format=None):
     * 'savez' --- uncompressed numpy npz.
     * 'safetensors' --- safetensors format (requires `safetensors`
       package: `pip install strux[safetensors]`).
+
+    Raises FileExistsError if the destination file already exists, to
+    prevent accidental data loss. This check is not atomic, so concurrent
+    writers to the same path are not fully guarded against; use distinct
+    paths per process if saving concurrently.
+
+    Note: numpy's savez/savez_compressed will append '.npz' to the path
+    if it doesn't already end in '.npz'. Safetensors writes to the exact
+    path given. For consistent behaviour, use '.npz' or '.safetensors'
+    extensions explicitly.
     """
     if format is not None:
         fmt = format
@@ -491,6 +501,16 @@ def save(path, tree, *, format=None):
         fmt = _infer_format(path)
     if fmt not in _SAVE_FORMATS:
         raise ValueError(f"Unknown format: {fmt!r}")
+    # check for existing file to prevent silent data loss
+    # (numpy appends .npz if not already present, so check that too)
+    dest = os.fspath(path)
+    if fmt in ("savez", "savez_compressed") and not dest.endswith(".npz"):
+        dest = dest + ".npz"
+    if os.path.exists(dest):
+        raise FileExistsError(
+            f"File already exists: {dest!r}. "
+            f"Remove it first to avoid accidental data loss."
+        )
     d = to_dict(tree)
     if fmt == "savez_compressed":
         np.savez_compressed(path, **d)

@@ -845,6 +845,12 @@ class TestSaveLoadErrors:
         restored = strux.load(path, template=_make_env(), format="savez")
         _assert_equal(restored.hero_pos, _make_env().hero_pos)
 
+    def test_overwrite_raises(self, tmp_path):
+        path = tmp_path / "env.npz"
+        strux.save(path, _make_env())
+        with pytest.raises(FileExistsError, match="already exists"):
+            strux.save(path, _make_env())
+
     def test_npz_defaults_to_compressed(self, tmp_path):
         # use a large zero array so compression is clearly effective
         @strux.struct
