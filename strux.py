@@ -378,7 +378,7 @@ def to_dict(tree) -> dict[str, np.ndarray]:
     The resulting dict is suitable for saving with `np.savez` or
     `safetensors.numpy.save_file`.
     """
-    paths_and_leaves, _ = jax.tree_util.tree_flatten_with_path(tree)
+    paths_and_leaves, _ = jax.tree.flatten_with_path(tree)
     d = {}
     for path, leaf in paths_and_leaves:
         key = _keypath_to_str(path)
@@ -402,13 +402,13 @@ def from_dict(d: dict, *, template):
 
     Raises KeyError if `d` is missing any key required by the template.
     """
-    paths_and_leaves, treedef = jax.tree_util.tree_flatten_with_path(template)
+    paths_and_leaves, treedef = jax.tree.flatten_with_path(template)
     keys = [_keypath_to_str(path) for path, _ in paths_and_leaves]
     missing = [k for k in keys if k not in d]
     if missing:
         raise KeyError(f"Missing keys in dict: {missing}")
     leaves = [jnp.asarray(d[k]) for k in keys]
-    return jax.tree_util.tree_unflatten(treedef, leaves)
+    return jax.tree.unflatten(treedef, leaves)
 
 
 _FORMAT_EXTENSIONS = {
