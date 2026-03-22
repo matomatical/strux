@@ -8,6 +8,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+try:
+    from safetensors import numpy as safetensors_numpy
+except ImportError:
+    safetensors_numpy = None
+
 
 def struct(Class=None, *, static_fieldnames: typing.Sequence[str] = ()):
     """
@@ -441,6 +446,14 @@ _SAVE_FORMATS = {"savez", "savez_compressed", "safetensors"}
 _LOAD_FORMATS = {"savez", "savez_compressed", "safetensors"}
 
 
+def _require_safetensors():
+    if safetensors_numpy is None:
+        raise ImportError(
+            "safetensors is required for the 'safetensors' format; "
+            "install it with: pip install strux[safetensors]"
+        )
+
+
 def _infer_format(path):
     ext = os.path.splitext(path)[1]
     if ext not in _FORMAT_EXTENSIONS:
@@ -466,7 +479,7 @@ def save(path, tree, *, format=None):
     * 'savez_compressed' --- compressed numpy npz (default for .npz).
     * 'savez' --- uncompressed numpy npz.
     * 'safetensors' --- safetensors format (requires `safetensors`
-      package: `pip install safetensors[numpy]`).
+      package: `pip install strux[safetensors]`).
     """
     if format is not None:
         fmt = format
@@ -480,14 +493,8 @@ def save(path, tree, *, format=None):
     elif fmt == "savez":
         np.savez(path, **d)
     elif fmt == "safetensors":
-        try:
-            from safetensors.numpy import save_file
-        except ImportError:
-            raise ImportError(
-                "safetensors is required for .safetensors format; "
-                "install it with: pip install safetensors[numpy]"
-            )
-        save_file(d, path)
+        _require_safetensors()
+        safetensors_numpy.save_file(d, path)
 
 
 def load(path, *, template, format=None):
@@ -511,12 +518,6 @@ def load(path, *, template, format=None):
     if fmt in ("savez", "savez_compressed"):
         d = dict(np.load(path))
     elif fmt == "safetensors":
-        try:
-            from safetensors.numpy import load_file
-        except ImportError:
-            raise ImportError(
-                "safetensors is required for .safetensors format; "
-                "install it with: pip install safetensors[numpy]"
-            )
-        d = load_file(path)
+        _require_safetensors()
+        d = safetensors_numpy.load_file(path)
     return from_dict(d, template=template)
