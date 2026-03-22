@@ -684,6 +684,12 @@ class TestGetitem:
 # Serialisation
 
 
+def _assert_equal(a, b):
+    """Assert two arrays have equal values AND dtypes."""
+    assert a.dtype == b.dtype, f"dtype mismatch: {a.dtype} != {b.dtype}"
+    assert jnp.array_equal(a, b)
+
+
 def _make_env():
     return Environment(
         hero_pos=jnp.array([1, 2], dtype=jnp.int32),
@@ -741,29 +747,29 @@ class TestFromDict:
         original = _make_world()
         d = strux.to_dict(original)
         restored = strux.from_dict(d, template=original)
-        assert jnp.array_equal(restored.score, original.score)
-        assert jnp.array_equal(restored.env.hero_pos, original.env.hero_pos)
+        _assert_equal(restored.score, original.score)
+        _assert_equal(restored.env.hero_pos, original.env.hero_pos)
 
     def test_round_trip_dict_tree(self):
         original = {"a": jnp.array(1.0), "b": jnp.array(2.0)}
         d = strux.to_dict(original)
         restored = strux.from_dict(d, template=original)
-        assert jnp.array_equal(restored["a"], original["a"])
-        assert jnp.array_equal(restored["b"], original["b"])
+        _assert_equal(restored["a"], original["a"])
+        _assert_equal(restored["b"], original["b"])
 
     def test_round_trip_list_tree(self):
         original = [jnp.array(1.0), jnp.array(2.0)]
         d = strux.to_dict(original)
         restored = strux.from_dict(d, template=original)
-        assert jnp.array_equal(restored[0], original[0])
-        assert jnp.array_equal(restored[1], original[1])
+        _assert_equal(restored[0], original[0])
+        _assert_equal(restored[1], original[1])
 
     def test_round_trip_mixed_tree(self):
         original = {"params": _make_env(), "step": jnp.array(0)}
         d = strux.to_dict(original)
         restored = strux.from_dict(d, template=original)
-        assert jnp.array_equal(restored["params"].hero_pos, original["params"].hero_pos)
-        assert jnp.array_equal(restored["step"], original["step"])
+        _assert_equal(restored["params"].hero_pos, original["params"].hero_pos)
+        _assert_equal(restored["step"], original["step"])
 
     def test_missing_key_raises(self):
         d = {"hero_pos": jnp.zeros(2), "goal_pos": jnp.zeros(2)}
@@ -774,7 +780,7 @@ class TestFromDict:
         d = strux.to_dict(_make_env())
         d["extra"] = jnp.zeros(3)
         restored = strux.from_dict(d, template=_make_env())
-        assert jnp.array_equal(restored.hero_pos, _make_env().hero_pos)
+        _assert_equal(restored.hero_pos, _make_env().hero_pos)
 
     def test_static_fields_from_template(self):
         @strux.struct(static_fieldnames=("label",))
@@ -784,7 +790,7 @@ class TestFromDict:
         template = Labelled(pos=jnp.zeros(2, dtype=jnp.int32), label="hello")
         d = {"pos": jnp.array([10, 20], dtype=jnp.int32)}
         restored = strux.from_dict(d, template=template)
-        assert jnp.array_equal(restored.pos, jnp.array([10, 20]))
+        _assert_equal(restored.pos, jnp.array([10, 20]))
         assert restored.label == "hello"
 
 
@@ -795,8 +801,8 @@ class TestSaveLoadNpz:
         strux.save(path, original)
         restored = strux.load(path, template=original)
         assert isinstance(restored, Environment)
-        assert jnp.array_equal(restored.hero_pos, original.hero_pos)
-        assert jnp.array_equal(restored.walls, original.walls)
+        _assert_equal(restored.hero_pos, original.hero_pos)
+        _assert_equal(restored.walls, original.walls)
 
     def test_nested_struct(self, tmp_path):
         original = _make_world()
@@ -804,8 +810,8 @@ class TestSaveLoadNpz:
         strux.save(path, original)
         restored = strux.load(path, template=original)
         assert isinstance(restored, World)
-        assert jnp.array_equal(restored.score, original.score)
-        assert jnp.array_equal(restored.env.walls, original.env.walls)
+        _assert_equal(restored.score, original.score)
+        _assert_equal(restored.env.walls, original.env.walls)
 
 
 class TestSaveLoadSafetensors:
@@ -815,8 +821,8 @@ class TestSaveLoadSafetensors:
         strux.save(path, original)
         restored = strux.load(path, template=original)
         assert isinstance(restored, Point)
-        assert jnp.array_equal(restored.x, original.x)
-        assert jnp.array_equal(restored.y, original.y)
+        _assert_equal(restored.x, original.x)
+        _assert_equal(restored.y, original.y)
 
     def test_nested_struct(self, tmp_path):
         original = _make_world()
@@ -824,8 +830,8 @@ class TestSaveLoadSafetensors:
         strux.save(path, original)
         restored = strux.load(path, template=original)
         assert isinstance(restored, World)
-        assert jnp.array_equal(restored.score, original.score)
-        assert jnp.array_equal(restored.env.hero_pos, original.env.hero_pos)
+        _assert_equal(restored.score, original.score)
+        _assert_equal(restored.env.hero_pos, original.env.hero_pos)
 
 
 class TestSaveLoadErrors:
@@ -837,7 +843,7 @@ class TestSaveLoadErrors:
         path = tmp_path / "file.npz"
         strux.save(path, _make_env(), format="savez")
         restored = strux.load(path, template=_make_env(), format="savez")
-        assert jnp.array_equal(restored.hero_pos, _make_env().hero_pos)
+        _assert_equal(restored.hero_pos, _make_env().hero_pos)
 
     def test_npz_defaults_to_compressed(self, tmp_path):
         # use a large zero array so compression is clearly effective
@@ -854,7 +860,7 @@ class TestSaveLoadErrors:
         # all three round-trip correctly
         for p in (path_default, path_explicit, path_uncompressed):
             restored = strux.load(p, template=big)
-            assert jnp.array_equal(restored.data, big.data)
+            _assert_equal(restored.data, big.data)
         # default and explicit compressed produce the same file size
         assert path_default.stat().st_size == path_explicit.stat().st_size
         # compressed is strictly smaller than uncompressed
@@ -868,8 +874,8 @@ class TestSaveRestoreMethods:
         original.save(path)
         restored = original.restore(path)
         assert isinstance(restored, World)
-        assert jnp.array_equal(restored.score, original.score)
-        assert jnp.array_equal(restored.env.hero_pos, original.env.hero_pos)
+        _assert_equal(restored.score, original.score)
+        _assert_equal(restored.env.hero_pos, original.env.hero_pos)
 
     def test_save_field_collision_warns(self):
         with pytest.warns(UserWarning, match="field named 'save'"):
