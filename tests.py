@@ -679,3 +679,164 @@ class TestGetitem:
         assert jnp.array_equal(e.hero_pos, jnp.array([30, 40]))
         assert jnp.array_equal(e.goal_pos, jnp.array([70, 80]))
 
+
+# # #
+# Serialisation
+
+
+def _make_env():
+    return Environment(
+        hero_pos=jnp.array([1, 2], dtype=jnp.int32),
+        goal_pos=jnp.array([3, 4], dtype=jnp.int32),
+        walls=jnp.ones((5, 5), dtype=bool),
+    )
+
+
+def _make_world():
+    return World(env=_make_env(), score=jnp.float32(42.0))
+
+
+class TestToDict:
+    def test_flat_struct_keys(self):
+        d = strux.to_dict(_make_env())
+        assert set(d.keys()) == {"hero_pos", "goal_pos", "walls"}
+
+    def test_nested_struct_keys(self):
+        d = strux.to_dict(_make_world())
+        assert set(d.keys()) == {"env/hero_pos", "env/goal_pos", "env/walls", "score"}
+
+    def test_values_are_numpy(self):
+        import numpy
+        d = strux.to_dict(_make_env())
+        for v in d.values():
+            assert isinstance(v, numpy.ndarray)
+
+    def test_dict_keys_use_repr(self):
+        tree = {"a/b": jnp.array(1.0), "c": jnp.array(2.0)}
+        d = strux.to_dict(tree)
+        assert set(d.keys()) == {"'a/b'", "'c'"}
+
+    def test_sequence_keys_use_repr(self):
+        tree = [jnp.array(1.0), jnp.array(2.0)]
+        d = strux.to_dict(tree)
+        assert set(d.keys()) == {"0", "1"}
+
+    def test_mixed_tree_keys(self):
+        tree = {"params": _make_env(), "steps": [jnp.array(1), jnp.array(2)]}
+        d = strux.to_dict(tree)
+        assert "'params'/hero_pos" in d
+        assert "'steps'/0" in d
+
+    def test_key_clash_raises(self):
+        class Evil(str):
+            def __repr__(self):
+                return "'a'"
+        tree = {"a": jnp.array(1.0), Evil("b"): jnp.array(2.0)}
+        with pytest.raises(ValueError, match="Key clash"):
+            strux.to_dict(tree)
+
+
+class TestFromDict:
+    def test_round_trip(self):
+        original = _make_world()
+        d = strux.to_dict(original)
+        restored = strux.from_dict(d, template=original)
+        assert jnp.array_equal(restored.score, original.score)
+        assert jnp.array_equal(restored.env.hero_pos, original.env.hero_pos)
+
+    def test_round_trip_dict_tree(self):
+        original = {"a": jnp.array(1.0), "b": jnp.array(2.0)}
+        d = strux.to_dict(original)
+        restored = strux.from_dict(d, template=original)
+        assert jnp.array_equal(restored["a"], original["a"])
+        assert jnp.array_equal(restored["b"], original["b"])
+
+    def test_round_trip_list_tree(self):
+        original = [jnp.array(1.0), jnp.array(2.0)]
+        d = strux.to_dict(original)
+        restored = strux.from_dict(d, template=original)
+        assert jnp.array_equal(restored[0], original[0])
+        assert jnp.array_equal(restored[1], original[1])
+
+    def test_round_trip_mixed_tree(self):
+        original = {"params": _make_env(), "step": jnp.array(0)}
+        d = strux.to_dict(original)
+        restored = strux.from_dict(d, template=original)
+        assert jnp.array_equal(restored["params"].hero_pos, original["params"].hero_pos)
+        assert jnp.array_equal(restored["step"], original["step"])
+
+    def test_missing_key_raises(self):
+        d = {"hero_pos": jnp.zeros(2), "goal_pos": jnp.zeros(2)}
+        with pytest.raises(KeyError, match="walls"):
+            strux.from_dict(d, template=_make_env())
+
+    def test_extra_keys_ok(self):
+        d = strux.to_dict(_make_env())
+        d["extra"] = jnp.zeros(3)
+        restored = strux.from_dict(d, template=_make_env())
+        assert jnp.array_equal(restored.hero_pos, _make_env().hero_pos)
+
+    def test_static_fields_from_template(self):
+        @strux.struct(static_fieldnames=("label",))
+        class Labelled:
+            pos: Int[Array, "2"]
+            label: str
+        template = Labelled(pos=jnp.zeros(2, dtype=jnp.int32), label="hello")
+        d = {"pos": jnp.array([10, 20], dtype=jnp.int32)}
+        restored = strux.from_dict(d, template=template)
+        assert jnp.array_equal(restored.pos, jnp.array([10, 20]))
+        assert restored.label == "hello"
+
+
+class TestSaveLoadNpz:
+    def test_flat_struct(self, tmp_path):
+        original = _make_env()
+        path = tmp_path / "env.npz"
+        strux.save(path, original)
+        restored = strux.load(path, template=original)
+        assert isinstance(restored, Environment)
+        assert jnp.array_equal(restored.hero_pos, original.hero_pos)
+        assert jnp.array_equal(restored.walls, original.walls)
+
+    def test_nested_struct(self, tmp_path):
+        original = _make_world()
+        path = tmp_path / "world.npz"
+        strux.save(path, original)
+        restored = strux.load(path, template=original)
+        assert isinstance(restored, World)
+        assert jnp.array_equal(restored.score, original.score)
+        assert jnp.array_equal(restored.env.walls, original.env.walls)
+
+
+class TestSaveLoadSafetensors:
+    def test_flat_struct(self, tmp_path):
+        original = Point(x=jnp.float32(1.0), y=jnp.float32(2.0))
+        path = tmp_path / "point.safetensors"
+        strux.save(path, original)
+        restored = strux.load(path, template=original)
+        assert isinstance(restored, Point)
+        assert jnp.array_equal(restored.x, original.x)
+        assert jnp.array_equal(restored.y, original.y)
+
+    def test_nested_struct(self, tmp_path):
+        original = _make_world()
+        path = tmp_path / "world.safetensors"
+        strux.save(path, original)
+        restored = strux.load(path, template=original)
+        assert isinstance(restored, World)
+        assert jnp.array_equal(restored.score, original.score)
+        assert jnp.array_equal(restored.env.hero_pos, original.env.hero_pos)
+
+
+class TestSaveLoadErrors:
+    def test_unknown_extension(self, tmp_path):
+        with pytest.raises(ValueError, match="Cannot infer format"):
+            strux.save(tmp_path / "file.xyz", _make_env())
+
+    def test_explicit_format_overrides_extension(self, tmp_path):
+        path = tmp_path / "file.npz"
+        strux.save(path, _make_env(), format="npz")
+        # load with explicit format should work even without relying on extension
+        restored = strux.load(path, template=_make_env(), format="npz")
+        assert jnp.array_equal(restored.hero_pos, _make_env().hero_pos)
+

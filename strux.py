@@ -1,5 +1,6 @@
 import dataclasses
 import functools
+import os
 import typing
 import warnings
 
@@ -337,3 +338,148 @@ def tree_getitem(tree, index):
 def tree_size(tree) -> int:
     """Calculates the total number of parameters in the PyTree."""
     return sum(jnp.size(x) for x in jax.tree.leaves(tree))
+
+
+# # #
+# Serialisation
+
+
+def _keypath_to_str(keypath) -> str:
+    """
+    Convert a JAX key path to a '/'-separated string like 'env/hero_pos'.
+
+    Field names (GetAttrKey) are included bare. Dict keys and sequence
+    indices are included via repr, so that e.g. string dict keys get
+    quoted ('my_key') and remain unambiguous with field names or the
+    '/' separator.
+    """
+    parts = []
+    for key in keypath:
+        if hasattr(key, 'name'):       # GetAttrKey (dataclass field)
+            parts.append(key.name)
+        elif hasattr(key, 'key'):       # DictKey
+            parts.append(repr(key.key))
+        elif hasattr(key, 'idx'):       # SequenceKey (list/tuple)
+            parts.append(repr(key.idx))
+        else:
+            raise TypeError(
+                f"Unsupported key type {type(key).__name__} in path"
+            )
+    return "/".join(parts)
+
+
+def to_dict(tree) -> dict[str, np.ndarray]:
+    """
+    Flatten a struct into a dict mapping path strings to numpy arrays.
+
+    Keys are '/'-separated field paths (e.g. 'env/hero_pos', 'score').
+    Only data fields (pytree leaves) are included; static/meta fields are not.
+
+    The resulting dict is suitable for saving with `np.savez` or
+    `safetensors.numpy.save_file`.
+    """
+    paths_and_leaves, _ = jax.tree_util.tree_flatten_with_path(tree)
+    d = {}
+    for path, leaf in paths_and_leaves:
+        key = _keypath_to_str(path)
+        if key in d:
+            raise ValueError(
+                f"Key clash in to_dict: {key!r} appears more than once"
+            )
+        d[key] = np.asarray(leaf)
+    return d
+
+
+def from_dict(d: dict, *, template):
+    """
+    Reconstruct a struct from a dict of arrays, using a template for structure.
+
+    The template determines the pytree structure, field order, and static field
+    values. Only the data (array) leaves are replaced with values from `d`.
+
+    Keys in `d` that don't correspond to any field in the template are silently
+    ignored (useful when loading a subset from a larger checkpoint).
+
+    Raises KeyError if `d` is missing any key required by the template.
+    """
+    paths_and_leaves, treedef = jax.tree_util.tree_flatten_with_path(template)
+    keys = [_keypath_to_str(path) for path, _ in paths_and_leaves]
+    missing = [k for k in keys if k not in d]
+    if missing:
+        raise KeyError(f"Missing keys in dict: {missing}")
+    leaves = [jnp.asarray(d[k]) for k in keys]
+    return jax.tree_util.tree_unflatten(treedef, leaves)
+
+
+_FORMAT_EXTENSIONS = {
+    ".npz": "npz",
+    ".safetensors": "safetensors",
+}
+
+
+def _infer_format(path, format):
+    if format is not None:
+        return format
+    ext = os.path.splitext(path)[1]
+    if ext not in _FORMAT_EXTENSIONS:
+        supported = ", ".join(_FORMAT_EXTENSIONS.keys())
+        raise ValueError(
+            f"Cannot infer format from extension {ext!r}; "
+            f"supported extensions: {supported}. "
+            f"Pass format= explicitly to override."
+        )
+    return _FORMAT_EXTENSIONS[ext]
+
+
+def save(path, tree, *, format=None):
+    """
+    Save a struct to disk.
+
+    Format is inferred from the file extension ('.npz' or '.safetensors'),
+    or can be specified explicitly via the `format` keyword argument.
+
+    The '.safetensors' format requires the `safetensors` package to be
+    installed (`pip install safetensors[numpy]`).
+    """
+    fmt = _infer_format(path, format)
+    d = to_dict(tree)
+    if fmt == "npz":
+        np.savez(path, **d)
+    elif fmt == "safetensors":
+        try:
+            from safetensors.numpy import save_file
+        except ImportError:
+            raise ImportError(
+                "safetensors is required for .safetensors format; "
+                "install it with: pip install safetensors[numpy]"
+            )
+        save_file(d, path)
+    else:
+        raise ValueError(f"Unknown format: {fmt!r}")
+
+
+def load(path, *, template, format=None):
+    """
+    Load a struct from disk, using a template for the pytree structure.
+
+    The template determines the struct type, field order, and static field
+    values. Only the data (array) leaves are loaded from the file.
+
+    Format is inferred from the file extension ('.npz' or '.safetensors'),
+    or can be specified explicitly via the `format` keyword argument.
+    """
+    fmt = _infer_format(path, format)
+    if fmt == "npz":
+        d = dict(np.load(path))
+    elif fmt == "safetensors":
+        try:
+            from safetensors.numpy import load_file
+        except ImportError:
+            raise ImportError(
+                "safetensors is required for .safetensors format; "
+                "install it with: pip install safetensors[numpy]"
+            )
+        d = load_file(path)
+    else:
+        raise ValueError(f"Unknown format: {fmt!r}")
+    return from_dict(d, template=template)

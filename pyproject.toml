@@ -19,11 +19,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+safetensors = [
+    "safetensors[numpy]",
+]
 dev = [
     "jaxtyping",
     "pytest",
     "pytest-codeblocks",
     "beartype",
+    "safetensors[numpy]",
 ]
 
 [project.urls]
