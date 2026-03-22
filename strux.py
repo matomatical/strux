@@ -412,14 +412,16 @@ def from_dict(d: dict, *, template):
 
 
 _FORMAT_EXTENSIONS = {
-    ".npz": "npz",
+    ".npz": "savez_compressed",
     ".safetensors": "safetensors",
 }
 
+_SAVE_FORMATS = {"savez", "savez_compressed", "safetensors"}
 
-def _infer_format(path, format):
-    if format is not None:
-        return format
+_LOAD_FORMATS = {"savez", "savez_compressed", "safetensors"}
+
+
+def _infer_format(path):
     ext = os.path.splitext(path)[1]
     if ext not in _FORMAT_EXTENSIONS:
         supported = ", ".join(_FORMAT_EXTENSIONS.keys())
@@ -435,15 +437,27 @@ def save(path, tree, *, format=None):
     """
     Save a struct to disk.
 
-    Format is inferred from the file extension ('.npz' or '.safetensors'),
-    or can be specified explicitly via the `format` keyword argument.
+    Format is inferred from the file extension: '.npz' defaults to
+    'savez_compressed', '.safetensors' uses safetensors. To save
+    uncompressed npz, pass format='savez' explicitly.
 
-    The '.safetensors' format requires the `safetensors` package to be
-    installed (`pip install safetensors[numpy]`).
+    Supported formats:
+
+    * 'savez_compressed' --- compressed numpy npz (default for .npz).
+    * 'savez' --- uncompressed numpy npz.
+    * 'safetensors' --- safetensors format (requires `safetensors`
+      package: `pip install safetensors[numpy]`).
     """
-    fmt = _infer_format(path, format)
+    if format is not None:
+        fmt = format
+    else:
+        fmt = _infer_format(path)
+    if fmt not in _SAVE_FORMATS:
+        raise ValueError(f"Unknown format: {fmt!r}")
     d = to_dict(tree)
-    if fmt == "npz":
+    if fmt == "savez_compressed":
+        np.savez_compressed(path, **d)
+    elif fmt == "savez":
         np.savez(path, **d)
     elif fmt == "safetensors":
         try:
@@ -454,8 +468,6 @@ def save(path, tree, *, format=None):
                 "install it with: pip install safetensors[numpy]"
             )
         save_file(d, path)
-    else:
-        raise ValueError(f"Unknown format: {fmt!r}")
 
 
 def load(path, *, template, format=None):
@@ -465,11 +477,18 @@ def load(path, *, template, format=None):
     The template determines the struct type, field order, and static field
     values. Only the data (array) leaves are loaded from the file.
 
-    Format is inferred from the file extension ('.npz' or '.safetensors'),
-    or can be specified explicitly via the `format` keyword argument.
+    Format is inferred from the file extension: '.npz' for numpy npz
+    (handles both compressed and uncompressed), '.safetensors' for
+    safetensors. Can be specified explicitly via the `format` keyword
+    argument.
     """
-    fmt = _infer_format(path, format)
-    if fmt == "npz":
+    if format is not None:
+        fmt = format
+    else:
+        fmt = _infer_format(path)
+    if fmt not in _LOAD_FORMATS:
+        raise ValueError(f"Unknown format: {fmt!r}")
+    if fmt in ("savez", "savez_compressed"):
         d = dict(np.load(path))
     elif fmt == "safetensors":
         try:
@@ -480,6 +499,4 @@ def load(path, *, template, format=None):
                 "install it with: pip install safetensors[numpy]"
             )
         d = load_file(path)
-    else:
-        raise ValueError(f"Unknown format: {fmt!r}")
     return from_dict(d, template=template)

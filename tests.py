@@ -835,8 +835,28 @@ class TestSaveLoadErrors:
 
     def test_explicit_format_overrides_extension(self, tmp_path):
         path = tmp_path / "file.npz"
-        strux.save(path, _make_env(), format="npz")
-        # load with explicit format should work even without relying on extension
-        restored = strux.load(path, template=_make_env(), format="npz")
+        strux.save(path, _make_env(), format="savez")
+        restored = strux.load(path, template=_make_env(), format="savez")
         assert jnp.array_equal(restored.hero_pos, _make_env().hero_pos)
+
+    def test_npz_defaults_to_compressed(self, tmp_path):
+        # use a large zero array so compression is clearly effective
+        @strux.struct
+        class Big:
+            data: Float[Array, "n"]
+        big = Big(data=jnp.zeros(10_000))
+        path_default = tmp_path / "default.npz"
+        path_explicit = tmp_path / "explicit.npz"
+        path_uncompressed = tmp_path / "uncompressed.npz"
+        strux.save(path_default, big)                              # default
+        strux.save(path_explicit, big, format="savez_compressed")  # explicit
+        strux.save(path_uncompressed, big, format="savez")         # uncompressed
+        # all three round-trip correctly
+        for p in (path_default, path_explicit, path_uncompressed):
+            restored = strux.load(p, template=big)
+            assert jnp.array_equal(restored.data, big.data)
+        # default and explicit compressed produce the same file size
+        assert path_default.stat().st_size == path_explicit.stat().st_size
+        # compressed is strictly smaller than uncompressed
+        assert path_default.stat().st_size < path_uncompressed.stat().st_size
 
