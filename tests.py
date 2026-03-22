@@ -841,8 +841,8 @@ class TestSaveLoadErrors:
 
     def test_explicit_format_overrides_extension(self, tmp_path):
         path = tmp_path / "file.npz"
-        strux.save(path, _make_env(), format="savez")
-        restored = strux.load(path, template=_make_env(), format="savez")
+        strux.save(path, _make_env(), fmt="savez")
+        restored = strux.load(path, template=_make_env(), fmt="savez")
         _assert_equal(restored.hero_pos, _make_env().hero_pos)
 
     def test_overwrite_raises(self, tmp_path):
@@ -861,8 +861,8 @@ class TestSaveLoadErrors:
         path_explicit = tmp_path / "explicit.npz"
         path_uncompressed = tmp_path / "uncompressed.npz"
         strux.save(path_default, big)                              # default
-        strux.save(path_explicit, big, format="savez_compressed")  # explicit
-        strux.save(path_uncompressed, big, format="savez")         # uncompressed
+        strux.save(path_explicit, big, fmt="savez_compressed")  # explicit
+        strux.save(path_uncompressed, big, fmt="savez")         # uncompressed
         # all three round-trip correctly
         for p in (path_default, path_explicit, path_uncompressed):
             restored = strux.load(p, template=big)

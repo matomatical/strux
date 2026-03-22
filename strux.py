@@ -83,9 +83,9 @@ def struct(Class=None, *, static_fieldnames: typing.Sequence[str] = ()):
         )
     Dataclass.__getitem__ = tree_getitem
     if "save" not in fields:
-        def _save_method(self, path, *, format=None):
+        def _save_method(self, path, *, fmt=None):
             """Save this struct to disk. See strux.save for details."""
-            return save(path, self, format=format)
+            return save(path, self, fmt=fmt)
         Dataclass.save = _save_method
     else:
         warnings.warn(
@@ -93,9 +93,9 @@ def struct(Class=None, *, static_fieldnames: typing.Sequence[str] = ()):
             f"convenience method .save() will not be available",
         )
     if "restore" not in fields:
-        def _restore_method(self, path, *, format=None):
+        def _restore_method(self, path, *, fmt=None):
             """Load from disk using this struct as the template. See strux.load."""
-            return load(path, template=self, format=format)
+            return load(path, template=self, fmt=fmt)
         Dataclass.restore = _restore_method
     else:
         warnings.warn(
@@ -470,13 +470,13 @@ def _infer_format(path):
     return _FORMAT_EXTENSIONS[ext]
 
 
-def save(path, tree, *, format=None):
+def save(path, tree, *, fmt=None):
     """
     Save a struct to disk.
 
     Format is inferred from the file extension: '.npz' defaults to
     'savez_compressed', '.safetensors' uses safetensors. To save
-    uncompressed npz, pass format='savez' explicitly.
+    uncompressed npz, pass fmt='savez' explicitly.
 
     Supported formats:
 
@@ -495,9 +495,7 @@ def save(path, tree, *, format=None):
     path given. For consistent behaviour, use '.npz' or '.safetensors'
     extensions explicitly.
     """
-    if format is not None:
-        fmt = format
-    else:
+    if fmt is None:
         fmt = _infer_format(path)
     if fmt not in _SAVE_FORMATS:
         raise ValueError(f"Unknown format: {fmt!r}")
@@ -521,7 +519,7 @@ def save(path, tree, *, format=None):
         safetensors_numpy.save_file(d, path)
 
 
-def load(path, *, template, format=None):
+def load(path, *, template, fmt=None):
     """
     Load a struct from disk, using a template for the pytree structure.
 
@@ -530,12 +528,10 @@ def load(path, *, template, format=None):
 
     Format is inferred from the file extension: '.npz' for numpy npz
     (handles both compressed and uncompressed), '.safetensors' for
-    safetensors. Can be specified explicitly via the `format` keyword
+    safetensors. Can be specified explicitly via the `fmt` keyword
     argument.
     """
-    if format is not None:
-        fmt = format
-    else:
+    if fmt is None:
         fmt = _infer_format(path)
     if fmt not in _LOAD_FORMATS:
         raise ValueError(f"Unknown format: {fmt!r}")
