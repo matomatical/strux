@@ -8,13 +8,30 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+# optional safetensors[numpy]
 try:
     from safetensors import numpy as safetensors_numpy
 except ImportError:
-    safetensors_numpy = None
+    @dataclasses.dataclass
+    class _MissingDependency:
+        message: str
+        def __getattr__(self, name: str):
+            raise ImportError(self.message)
+    
+    safetensors_numpy = _MissingDependency(
+        "missing optional dependency group strux[safetensors]"
+    )
 
 
-def struct(Class=None, *, static_fieldnames: typing.Sequence[str] = ()):
+# # # 
+# Core wrapper
+
+
+def struct(
+    Class=None,
+    *,
+    static_fieldnames: typing.Sequence[str] = (),
+):
     """
     Transform a class into an immutable dataclass that is also registered as a
     JAX PyTree. Can be used as a bare decorator or with keyword arguments:
@@ -111,83 +128,8 @@ def struct(Class=None, *, static_fieldnames: typing.Sequence[str] = ()):
     return Dataclass
 
 
-@functools.lru_cache(maxsize=None)
-def _make_struct_annotation(struct_cls, dims):
-    """
-    Create a type annotation representing a batched/vmapped struct.
-
-    For example, given:
-
-        @strux.struct
-        class Env:
-            pos: Int[Array, "2"]
-            walls: Bool[Array, "h w"]
-
-    Then Env["batch"] produces a type where isinstance checks verify as if it
-    were defined:
-
-        @strux.struct
-        class Envs:
-            pos: Int[Array, "batch 2"]
-            walls: Bool[Array, "batch h w"]
-    """
-    hints = typing.get_type_hints(struct_cls, include_extras=True)
-    expanded = {}
-    for name, hint in hints.items():
-        # don't propagate dims to meta fields
-        if name in struct_cls._meta_fields:
-            continue
-        # propagate dims to jaxtype and struct fields
-        is_jaxtype = (
-            isinstance(hint, type)
-            and hasattr(hint, 'dtype')
-            and hasattr(hint, 'array_type')
-            and hasattr(hint, 'dim_str')
-        )
-        is_struct = getattr(hint, '_is_strux_struct', False)
-        if is_jaxtype:
-            new_dims = f"{dims} {hint.dim_str}".strip()
-            expanded[name] = hint.dtype[hint.array_type, new_dims]
-        elif is_struct:
-            expanded[name] = hint[dims]
-        # unclear how to propagate otherwise
-        else:
-            _scalar_hints = {
-                float: 'Float[Array, ""]',
-                int: 'Int[Array, ""]',
-                bool: 'Bool[Array, ""]',
-                complex: 'Complex[Array, ""]',
-            }
-            msg = (
-                f"Cannot batch data field '{name}' of {struct_cls.__name__}: "
-                f"type {hint} is not a jaxtyping annotation or strux struct"
-            )
-            if hint in _scalar_hints:
-                msg += (
-                    f". If '{name}' is a scalar array, consider "
-                    f"annotating it as {_scalar_hints[hint]} instead of "
-                    f"{hint.__name__}"
-                )
-            raise TypeError(msg)
-    return _StructAnnotationMeta(
-        f'{struct_cls.__name__}["{dims}"]',
-        (),
-        {
-            '_struct_type': struct_cls,
-            '_field_hints': expanded,
-        },
-    )
-
-
-class _StructAnnotationMeta(type):
-    """Metaclass for batched struct type annotations with isinstance support."""
-    def __instancecheck__(cls, instance):
-        if not isinstance(instance, cls._struct_type):
-            return False
-        for field_name, expected_type in cls._field_hints.items():
-            if not isinstance(getattr(instance, field_name), expected_type):
-                return False
-        return True
+# # # 
+# Pretty printing
 
 
 def to_str(
@@ -316,6 +258,93 @@ def tree_format(tree, format_spec: str) -> str:
     )
 
 
+# # # 
+# Batch annotations
+
+
+@functools.lru_cache(maxsize=None)
+def _make_struct_annotation(struct_cls, dims):
+    """
+    Create a type annotation representing a batched/vmapped struct.
+
+    For example, given:
+
+        @strux.struct
+        class Env:
+            pos: Int[Array, "2"]
+            walls: Bool[Array, "h w"]
+
+    Then Env["batch"] produces a type where isinstance checks verify as if it
+    were defined:
+
+        @strux.struct
+        class Envs:
+            pos: Int[Array, "batch 2"]
+            walls: Bool[Array, "batch h w"]
+    """
+    hints = typing.get_type_hints(struct_cls, include_extras=True)
+    expanded = {}
+    for name, hint in hints.items():
+        # don't propagate dims to meta fields
+        if name in struct_cls._meta_fields:
+            continue
+        # propagate dims to jaxtype and struct fields
+        is_jaxtype = (
+            isinstance(hint, type)
+            and hasattr(hint, 'dtype')
+            and hasattr(hint, 'array_type')
+            and hasattr(hint, 'dim_str')
+        )
+        is_struct = getattr(hint, '_is_strux_struct', False)
+        if is_jaxtype:
+            new_dims = f"{dims} {hint.dim_str}".strip()
+            expanded[name] = hint.dtype[hint.array_type, new_dims]
+        elif is_struct:
+            expanded[name] = hint[dims]
+        # unclear how to propagate otherwise
+        else:
+            _scalar_hints = {
+                float: 'Float[Array, ""]',
+                int: 'Int[Array, ""]',
+                bool: 'Bool[Array, ""]',
+                complex: 'Complex[Array, ""]',
+            }
+            msg = (
+                f"Cannot batch data field '{name}' of {struct_cls.__name__}: "
+                f"type {hint} is not a jaxtyping annotation or strux struct"
+            )
+            if hint in _scalar_hints:
+                msg += (
+                    f". If '{name}' is a scalar array, consider "
+                    f"annotating it as {_scalar_hints[hint]} instead of "
+                    f"{hint.__name__}"
+                )
+            raise TypeError(msg)
+    return _StructAnnotationMeta(
+        f'{struct_cls.__name__}["{dims}"]',
+        (),
+        {
+            '_struct_type': struct_cls,
+            '_field_hints': expanded,
+        },
+    )
+
+
+class _StructAnnotationMeta(type):
+    """Metaclass for batched struct type annotations with isinstance support."""
+    def __instancecheck__(cls, instance):
+        if not isinstance(instance, cls._struct_type):
+            return False
+        for field_name, expected_type in cls._field_hints.items():
+            if not isinstance(getattr(instance, field_name), expected_type):
+                return False
+        return True
+
+
+# # # 
+# Shapes and indexing batched structs
+
+
 def tree_shape(tree) -> tuple[int, ...]:
     """
     Return the batch shape of a struct, i.e. the leading dimensions beyond
@@ -365,8 +394,8 @@ def tree_size(tree) -> int:
     return sum(jnp.size(x) for x in jax.tree.leaves(tree))
 
 
-# # #
-# Serialisation
+# # # 
+# Flattening
 
 
 def _keypath_to_str(keypath) -> str:
@@ -440,6 +469,10 @@ def from_dict(d: dict, *, template):
     return jax.tree.unflatten(treedef, leaves)
 
 
+# # # 
+# Serialisation
+
+
 _FORMAT_EXTENSIONS = {
     ".npz": "savez_compressed",
     ".safetensors": "safetensors",
@@ -448,14 +481,6 @@ _FORMAT_EXTENSIONS = {
 _SAVE_FORMATS = {"savez", "savez_compressed", "safetensors"}
 
 _LOAD_FORMATS = {"savez", "savez_compressed", "safetensors"}
-
-
-def _require_safetensors():
-    if safetensors_numpy is None:
-        raise ImportError(
-            "safetensors is required for the 'safetensors' format; "
-            "install it with: pip install strux[safetensors]"
-        )
 
 
 def _infer_format(path):
@@ -515,7 +540,6 @@ def save(path, tree, *, fmt=None):
     elif fmt == "savez":
         np.savez(path, **d)
     elif fmt == "safetensors":
-        _require_safetensors()
         safetensors_numpy.save_file(d, path)
 
 
@@ -538,6 +562,5 @@ def load(path, *, template, fmt=None):
     if fmt in ("savez", "savez_compressed"):
         d = dict(np.load(path))
     elif fmt == "safetensors":
-        _require_safetensors()
         d = safetensors_numpy.load_file(path)
     return from_dict(d, template=template)
