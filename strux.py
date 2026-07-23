@@ -288,6 +288,16 @@ def _make_struct_annotation(struct_cls, dims):
             pos: Int[Array, "batch 2"]
             walls: Bool[Array, "batch h w"]
     """
+    # batched annotations bottom out in jaxtyping annotations (every data
+    # field must be a jaxtype, a nested struct thereof, or a promoted plain
+    # scalar), so the feature as a whole requires the optional dependency
+    try:
+        import jaxtyping
+    except ImportError:
+        raise ImportError(
+            f'Batched struct annotations like {struct_cls.__name__}["{dims}"] '
+            f"require jaxtyping (pip install jaxtyping)"
+        ) from None
     hints = typing.get_type_hints(struct_cls, include_extras=True)
     expanded = {}
     for name, hint in hints.items():
@@ -310,15 +320,6 @@ def _make_struct_annotation(struct_cls, dims):
         elif hint in (bool, int, float, complex):
             # promote plain scalar hints to rank-0 jaxtyping annotations, so
             # that scalar fields batch like everything else
-            try:
-                import jaxtyping
-            except ImportError:
-                raise TypeError(
-                    f"Cannot batch data field '{name}' of "
-                    f"{struct_cls.__name__}: promoting plain scalar hint "
-                    f"'{hint.__name__}' requires jaxtyping "
-                    f"(pip install jaxtyping)"
-                )
             scalar_dtypes = {
                 bool: jaxtyping.Bool,
                 int: jaxtyping.Int,

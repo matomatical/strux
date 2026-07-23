@@ -426,8 +426,8 @@ Jaxtyping is optional for non-development installations, people should be able
 to install and use strux for easily creating jit-compatible dataclasses even if
 they don't use jaxtyping for type annotations. Strux detects jaxtyping
 annotations via duck typing (`hasattr(hint, 'dtype')` etc.). The exception is
-batching plain scalar hints (`MyStruct["batch"]` with a `loss: float` field),
-which imports jaxtyping to build the promoted annotation.
+the batched-annotation feature (`MyStruct["batch"]`), which inherently
+requires jaxtyping and raises a clear ImportError when it is missing.
 
 Reserved field names: fields named `replace`, `size`, `shape`, `save`, or
 `restore` shadow the corresponding convenience member (strux warns and skips

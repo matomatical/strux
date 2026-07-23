@@ -356,6 +356,19 @@ class TestAnnotationExpansion:
         with pytest.raises(TypeError, match="Cannot batch data field 'name'"):
             Bad["batch"]
 
+    def test_missing_jaxtyping_friendly_error(self, monkeypatch):
+        # without jaxtyping installed, batched annotations fail up front
+        # with a clear ImportError, whatever the field types
+        import sys
+
+        @strux.struct
+        class Fresh:
+            pos: Int[Array, "2"]
+
+        monkeypatch.setitem(sys.modules, "jaxtyping", None)
+        with pytest.raises(ImportError, match="require jaxtyping"):
+            Fresh["batch"]
+
     def test_plain_scalar_hints_promoted(self):
         # plain float/int/bool hints are promoted to rank-0 jaxtyping
         # annotations, so scalar fields batch like everything else
