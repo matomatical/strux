@@ -359,15 +359,28 @@ class TestAnnotationExpansion:
     def test_missing_jaxtyping_friendly_error(self, monkeypatch):
         # without jaxtyping installed, batched annotations fail up front
         # with a clear ImportError, whatever the field types
-        import sys
-
         @strux.struct
         class Fresh:
             pos: Int[Array, "2"]
 
-        monkeypatch.setitem(sys.modules, "jaxtyping", None)
+        monkeypatch.setattr(strux, "jaxtyping", None)
         with pytest.raises(ImportError, match="require jaxtyping"):
             Fresh["batch"]
+
+    def test_jaxtype_detection_is_exact(self):
+        # a class that merely duck-types the jaxtyping attributes is not
+        # treated as an array annotation
+        class Impostor:
+            dtype = None
+            array_type = None
+            dim_str = "2"
+
+        @strux.struct
+        class HasImpostor:
+            pos: Impostor
+
+        with pytest.raises(TypeError, match="Cannot batch data field 'pos'"):
+            HasImpostor["batch"]
 
     def test_plain_scalar_hints_promoted(self):
         # plain float/int/bool hints are promoted to rank-0 jaxtyping
@@ -622,6 +635,16 @@ class TestShape:
         # a batched instance: all of the value's dims are batch dims
         batched = Metrics(loss=jnp.zeros(4), step=jnp.arange(4))
         assert batched.shape == (4,)
+
+    def test_plain_scalar_shape_without_jaxtyping(self, monkeypatch):
+        # .shape degrades cleanly when jaxtyping is unavailable: no field
+        # can carry a jaxtyping annotation, plain scalar hints still work
+        @strux.struct
+        class Metrics:
+            loss: float
+
+        monkeypatch.setattr(strux, "jaxtyping", None)
+        assert Metrics(loss=jnp.zeros(4)).shape == (4,)
 
     def test_nested_struct(self):
         world = World(

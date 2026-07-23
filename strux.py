@@ -23,6 +23,26 @@ except ImportError:
         "missing optional dependency group strux[safetensors]"
     )
 
+# optional jaxtyping (the exclusive supported annotation framework; required
+# only for annotation-dependent features, see _is_jaxtype)
+try:
+    import jaxtyping
+except ImportError:
+    jaxtyping = None
+
+
+def _is_jaxtype(hint) -> bool:
+    """
+    Is this type hint a jaxtyping array annotation? Jaxtyping is the only
+    supported annotation framework, so if it is not installed, no hint can
+    be an array annotation.
+    """
+    return (
+        jaxtyping is not None
+        and isinstance(hint, type)
+        and issubclass(hint, jaxtyping.AbstractArray)
+    )
+
 
 # # # 
 # Core wrapper
@@ -291,13 +311,11 @@ def _make_struct_annotation(struct_cls, dims):
     # batched annotations bottom out in jaxtyping annotations (every data
     # field must be a jaxtype, a nested struct thereof, or a promoted plain
     # scalar), so the feature as a whole requires the optional dependency
-    try:
-        import jaxtyping
-    except ImportError:
+    if jaxtyping is None:
         raise ImportError(
             f'Batched struct annotations like {struct_cls.__name__}["{dims}"] '
             f"require jaxtyping (pip install jaxtyping)"
-        ) from None
+        )
     hints = typing.get_type_hints(struct_cls, include_extras=True)
     expanded = {}
     for name, hint in hints.items():
@@ -305,12 +323,7 @@ def _make_struct_annotation(struct_cls, dims):
         if name in struct_cls._meta_fields:
             continue
         # propagate dims to jaxtype and struct fields
-        is_jaxtype = (
-            isinstance(hint, type)
-            and hasattr(hint, 'dtype')
-            and hasattr(hint, 'array_type')
-            and hasattr(hint, 'dim_str')
-        )
+        is_jaxtype = _is_jaxtype(hint)
         is_struct = getattr(hint, '_is_strux_struct', False)
         if is_jaxtype:
             new_dims = f"{dims} {hint.dim_str}".strip()
@@ -374,12 +387,7 @@ def tree_shape(tree) -> tuple[int, ...]:
     for name in cls._data_fields:
         hint = hints[name]
         val = getattr(tree, name)
-        is_jaxtype = (
-            isinstance(hint, type)
-            and hasattr(hint, 'dtype')
-            and hasattr(hint, 'array_type')
-            and hasattr(hint, 'dim_str')
-        )
+        is_jaxtype = _is_jaxtype(hint)
         is_struct = getattr(hint, '_is_strux_struct', False)
         if is_jaxtype:
             base_ndim = len(hint.dim_str.split()) if hint.dim_str else 0

@@ -424,10 +424,13 @@ Single-file implementation (`strux.py`, though see `tests.py` for tests).
 
 Jaxtyping is optional for non-development installations, people should be able
 to install and use strux for easily creating jit-compatible dataclasses even if
-they don't use jaxtyping for type annotations. Strux detects jaxtyping
-annotations via duck typing (`hasattr(hint, 'dtype')` etc.). The exception is
-the batched-annotation feature (`MyStruct["batch"]`), which inherently
-requires jaxtyping and raises a clear ImportError when it is missing.
+they don't use jaxtyping for type annotations. However, jaxtyping is the
+*exclusive* supported annotation framework: strux imports it behind a guard
+(like safetensors) and checks hints against `jaxtyping.AbstractArray`. If
+jaxtyping is not installed then no field can carry an array annotation, so
+annotation-dependent features degrade cleanly: `.shape` sees only plain
+scalar hints, and the batched-annotation feature (`MyStruct["batch"]`)
+raises a clear ImportError.
 
 Reserved field names: fields named `replace`, `size`, `shape`, `save`, or
 `restore` shadow the corresponding convenience member (strux warns and skips
