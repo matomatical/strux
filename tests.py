@@ -356,14 +356,36 @@ class TestAnnotationExpansion:
         with pytest.raises(TypeError, match="Cannot batch data field 'name'"):
             Bad["batch"]
 
-    def test_scalar_type_hint_in_error(self):
+    def test_plain_scalar_hints_promoted(self):
+        # plain float/int/bool hints are promoted to rank-0 jaxtyping
+        # annotations, so scalar fields batch like everything else
         @strux.struct
-        class Bad:
+        class Metrics:
             pos: Int[Array, "2"]
             loss: float
+            step: int
+            done: bool
 
-        with pytest.raises(TypeError, match='Float\\[Array, ""\\]'):
-            Bad["batch"]
+        ann = Metrics["batch"]
+        assert ann._field_hints["loss"].dim_str == "batch"
+        assert ann._field_hints["step"].dim_str == "batch"
+        assert ann._field_hints["done"].dim_str == "batch"
+        # a batched instance passes the isinstance check
+        batched = Metrics(
+            pos=jnp.zeros((4, 2), dtype=jnp.int32),
+            loss=jnp.zeros(4),
+            step=jnp.zeros(4, dtype=jnp.int32),
+            done=jnp.zeros(4, dtype=bool),
+        )
+        assert isinstance(batched, ann)
+
+    def test_plain_scalar_hint_wrong_dtype_fails(self):
+        @strux.struct
+        class Loss:
+            loss: float
+
+        batched = Loss(loss=jnp.zeros(4, dtype=jnp.int32))
+        assert not isinstance(batched, Loss["batch"])
 
     def test_scalar_fields_no_trailing_space(self):
         # Float[Array, ""] is a scalar; batching should give "batch", not "batch "
@@ -575,6 +597,18 @@ class TestShape:
     def test_scalar_fields(self):
         p = Point(x=jnp.array([1.0, 2.0]), y=jnp.array([3.0, 4.0]))
         assert p.shape == (2,)
+
+    def test_plain_scalar_hint_fields(self):
+        @strux.struct
+        class Metrics:
+            loss: float
+            step: int
+
+        # python scalars have batch shape ()
+        assert Metrics(loss=1.0, step=7).shape == ()
+        # a batched instance: all of the value's dims are batch dims
+        batched = Metrics(loss=jnp.zeros(4), step=jnp.arange(4))
+        assert batched.shape == (4,)
 
     def test_nested_struct(self):
         world = World(
@@ -851,6 +885,22 @@ class TestSaveLoadErrors:
         with pytest.raises(FileExistsError, match="already exists"):
             strux.save(path, _make_env())
 
+    def test_overwrite_true_replaces(self, tmp_path):
+        path = tmp_path / "env.npz"
+        original = _make_env()
+        strux.save(path, original)
+        updated = original.replace(hero_pos=original.hero_pos + 1)
+        strux.save(path, updated, overwrite=True)
+        restored = strux.load(path, template=original)
+        _assert_equal(restored.hero_pos, updated.hero_pos)
+
+    def test_no_temporary_files_left_behind(self, tmp_path):
+        # saves go via a temporary file renamed over the destination
+        path = tmp_path / "env.npz"
+        strux.save(path, _make_env())
+        strux.save(path, _make_env(), overwrite=True)
+        assert [p.name for p in tmp_path.iterdir()] == ["env.npz"]
+
     def test_npz_defaults_to_compressed(self, tmp_path):
         # use a large zero array so compression is clearly effective
         @strux.struct
@@ -882,6 +932,14 @@ class TestSaveRestoreMethods:
         assert isinstance(restored, World)
         _assert_equal(restored.score, original.score)
         _assert_equal(restored.env.hero_pos, original.env.hero_pos)
+
+    def test_save_method_overwrite(self, tmp_path):
+        original = _make_world()
+        path = tmp_path / "world.npz"
+        original.save(path)
+        original.save(path, overwrite=True)
+        restored = original.restore(path)
+        _assert_equal(restored.score, original.score)
 
     def test_save_field_collision_warns(self):
         with pytest.warns(UserWarning, match="field named 'save'"):

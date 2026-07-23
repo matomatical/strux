@@ -213,6 +213,12 @@ and strux is installed with the optional `safetensors` dependency (`pip install
 strux[safetensors]`, then strux uses the
 [safetensors](https://huggingface.co/docs/safetensors/) memory-mapped format.
 
+By default, saving refuses to overwrite an existing file; pass
+`overwrite=True` to replace it (e.g. for repeatedly saving the latest
+checkpoint during training). Writes are atomic: data is written to a
+temporary file that is then renamed over the destination, so an interrupted
+save never leaves a partial file.
+
 For loading, by default the format of the file is inferred from the file
 extension. Strux requires a template struct, complete with values for all
 static fields, to load the data into memory. The shapes and data types of the
@@ -250,7 +256,9 @@ batches of data, parameters, or anything else. You can define your struct for
 the individual elements of the batch, and then annotate batched structs using
 type subscripting (e.g. `Image["batch_size"]`). The result is a new struct type
 with the batch dimension(s) prepended to each (non-static) field's jaxtyping
-annotation.
+annotation. Plain scalar hints (`float`, `int`, `bool`, `complex`) are
+promoted to rank-0 jaxtyping annotations, so e.g. a `loss: float` field
+batches as `Float[Array, "batch"]`.
 
 We could use this to implement a data batch or a neural network ensemble, or
 even depth-wise batches of layer parameters for use as inputs to
@@ -313,7 +321,6 @@ Output:
 GridWorld(
   hero_pos=jnp.int32[4,2],
   walls=jnp.bool[4,5,5],
-  size=int(5),
 )
 hero positions before step:
 [[0 0]
@@ -418,7 +425,15 @@ Single-file implementation (`strux.py`, though see `tests.py` for tests).
 Jaxtyping is optional for non-development installations, people should be able
 to install and use strux for easily creating jit-compatible dataclasses even if
 they don't use jaxtyping for type annotations. Strux detects jaxtyping
-annotations via duck typing (`hasattr(hint, 'dtype')` etc.).
+annotations via duck typing (`hasattr(hint, 'dtype')` etc.). The exception is
+batching plain scalar hints (`MyStruct["batch"]` with a `loss: float` field),
+which imports jaxtyping to build the promoted annotation.
+
+Reserved field names: fields named `replace`, `size`, `shape`, `save`, or
+`restore` shadow the corresponding convenience member (strux warns and skips
+adding it); the module-level equivalents (`dataclasses.replace`,
+`strux.tree_size`, `strux.tree_shape`, `strux.save`, `strux.load`) always
+remain available.
 
 ### Testing
 

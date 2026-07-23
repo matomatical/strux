@@ -1,6 +1,7 @@
 import dataclasses
 import functools
 import os
+import tempfile
 import typing
 import warnings
 
@@ -82,32 +83,36 @@ def struct(
     else:
         warnings.warn(
             f"{Class.__name__} has a field named 'replace', so the "
-            f"convenience method .replace() will not be available",
+            f"convenience method .replace() will not be available; use "
+            f"dataclasses.replace(obj, ...) instead",
         )
     if "size" not in fields:
         Dataclass.size = property(tree_size)
     else:
         warnings.warn(
             f"{Class.__name__} has a field named 'size', so the "
-            f"convenience property .size will not be available",
+            f"convenience property .size will not be available; use "
+            f"strux.tree_size(obj) instead",
         )
     if "shape" not in fields:
         Dataclass.shape = property(tree_shape)
     else:
         warnings.warn(
             f"{Class.__name__} has a field named 'shape', so the "
-            f"convenience property .shape will not be available",
+            f"convenience property .shape will not be available; use "
+            f"strux.tree_shape(obj) instead",
         )
     Dataclass.__getitem__ = tree_getitem
     if "save" not in fields:
-        def _save_method(self, path, *, fmt=None):
+        def _save_method(self, path, *, fmt=None, overwrite=False):
             """Save this struct to disk. See strux.save for details."""
-            return save(path, self, fmt=fmt)
+            return save(path, self, fmt=fmt, overwrite=overwrite)
         Dataclass.save = _save_method
     else:
         warnings.warn(
             f"{Class.__name__} has a field named 'save', so the "
-            f"convenience method .save() will not be available",
+            f"convenience method .save() will not be available; use "
+            f"strux.save(path, obj) instead",
         )
     if "restore" not in fields:
         def _restore_method(self, path, *, fmt=None):
@@ -117,7 +122,8 @@ def struct(
     else:
         warnings.warn(
             f"{Class.__name__} has a field named 'restore', so the "
-            f"convenience method .restore() will not be available",
+            f"convenience method .restore() will not be available; use "
+            f"strux.load(path, template=obj) instead",
         )
 
     # allow type subscripting for annotating batched/vmapped pytrees,
@@ -301,25 +307,32 @@ def _make_struct_annotation(struct_cls, dims):
             expanded[name] = hint.dtype[hint.array_type, new_dims]
         elif is_struct:
             expanded[name] = hint[dims]
+        elif hint in (bool, int, float, complex):
+            # promote plain scalar hints to rank-0 jaxtyping annotations, so
+            # that scalar fields batch like everything else
+            try:
+                import jaxtyping
+            except ImportError:
+                raise TypeError(
+                    f"Cannot batch data field '{name}' of "
+                    f"{struct_cls.__name__}: promoting plain scalar hint "
+                    f"'{hint.__name__}' requires jaxtyping "
+                    f"(pip install jaxtyping)"
+                )
+            scalar_dtypes = {
+                bool: jaxtyping.Bool,
+                int: jaxtyping.Int,
+                float: jaxtyping.Float,
+                complex: jaxtyping.Complex,
+            }
+            expanded[name] = scalar_dtypes[hint][jaxtyping.Array, dims]
         # unclear how to propagate otherwise
         else:
-            _scalar_hints = {
-                float: 'Float[Array, ""]',
-                int: 'Int[Array, ""]',
-                bool: 'Bool[Array, ""]',
-                complex: 'Complex[Array, ""]',
-            }
-            msg = (
+            raise TypeError(
                 f"Cannot batch data field '{name}' of {struct_cls.__name__}: "
-                f"type {hint} is not a jaxtyping annotation or strux struct"
+                f"type {hint} is not a jaxtyping annotation, strux struct, "
+                f"or plain scalar type"
             )
-            if hint in _scalar_hints:
-                msg += (
-                    f". If '{name}' is a scalar array, consider "
-                    f"annotating it as {_scalar_hints[hint]} instead of "
-                    f"{hint.__name__}"
-                )
-            raise TypeError(msg)
     return _StructAnnotationMeta(
         f'{struct_cls.__name__}["{dims}"]',
         (),
@@ -372,6 +385,10 @@ def tree_shape(tree) -> tuple[int, ...]:
             bs = val.shape[:val.ndim - base_ndim] if base_ndim > 0 else val.shape
         elif is_struct:
             bs = val.shape
+        elif hint in (bool, int, float, complex):
+            # plain scalar hint: all of the value's dims are batch dims
+            # (np.shape handles Python scalars, which have shape ())
+            bs = np.shape(val)
         else:
             continue
         if batch_shape is None:
@@ -495,7 +512,7 @@ def _infer_format(path):
     return _FORMAT_EXTENSIONS[ext]
 
 
-def save(path, tree, *, fmt=None):
+def save(path, tree, *, fmt=None, overwrite=False):
     """
     Save a struct to disk.
 
@@ -510,37 +527,62 @@ def save(path, tree, *, fmt=None):
     * 'safetensors' --- safetensors format (requires `safetensors`
       package: `pip install strux[safetensors]`).
 
-    Raises FileExistsError if the destination file already exists, to
-    prevent accidental data loss. This check is not atomic, so concurrent
-    writers to the same path are not fully guarded against; use distinct
-    paths per process if saving concurrently.
+    By default, raises FileExistsError if the destination file already
+    exists, to prevent accidental data loss; pass overwrite=True to
+    replace it (e.g. for repeatedly saving the latest checkpoint during
+    training).
 
-    Note: numpy's savez/savez_compressed will append '.npz' to the path
-    if it doesn't already end in '.npz'. Safetensors writes to the exact
-    path given. For consistent behaviour, use '.npz' or '.safetensors'
-    extensions explicitly.
+    The write is atomic: data is first written to a temporary file in the
+    same directory, which is then renamed over the destination, so an
+    interrupted save never leaves a partial file at the destination. (The
+    overwrite=False existence check itself is not atomic, so simultaneous
+    savers to the same path can still race it; use distinct paths per
+    process if saving concurrently.)
+
+    Note: for the npz formats, '.npz' is appended to the path if it
+    doesn't already end in '.npz' (matching numpy's savez behaviour).
+    Safetensors writes to the exact path given. For consistent behaviour,
+    use '.npz' or '.safetensors' extensions explicitly.
     """
     if fmt is None:
         fmt = _infer_format(path)
     if fmt not in _SAVE_FORMATS:
         raise ValueError(f"Unknown format: {fmt!r}")
-    # check for existing file to prevent silent data loss
-    # (numpy appends .npz if not already present, so check that too)
+    # resolve the true destination (numpy conventionally appends .npz)
     dest = os.fspath(path)
     if fmt in ("savez", "savez_compressed") and not dest.endswith(".npz"):
         dest = dest + ".npz"
-    if os.path.exists(dest):
+    # check for existing file to prevent silent data loss
+    if not overwrite and os.path.exists(dest):
         raise FileExistsError(
             f"File already exists: {dest!r}. "
-            f"Remove it first to avoid accidental data loss."
+            f"Pass overwrite=True to replace it."
         )
     d = to_dict(tree)
-    if fmt == "savez_compressed":
-        np.savez_compressed(path, **d)
-    elif fmt == "savez":
-        np.savez(path, **d)
-    elif fmt == "safetensors":
-        safetensors_numpy.save_file(d, path)
+    # write to a temporary file in the destination directory, then rename it
+    # over the destination, so an interrupted save can't corrupt an existing
+    # file
+    fd, tmp = tempfile.mkstemp(
+        dir=os.path.dirname(dest) or ".",
+        prefix=os.path.basename(dest) + ".tmp.",
+    )
+    try:
+        if fmt == "savez_compressed":
+            with os.fdopen(fd, "wb") as f:
+                np.savez_compressed(f, **d)
+        elif fmt == "savez":
+            with os.fdopen(fd, "wb") as f:
+                np.savez(f, **d)
+        elif fmt == "safetensors":
+            os.close(fd)
+            safetensors_numpy.save_file(d, tmp)
+        os.replace(tmp, dest)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def load(path, *, template, fmt=None):
