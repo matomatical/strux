@@ -30,6 +30,21 @@ try:
 except ImportError:
     jaxtyping = None
 
+# dataclass_transform (PEP 681) tells static type checkers like mypy that
+# @strux.struct generates dataclass semantics (an __init__ from the field
+# annotations, frozen instances). In the standard library from python
+# 3.11; harmless no-op fallback below it.
+try:
+    from typing import dataclass_transform
+except ImportError:
+    try:
+        from typing_extensions import dataclass_transform
+    except ImportError:
+        def dataclass_transform(**kwargs):
+            def identity(cls_or_fn):
+                return cls_or_fn
+            return identity
+
 
 def _is_jaxtype(hint) -> bool:
     """
@@ -48,6 +63,7 @@ def _is_jaxtype(hint) -> bool:
 # Core wrapper
 
 
+@dataclass_transform(frozen_default=True, field_specifiers=(dataclasses.field,))
 def struct(
     Class=None,
     *,
