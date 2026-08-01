@@ -592,6 +592,178 @@ class TestJaxtypedIntegration:
 
 
 # # #
+# Batch-tolerant constructor checking
+
+
+class TestCheckedConstruction:
+    """
+    Runtime type checkers that wrap dataclass constructors see relaxed
+    __init__ annotations: dtype and trailing shape are enforced, leading
+    batch dims are free. Applying @jaxtyped directly to the class is
+    equivalent to what jaxtyping's import hook does to every class in a
+    checked module (it wraps the generated __init__ in place).
+    """
+
+    def test_element_construction_passes(self):
+        @jaxtyped(typechecker=beartype)
+        @strux.struct
+        class Goal:
+            weight: Float[Array, ""]
+
+        Goal(weight=jnp.float32(1.0))
+
+    def test_wrong_dtype_raises(self):
+        @jaxtyped(typechecker=beartype)
+        @strux.struct
+        class Goal:
+            weight: Float[Array, ""]
+
+        with pytest.raises(Exception):
+            Goal(weight=jnp.int32(1))
+
+    def test_batched_leaves_pass(self):
+        # for a rank-0 field every shape is a legal batch shape
+        @jaxtyped(typechecker=beartype)
+        @strux.struct
+        class Goal:
+            weight: Float[Array, ""]
+
+        Goal(weight=jnp.ones((4, 2)))
+
+    def test_trailing_shape_still_enforced(self):
+        @jaxtyped(typechecker=beartype)
+        @strux.struct
+        class Path:
+            points: Float[Array, "n 2"]
+
+        Path(points=jnp.ones((5, 2)))        # element
+        Path(points=jnp.ones((7, 5, 2)))     # batch of 7
+        with pytest.raises(Exception):
+            Path(points=jnp.ones((5,)))      # rank too low
+        with pytest.raises(Exception):
+            Path(points=jnp.ones((7, 5, 3))) # trailing dim mismatch
+
+    def test_vmap_construction_passes(self):
+        @jaxtyped(typechecker=beartype)
+        @strux.struct
+        class Goal:
+            weight: Float[Array, ""]
+
+        goals = jax.vmap(lambda w: Goal(weight=w))(jnp.arange(3.0))
+        assert goals.shape == (3,)
+
+    def test_scan_construction_passes(self):
+        @jaxtyped(typechecker=beartype)
+        @strux.struct
+        class Goal:
+            weight: Float[Array, ""]
+
+        _, goals = jax.lax.scan(
+            lambda carry, w: (carry, Goal(weight=w)),
+            None,
+            jnp.arange(3.0),
+        )
+        assert goals.shape == (3,)
+
+    def test_tree_stack_construction_passes(self):
+        @jaxtyped(typechecker=beartype)
+        @strux.struct
+        class Goal:
+            weight: Float[Array, ""]
+
+        goals = jax.tree.map(
+            lambda *leaves: jnp.stack(leaves),
+            *[Goal(weight=jnp.float32(w)) for w in (0.0, 0.5, 1.0)],
+        )
+        assert goals.shape == (3,)
+
+    def test_replace_on_batched_struct_passes(self):
+        # dataclasses.replace goes through the wrapped __init__ too
+        @jaxtyped(typechecker=beartype)
+        @strux.struct
+        class Goal:
+            weight: Float[Array, ""]
+
+        goals = jax.vmap(lambda w: Goal(weight=w))(jnp.arange(3.0))
+        goals.replace(weight=jnp.ones(3))
+
+    def test_inconsistent_batch_dims_rejected(self):
+        # leading batch dims are free, but must agree across array fields
+        @jaxtyped(typechecker=beartype)
+        @strux.struct
+        class Pair:
+            u: Float[Array, ""]
+            v: Float[Array, ""]
+
+        Pair(u=jnp.ones(3), v=jnp.ones(3))
+        with pytest.raises(Exception):
+            Pair(u=jnp.ones(3), v=jnp.ones(4))
+        with pytest.raises(Exception):
+            Pair(u=jnp.ones(3), v=jnp.float32(1.0))  # partially batched
+
+    def test_user_dim_named_batch_no_collision(self):
+        # a regular dim that the user names "batch" is independent of the
+        # "*batch" variadic prefix (separate namespaces in jaxtyping)
+        @jaxtyped(typechecker=beartype)
+        @strux.struct
+        class Frames:
+            frames: Float[Array, "batch 2"]
+            count: Int[Array, ""]
+
+        Frames(frames=jnp.ones((7, 2)), count=jnp.int32(7))
+        Frames(
+            frames=jnp.ones((3, 7, 2)),
+            count=jnp.ones(3, dtype=jnp.int32),
+        )
+
+    def test_scalar_field_accepts_scalar_and_batched_array(self):
+        @jaxtyped(typechecker=beartype)
+        @strux.struct
+        class Config:
+            coeff: float
+
+        Config(coeff=0.5)
+        Config(coeff=jnp.ones(3))
+        with pytest.raises(Exception):
+            Config(coeff=jnp.ones(3, dtype=jnp.int32))
+
+    def test_scalar_field_batch_constraints(self):
+        # a python scalar leaves the batch shape unconstrained; an array
+        # value participates in the cross-field consistency check
+        @jaxtyped(typechecker=beartype)
+        @strux.struct
+        class Config:
+            coeff: float
+            u: Float[Array, ""]
+
+        Config(coeff=0.5, u=jnp.ones(3))
+        Config(coeff=jnp.ones(3), u=jnp.ones(3))
+        with pytest.raises(Exception):
+            Config(coeff=jnp.ones(4), u=jnp.ones(3))
+
+    def test_static_field_checked_exactly(self):
+        @jaxtyped(typechecker=beartype)
+        @strux.struct(static_fieldnames=("label",))
+        class Config:
+            coeff: Float[Array, ""]
+            label: str
+
+        Config(coeff=jnp.float32(1.0), label="ok")
+        with pytest.raises(Exception):
+            Config(coeff=jnp.float32(1.0), label=42)
+
+    def test_variadic_annotation_left_alone(self):
+        @jaxtyped(typechecker=beartype)
+        @strux.struct
+        class History:
+            values: Float[Array, "..."]
+
+        History(values=jnp.ones((2, 3, 4)))
+        with pytest.raises(Exception):
+            History(values=jnp.ones((2, 3, 4), dtype=jnp.int32))
+
+
+# # #
 # Batch shape
 
 

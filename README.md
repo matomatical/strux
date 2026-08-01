@@ -406,6 +406,18 @@ envs = checked_step(envs, actions) # envs, actions from previous example
 # checked_step(envs, jnp.array([1, 2]))  # beartype raises!
 ```
 
+The annotations on struct fields should always describe the components of
+a single *element* of the struct, even though instances may carry extra
+leading batch dims. Checked construction respects this: JAX rebuilds
+structs by calling the constructor during pytree unflattening, so `vmap`,
+`scan`, and tree-stacking all construct structs with batch-dim'd leaves.
+Strux therefore relaxes the annotations on the generated `__init__`, and a
+checker that wraps dataclass constructors (such as jaxtyping's import
+hook) enforces each field's dtype and trailing shape at construction while
+allowing any leading batch dims, so long as the fields agree on them.
+Discipline about a *specific* batch shape belongs at function boundaries,
+as above.
+
 Development
 -----------
 
@@ -458,6 +470,7 @@ Advanced features:
 - [x] `isinstance` support and integrate with jaxtyping + beartype
 - [x] Save/load structs to/from disk (e.g. serialisation with pytree structure)
 - [x] Support indexing and shape directly on batched structs, e.g., `env[0]`.
+- [x] Batch-tolerant constructor checking under runtime type checkers
 - [ ] Pretty print registered pytree classes that aren't dataclasses
 - [ ] Construct empty structs from type annotations (for use as load templates)
 

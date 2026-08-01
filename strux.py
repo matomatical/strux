@@ -165,9 +165,67 @@ def struct(
     # allow type subscripting for annotating batched/vmapped pytrees,
     Dataclass._is_strux_struct = True
     Dataclass.__class_getitem__ = classmethod(_make_struct_annotation)
-    
+
+    # relax the generated __init__'s annotations on the data fields so that
+    # runtime type checkers tolerate leading batch dims at construction (the
+    # class's own field annotations stay rank-exact: they describe the
+    # element)
+    if jaxtyping is not None:
+        init_annotations = Dataclass.__init__.__annotations__
+        for name in data_fields:
+            init_annotations[name] = _relax_annotation(init_annotations[name])
+
     # done!
     return Dataclass
+
+
+def _relax_annotation(hint):
+    """
+    Return a batch-tolerant version of a field annotation, for use on the
+    generated __init__.
+
+    A struct's field annotations describe the *element*, but instances may
+    carry extra leading batch dims on every leaf, and batched instances are
+    constructed through __init__: JAX rebuilds structs by calling the
+    constructor during pytree unflattening, so a vmap that returns a struct,
+    a scan that collects one struct per step, or a tree-stack of structs all
+    call __init__ with batch-dim'd leaves. Runtime type checkers that wrap
+    dataclass constructors (such as jaxtyping's import hook with beartype)
+    would reject those calls if they enforced the field annotations exactly,
+    so the __init__ annotations must instead tolerate leading batch dims:
+
+    * jaxtyping annotations get a named variadic prefix ("n 2" becomes
+      "*batch n 2"), preserving the dtype check and the trailing shape
+      check while leaving the leading dims free — except that within one
+      call, "*batch" must bind to the same dims everywhere, so all array
+      fields must agree on the batch shape (annotations that already
+      contain a variadic dim are returned unchanged; a regular dim that a
+      user happens to name "batch" cannot collide, because jaxtyping keeps
+      variadic and regular dim names in separate namespaces);
+    * plain scalar annotations (bool/int/float/complex) become a union of
+      the scalar type and a "*batch" array of the matching dtype, mirroring
+      their promotion for batching purposes elsewhere (a Python scalar
+      matches the scalar arm and leaves "*batch" unbound, so scalar fields
+      never constrain the batch shape);
+    * anything else (nested structs, unresolved string annotations, other
+      types) is returned unchanged.
+
+    Static type checkers never see this rewrite: they derive __init__ from
+    the class's field annotations (PEP 681), which remain rank-exact.
+    """
+    if _is_jaxtype(hint) and hint.index_variadic is None:
+        batched_dims = f"*batch {hint.dim_str}".strip()
+        return hint.dtype[hint.array_type, batched_dims]
+    elif hint is bool:
+        return typing.Union[bool, jaxtyping.Bool[jaxtyping.Array, "*batch"]]
+    elif hint is int:
+        return typing.Union[int, jaxtyping.Int[jaxtyping.Array, "*batch"]]
+    elif hint is float:
+        return typing.Union[float, jaxtyping.Float[jaxtyping.Array, "*batch"]]
+    elif hint is complex:
+        return typing.Union[complex, jaxtyping.Complex[jaxtyping.Array, "*batch"]]
+    else:
+        return hint
 
 
 # # # 
