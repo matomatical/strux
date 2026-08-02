@@ -334,6 +334,9 @@ class Schema:
     """
     cls: type
     fields: dict
+    # precompiled validation plan for the common all-simple-fields case
+    # (None when any field needs the general solver); see _fast_plan
+    fast_plan: tuple | None = None
 
     def __str__(self):
         lines = [f"schema {self.cls.__name__}:"]
@@ -374,9 +377,69 @@ def schema(cls) -> Schema:
         context = f"{cls.__name__}.{name}"
         hint = _resolve_hint(hint, owner=owner, cls=cls, context=context)
         fields[name] = _parse_hint(hint, context=context)
-    result = Schema(cls=cls, fields=fields)
+    result = Schema(cls=cls, fields=fields, fast_plan=_fast_plan(fields))
     cls._strux_schema = result
     return result
+
+
+def _fast_plan(fields):
+    """
+    Precompile the validation plan for the common case: every field is a
+    rank-determined array, or a scalar-or-rank-0-array union. Returns None
+    (use the general solver) if any field is more complex. Plan entries:
+    (name, dtype_names_frozenset_or_None, ndim_or_None, fixed) — ndim None
+    marks a scalar-ish slot (python scalars skipped, arrays contribute
+    their full shape as the batch).
+    """
+    plan = []
+    for name, spec in fields.items():
+        if isinstance(spec, _ArraySpec) and spec.ndim is not None:
+            dtype_set = (
+                _concrete_dtypes(spec.dtypes)
+                if spec.dtypes is not None
+                else None
+            )
+            plan.append((name, dtype_set, spec.ndim, spec.fixed))
+        elif isinstance(spec, _UnionSpec) and all(
+            isinstance(arm, _PyScalarSpec)
+            or (
+                isinstance(arm, _ArraySpec)
+                and arm.ndim == 0
+                and arm.dtypes is not None
+            )
+            for arm in spec.arms
+        ):
+            # scalar-ish: python scalar (batch-agnostic) or rank-0 array
+            dtype_set = _concrete_dtypes(
+                frozenset().union(
+                    *(
+                        arm.dtypes
+                        for arm in spec.arms
+                        if isinstance(arm, _ArraySpec)
+                    )
+                )
+            )
+            plan.append((name, dtype_set, None, ()))
+        else:
+            return None
+    return tuple(plan)
+
+
+def _concrete_dtypes(dtype_names):
+    """
+    Resolve dtype names to np.dtype objects for fast membership tests
+    (dtype.name is computed dynamically by numpy and is far slower).
+    Names that don't resolve to concrete dtypes (regex-style patterns,
+    exotic kinds) are dropped: such values fail the fast path and are
+    judged by the general solver instead.
+    """
+    dtypes = set()
+    for dtype_name in dtype_names:
+        try:
+            dtypes.add(np.dtype(dtype_name))
+        except TypeError:
+            pass
+    return frozenset(dtypes)
 
 
 def _field_hint(cls, name):
@@ -779,10 +842,48 @@ def _validate_struct(instance):
     annotations themselves cannot be compiled).
     """
     cls = type(instance)
+    sch = schema(cls)
+    # fast path: simple fields validated with plain tuple arithmetic; any
+    # anomaly (including acceptable oddities like float0 cotangents and
+    # prng-key dtypes) falls through to the general solver, which either
+    # accepts them or raises with a precise message
+    plan = sch.fast_plan
+    if plan is not None and _fast_validate(instance, plan):
+        return
     meet = _BatchMeet()
-    for name, spec in schema(cls).fields.items():
+    for name, spec in sch.fields.items():
         path = f"{cls.__name__}.{name}"
         meet.add(path, _candidates(getattr(instance, name), spec, path))
+
+
+def _fast_validate(instance, plan):
+    batch = None
+    for name, dtype_set, ndim, fixed in plan:
+        value = getattr(instance, name)
+        if ndim is None and isinstance(value, (bool, int, float, complex)):
+            continue    # scalar-ish slot with a python scalar
+        try:
+            shape = value.shape
+            dtype = value.dtype
+        except AttributeError:
+            return False
+        if dtype_set is not None and dtype not in dtype_set:
+            return False
+        if ndim is None:
+            value_batch = tuple(shape)
+        else:
+            cut = len(shape) - ndim
+            if cut < 0:
+                return False
+            for offset, size in fixed:
+                if shape[len(shape) + offset] != size:
+                    return False
+            value_batch = tuple(shape[:cut])
+        if batch is None:
+            batch = value_batch
+        elif value_batch != batch:
+            return False
+    return True
 
 
 # # # 
