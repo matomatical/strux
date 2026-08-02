@@ -387,11 +387,20 @@ A struct's field annotations describe one *element* of the struct, and they
 are compiled (lazily, on first use) into a per-class schema of shape
 constraints. Construction validates against the schema: dtype kind and
 trailing (element) dims are enforced, while leading batch dims are free —
-but must agree across every field. This is what makes annotations, batching,
-and JAX's tree machinery coexist: JAX rebuilds structs through the
-constructor when unflattening, so a `vmap` that returns structs, a `scan`
-that stacks one struct per step, and a tree-stack all construct instances
-whose leaves carry batch dims beyond the annotations.
+but must agree across every field. Batch tolerance is what makes
+annotations and batching coexist: instances routinely carry leading batch
+dims beyond the annotations (a stack of levels built from numpy, a restored
+checkpoint of rollouts), and construction accepts any consistent batch.
+
+Validation guards the user API boundary — direct construction and
+`.replace` — while reconstruction through JAX's tree machinery
+(`jax.tree.map` results, `vmap`/`scan`/`jit` outputs, gradients) is
+*structural* and never validated: transformed trees legitimately carry
+leaves that differ from the declared element types (mapping
+`jnp.array_equal` over two structs yields rank-0 bools; cotangents carry
+`float0`). In practice this still catches shape bugs where they are born,
+because traced code builds its result structs with `.replace(...)`, which
+validates at trace time.
 
 ```python
 import jax
@@ -485,9 +494,9 @@ schema Level:
 
 Checked construction is on by default; pass `@strux.struct(check=False)`
 to opt a class out (its schema-driven features like `.shape` still work).
-The check runs on every construction, including JAX's internal
-unflattening — the cost is a few microseconds per field, negligible next
-to dispatch except in the very hottest of loops.
+The check costs about a microsecond per construction for simple schemas,
+and runs only on direct construction and `.replace` — JAX's internal tree
+reconstructions skip it entirely.
 
 ### Runtime type checking
 

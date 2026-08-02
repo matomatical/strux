@@ -1,3 +1,4 @@
+import ast
 import collections.abc
 import dataclasses
 import functools
@@ -105,11 +106,42 @@ def struct(
     Dataclass._data_fields = data_fields
     Dataclass._meta_fields = meta_fields
     
-    # register dataclass as a JAX pytree node
-    jax.tree_util.register_dataclass(
-        nodetype=Dataclass,
-        data_fields=data_fields,
-        meta_fields=meta_fields,
+    # register as a JAX pytree node. Reconstruction through JAX's tree
+    # machinery (tree.map results, vmap/scan/jit outputs, gradients) is
+    # *structural*: it bypasses __init__ and hence validation, because
+    # transformed trees legitimately carry leaves that differ from the
+    # declared element types (tree.map(jnp.array_equal, ...) yields bool
+    # scalars, cotangents carry float0, masks change dtypes). Validation
+    # guards the user API boundary instead: direct construction and
+    # .replace. (For the same reason, __post_init__ logic runs on direct
+    # construction only, never on tree reconstruction.)
+    data_fields_tuple = tuple(data_fields)
+    meta_fields_tuple = tuple(meta_fields)
+    def _flatten_with_keys(obj):
+        return (
+            [
+                (jax.tree_util.GetAttrKey(name), getattr(obj, name))
+                for name in data_fields_tuple
+            ],
+            tuple(getattr(obj, name) for name in meta_fields_tuple),
+        )
+    def _flatten(obj):
+        return (
+            tuple(getattr(obj, name) for name in data_fields_tuple),
+            tuple(getattr(obj, name) for name in meta_fields_tuple),
+        )
+    def _unflatten(meta, data):
+        obj = object.__new__(Dataclass)
+        for name, value in zip(data_fields_tuple, data):
+            object.__setattr__(obj, name, value)
+        for name, value in zip(meta_fields_tuple, meta):
+            object.__setattr__(obj, name, value)
+        return obj
+    jax.tree_util.register_pytree_with_keys(
+        Dataclass,
+        _flatten_with_keys,
+        _unflatten,
+        flatten_func=_flatten,
     )
     
     # overwrite string render methods to use pretty printing
@@ -1278,16 +1310,41 @@ def to_dict(tree) -> dict[str, np.ndarray]:
     return d
 
 
-def from_dict(d: dict, *, template):
+def from_dict(d: dict, *, template, statics=None):
     """
     Reconstruct a struct from a dict of arrays, using a template for structure.
 
-    The template determines the pytree structure, field order, and static field
-    values. Only the data (array) leaves are replaced with values from `d`.
+    The template is either an *instance* (the classic path: it determines
+    the pytree structure, field order, and static field values, and only
+    the data leaves are replaced from `d`) or a struct *class* (the
+    template-free path: the structure is derived from the class's schema
+    and the dict's keys). In the class case, static fields take their
+    values from `statics` — a dict mapping '/'-joined field paths (e.g.
+    "activate", "linear1/activate") to values — or from their defaults;
+    a missing static value raises KeyError naming the path to pass.
+
+    The template-free path covers schemas made of arrays, scalars, nested
+    dataclass structs, containers, and optionals (a union whose data is
+    absent restores as None). It cannot reconstruct polymorphic fields
+    (annotated with a base class but holding subclass instances) — restore
+    those with an instance template.
 
     The keys in `d` must exactly match the keys expected by the template.
     Raises KeyError on missing or extra keys.
     """
+    if isinstance(template, type):
+        built, consumed = _build_from_dict(template, d, statics or {}, "")
+        extra = d.keys() - consumed
+        if extra:
+            raise KeyError(
+                f"Key mismatch in from_dict: extra keys: {sorted(extra)}"
+            )
+        return built
+    if statics is not None:
+        raise TypeError(
+            "statics= applies only when template is a class; an instance "
+            "template already carries its static field values"
+        )
     paths_and_leaves, treedef = jax.tree.flatten_with_path(template)
     keys = set(_keypath_to_str(path) for path, _ in paths_and_leaves)
     missing = keys - d.keys()
@@ -1301,6 +1358,133 @@ def from_dict(d: dict, *, template):
         raise KeyError(f"Key mismatch in from_dict: {'; '.join(parts)}")
     leaves = [jnp.asarray(d[_keypath_to_str(path)]) for path, _ in paths_and_leaves]
     return jax.tree.unflatten(treedef, leaves)
+
+
+def _build_from_dict(cls, d, statics, prefix):
+    """
+    Build an instance of a struct class from saved leaves, guided by its
+    schema. Returns (instance, set of consumed keys).
+    """
+    if not dataclasses.is_dataclass(cls):
+        raise TypeError(
+            f"template class {cls.__name__} is not a struct/dataclass"
+        )
+    field_specs = schema(cls).fields
+    values = {}
+    consumed = set()
+    for field in dataclasses.fields(cls):
+        name = field.name
+        path = f"{prefix}{name}"
+        if name in field_specs:
+            value, keys = _build_value(field_specs[name], d, statics, path)
+            values[name] = value
+            consumed |= keys
+        else:
+            # static field: from statics, or the field's default
+            if path in statics:
+                values[name] = statics[path]
+            elif field.default is not dataclasses.MISSING:
+                values[name] = field.default
+            elif field.default_factory is not dataclasses.MISSING:
+                values[name] = field.default_factory()
+            else:
+                raise KeyError(
+                    f"static field {path!r} needs a value: pass "
+                    f"statics={{{path!r}: ...}}"
+                )
+    return cls(**values), consumed
+
+
+def _build_value(spec, d, statics, path):
+    if isinstance(spec, (_ArraySpec, _PyScalarSpec)):
+        if path not in d:
+            raise KeyError(f"missing saved array for {path!r}")
+        return jnp.asarray(d[path]), {path}
+    elif isinstance(spec, _NoneSpec):
+        return None, set()
+    elif isinstance(spec, _UnionSpec):
+        # an array saved at exactly this path: the array arm
+        if path in d:
+            return jnp.asarray(d[path]), {path}
+        # keys strictly below this path: the first structured arm that fits
+        if any(key.startswith(path + "/") for key in d):
+            failures = []
+            for arm in spec.arms:
+                if isinstance(arm, (_ClassSpec, _ContainerSpec)):
+                    try:
+                        return _build_value(arm, d, statics, path)
+                    except (KeyError, TypeError) as e:
+                        failures.append(f"as {arm}: {e}")
+            raise KeyError(
+                f"cannot reconstruct {path!r} under any arm of {spec}: "
+                + "; ".join(failures)
+            )
+        # no data at all: the None arm, if there is one
+        if any(isinstance(arm, _NoneSpec) for arm in spec.arms):
+            return None, set()
+        raise KeyError(f"missing saved data for {path!r}")
+    elif isinstance(spec, _ClassSpec):
+        if dataclasses.is_dataclass(spec.cls):
+            return _build_from_dict(spec.cls, d, statics, f"{path}/")
+        raise TypeError(
+            f"{path!r}: cannot reconstruct a {spec.cls.__name__} from a "
+            "class template (the saved value's concrete type is unknown); "
+            "restore with an instance template"
+        )
+    elif isinstance(spec, _ContainerSpec):
+        # immediate child segments below this path, in saved order
+        # (note: quoted dict keys containing '/' are not supported here)
+        child_prefix = path + "/"
+        segments = []
+        for key in d:
+            if key.startswith(child_prefix):
+                segment = key[len(child_prefix):].split("/", 1)[0]
+                if segment not in segments:
+                    segments.append(segment)
+        consumed = set()
+        if spec.kind == "dict":
+            out = {}
+            for segment in segments:
+                dict_key = _ast_literal(segment, path)
+                value, keys = _build_value(
+                    spec.elems[0], d, statics, f"{path}/{segment}",
+                )
+                out[dict_key] = value
+                consumed |= keys
+            return out, consumed
+        indices = sorted(int(segment) for segment in segments)
+        if indices != list(range(len(indices))):
+            raise KeyError(
+                f"{path!r}: saved indices {indices} are not contiguous"
+            )
+        if spec.kind == "tuple":
+            if len(indices) != len(spec.elems):
+                raise KeyError(
+                    f"{path!r}: expected {len(spec.elems)} saved elements "
+                    f"({spec}), found {len(indices)}"
+                )
+            elem_specs = spec.elems
+        else:
+            elem_specs = (spec.elems[0],) * len(indices)
+        items = []
+        for i, elem_spec in zip(indices, elem_specs):
+            value, keys = _build_value(elem_spec, d, statics, f"{path}/{i}")
+            items.append(value)
+            consumed |= keys
+        if spec.kind == "list":
+            return items, consumed
+        return tuple(items), consumed
+    else:
+        raise AssertionError(f"unknown spec {spec!r}")
+
+
+def _ast_literal(segment, path):
+    try:
+        return ast.literal_eval(segment)
+    except (ValueError, SyntaxError):
+        raise KeyError(
+            f"{path!r}: cannot parse saved dict key segment {segment!r}"
+        )
 
 
 # # # 
@@ -1402,12 +1586,15 @@ def save(path, tree, *, fmt=None, overwrite=False):
         raise
 
 
-def load(path, *, template, fmt=None):
+def load(path, *, template, fmt=None, statics=None):
     """
     Load a struct from disk, using a template for the pytree structure.
 
-    The template determines the struct type, field order, and static field
-    values. Only the data (array) leaves are loaded from the file.
+    The template is either an instance (which determines the struct type,
+    field order, and static field values; only the data leaves are loaded
+    from the file) or a struct class (template-free restore: the structure
+    is derived from the class's schema and the saved keys, and static
+    fields come from `statics` or their defaults — see `strux.from_dict`).
 
     Format is inferred from the file extension: '.npz' for numpy npz
     (handles both compressed and uncompressed), '.safetensors' for
@@ -1422,4 +1609,4 @@ def load(path, *, template, fmt=None):
         d = dict(np.load(path))
     elif fmt == "safetensors":
         d = safetensors_numpy.load_file(path)
-    return from_dict(d, template=template)
+    return from_dict(d, template=template, statics=statics)

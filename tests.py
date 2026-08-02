@@ -1525,3 +1525,126 @@ class TestAnnotationResolution:
             score=jnp.float32(0.0),
         )
         assert e.shape == ()
+
+
+# # #
+# Template-free restore (load from a struct class)
+
+
+class TestTemplateFreeRestore:
+    def _mlp(self):
+        # a nested module with a static field, like the README MLP
+        @strux.struct
+        class Affine:
+            weights: Float[Array, "n_in n_out"]
+            biases: Float[Array, "n_out"]
+
+        @strux.struct(static_fieldnames=("activate",))
+        class MLP:
+            linear1: Affine
+            linear2: Affine
+            activate: object
+
+        net = MLP(
+            linear1=Affine(weights=jnp.ones((4, 8)), biases=jnp.zeros(8)),
+            linear2=Affine(weights=jnp.ones((8, 1)), biases=jnp.zeros(1)),
+            activate=jax.nn.relu,
+        )
+        return MLP, net
+
+    def test_nested_restore_with_statics(self, tmp_path):
+        MLP, net = self._mlp()
+        path = str(tmp_path / "mlp.npz")
+        net.save(path)
+        restored = strux.load(
+            path, template=MLP, statics={"activate": jax.nn.relu},
+        )
+        assert jax.tree.all(jax.tree.map(jnp.array_equal, net, restored))
+        assert restored.activate is jax.nn.relu
+
+    def test_missing_static_names_the_path(self, tmp_path):
+        MLP, net = self._mlp()
+        path = str(tmp_path / "mlp.npz")
+        net.save(path)
+        with pytest.raises(KeyError, match="statics=\\{'activate'"):
+            strux.load(path, template=MLP)
+
+    def test_static_default_used(self, tmp_path):
+        @strux.struct(static_fieldnames=("name",))
+        class Tagged:
+            x: Float[Array, ""]
+            name: str = "anon"
+
+        t = Tagged(x=jnp.float32(1.0), name="custom")
+        path = str(tmp_path / "tagged.npz")
+        t.save(path)
+        restored = strux.load(path, template=Tagged)
+        assert restored.name == "anon"      # default, not the saved instance's
+        assert jnp.array_equal(restored.x, t.x)
+
+    def test_optional_field_roundtrip(self, tmp_path):
+        @strux.struct
+        class Opt:
+            momentum: Float[Array, "n"] | None
+            count: Int[Array, ""]
+
+        for momentum in (None, jnp.arange(3.0)):
+            o = Opt(momentum=momentum, count=jnp.int32(7))
+            path = str(tmp_path / f"opt_{momentum is None}.npz")
+            o.save(path)
+            restored = strux.load(path, template=Opt)
+            assert (restored.momentum is None) == (momentum is None)
+            assert restored.count == 7
+
+    def test_container_fields_roundtrip(self, tmp_path):
+        @strux.struct
+        class Bank:
+            layers: tuple[Float[Array, "n"], ...]
+            table: dict[str, Float[Array, "2"]]
+
+        bank = Bank(
+            layers=(jnp.zeros(3), jnp.ones(5)),
+            table={"a": jnp.zeros(2), "b": jnp.ones(2)},
+        )
+        path = str(tmp_path / "bank.npz")
+        bank.save(path)
+        restored = strux.load(path, template=Bank)
+        assert jax.tree.all(jax.tree.map(jnp.array_equal, bank, restored))
+        assert isinstance(restored.layers, tuple)
+        assert set(restored.table) == {"a", "b"}
+
+    def test_polymorphic_field_needs_instance_template(self, tmp_path):
+        class RewardFn:
+            pass
+
+        @strux.struct
+        class Constant(RewardFn):
+            value: Float[Array, ""]
+
+        @strux.struct
+        class Holder:
+            fn: RewardFn
+
+        h = Holder(fn=Constant(value=jnp.float32(1.0)))
+        path = str(tmp_path / "holder.npz")
+        h.save(path)
+        with pytest.raises((KeyError, TypeError), match="instance template"):
+            strux.load(path, template=Holder)
+        # while the instance template still works
+        restored = strux.load(path, template=h)
+        assert jnp.array_equal(restored.fn.value, h.fn.value)
+
+    def test_restored_batched_checkpoint(self, tmp_path):
+        # a batched struct restores with its batch dims (and validation)
+        batched = Point(x=jnp.arange(4.0), y=jnp.ones(4))
+        path = str(tmp_path / "points.npz")
+        batched.save(path)
+        restored = strux.load(path, template=Point)
+        assert restored.shape == (4,)
+
+    def test_statics_rejected_for_instance_template(self, tmp_path):
+        p = Point(x=jnp.float32(0.0), y=jnp.float32(1.0))
+        path = str(tmp_path / "p.npz")
+        p.save(path)
+        with pytest.raises(TypeError, match="instance template"):
+            strux.load(path, template=p, statics={"x": 1})
