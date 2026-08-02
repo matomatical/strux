@@ -44,7 +44,7 @@ name = "strux"
 
 [tool.pytest.ini_options]
 testpaths = [
-    "tests.py",
+    "tests",
     "README.md",
 ]
 addopts = ["--codeblocks"]

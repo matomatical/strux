@@ -568,7 +568,11 @@ Installs normal dependencies plus also `jaxtyping`, `beartype`, `pytest`,
 
 ### Notes
 
-Single-file implementation (`strux.py`, though see `tests.py` for tests).
+The implementation is a small package (`strux/`), one module per component:
+the `@struct` decorator (`struct.py`), schema compilation (`schema.py`), the
+batch-shape solver (`batch.py`), shape queries and indexing (`shapes.py`),
+batched type annotations (`annotate.py`), pretty printing (`pprint.py`), and
+serialisation (`serial.py`). Tests mirror this layout in `tests/`.
 
 Jaxtyping is a required dependency: it is strux's annotation *language* —
 the schema (`strux.schema`) is compiled from jaxtyping annotations, and
