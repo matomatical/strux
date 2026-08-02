@@ -614,6 +614,10 @@ Advanced features:
       (`strux.load(path, template=Cls, statics=...)`)
 - [ ] Bind symbolic dim names across fields (prototype: `strux.tree_dims`;
       constructor enforcement pending)
+- [ ] Schema functors: generic leaf-spec transformations as annotations,
+      e.g. `Cls[strux.leaves(Bool, "")]` as the type of
+      `jax.tree.map(jnp.array_equal, a, b)` — the batch subscript being
+      the invertible special case (design seed in the meta-repo journal)
 
 Project:
 
