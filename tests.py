@@ -224,7 +224,7 @@ class TestToStr:
         result = strux.to_str(object())
         assert result.startswith("UNKNOWN_LEAF:")
 
-    # custom pytree class (not a dataclass)
+    # custom pytree classes (not dataclasses) render via the registry
     def test_custom_pytree_class(self):
         class MyNode:
             def __init__(self, x, y):
@@ -236,8 +236,35 @@ class TestToStr:
             lambda n: ((n.x, n.y), None),
             lambda _, children: MyNode(*children),
         )
-        result = strux.to_str(MyNode(1.0, 2.0))
-        assert "UNKNOWN_LEAF" in result
+        result = strux.to_str(MyNode(1.0, jnp.zeros(3)))
+        assert result.startswith("MyNode(")
+        assert "float(1.0)," in result
+        assert "jnp.float32[3]," in result
+
+    def test_custom_pytree_class_with_keys(self):
+        class KeyedNode:
+            def __init__(self, a):
+                self.a = a
+
+        jax.tree_util.register_pytree_with_keys(
+            KeyedNode,
+            lambda n: ([(jax.tree_util.GetAttrKey("a"), n.a)], None),
+            lambda _, children: KeyedNode(*children),
+        )
+        result = strux.to_str(KeyedNode(jnp.ones(2)))
+        assert result == "KeyedNode(\n  a=jnp.float32[2],\n)"
+
+    def test_custom_pytree_class_max_depth(self):
+        class DeepNode:
+            def __init__(self, a):
+                self.a = a
+
+        jax.tree_util.register_pytree_node(
+            DeepNode,
+            lambda n: ((n.a,), None),
+            lambda _, children: DeepNode(*children),
+        )
+        assert strux.to_str(DeepNode(1.0), max_depth=0) == "DeepNode(...)"
 
 
 # # #
@@ -1648,3 +1675,61 @@ class TestTemplateFreeRestore:
         p.save(path)
         with pytest.raises(TypeError, match="instance template"):
             strux.load(path, template=p, statics={"x": 1})
+
+
+# # #
+# Symbolic dim binding (tree_dims)
+
+
+class TestTreeDims:
+    def test_binds_names_across_fields(self):
+        @strux.struct
+        class Affine:
+            weights: Float[Array, "n_in n_out"]
+            biases: Float[Array, "n_out"]
+
+        net = Affine(weights=jnp.ones((4, 8)), biases=jnp.zeros(8))
+        assert strux.tree_dims(net) == {"n_in": 4, "n_out": 8}
+
+    def test_inconsistent_names_raise(self):
+        @strux.struct(check=False)
+        class Affine:
+            weights: Float[Array, "n_in n_out"]
+            biases: Float[Array, "n_out"]
+
+        broken = Affine(weights=jnp.ones((4, 8)), biases=jnp.zeros(3))
+        with pytest.raises(strux.ValidationError, match="inconsistent dim 'n_out'"):
+            strux.tree_dims(broken)
+
+    def test_construction_does_not_enforce_names(self):
+        # documented v1 semantics: symbolic dims are rank-only at
+        # construction; tree_dims is the stricter (on-demand) check
+        @strux.struct
+        class Affine:
+            weights: Float[Array, "n_in n_out"]
+            biases: Float[Array, "n_out"]
+
+        Affine(weights=jnp.ones((4, 8)), biases=jnp.zeros(3))    # accepted
+
+    def test_batched_instances_bind_element_dims(self):
+        e = Environment(
+            hero_pos=jnp.zeros((7, 2), jnp.int32),
+            goal_pos=jnp.zeros((7, 2), jnp.int32),
+            walls=jnp.zeros((7, 5, 6), bool),
+        )
+        assert strux.tree_dims(e) == {"h": 5, "w": 6}
+
+    def test_nested_and_container_binding(self):
+        @strux.struct
+        class Layer:
+            w: Float[Array, "n n"]
+
+        @strux.struct
+        class Stack:
+            layers: tuple[Layer, ...]
+
+        stack = Stack(layers=(Layer(w=jnp.ones((3, 3))), Layer(w=jnp.zeros((3, 3)))))
+        assert strux.tree_dims(stack) == {"n": 3}
+        broken = Stack(layers=(Layer(w=jnp.ones((3, 3))), Layer(w=jnp.zeros((4, 4)))))
+        with pytest.raises(strux.ValidationError, match="inconsistent dim 'n'"):
+            strux.tree_dims(broken)

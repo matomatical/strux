@@ -1010,7 +1010,30 @@ def to_str(
         elif tree is None:
             _put(f"{prefix}None{suffix}", depth=depth)
         else:
-            _put(f"{prefix}UNKNOWN_LEAF:{type(tree)}{suffix}", depth=depth)
+            # registered pytree nodes that aren't dataclasses: render one
+            # level via the registry's keyed flattening; anything else is
+            # an unknown leaf
+            try:
+                keys_and_children, _ = (
+                    jax.tree_util.default_registry.flatten_one_level_with_keys(
+                        tree
+                    )
+                )
+            except (TypeError, ValueError):
+                _put(f"{prefix}UNKNOWN_LEAF:{type(tree)}{suffix}", depth=depth)
+                return
+            if depth == max_depth:
+                _put(f"{prefix}{type(tree).__name__}(...){suffix}", depth=depth)
+            else:
+                _put(f"{prefix}{type(tree).__name__}(", depth=depth)
+                for key, child in keys_and_children:
+                    key_str = str(key)
+                    if key_str.startswith("."):
+                        child_prefix = f"{key_str[1:]}="
+                    else:
+                        child_prefix = f"{key_str}: "
+                    _walk(child, prefix=child_prefix, suffix=",", depth=depth+1)
+                _put(f"){suffix}", depth=depth)
     _walk(tree, prefix="", suffix="", depth=0)
     return "\n".join(lines)
 
@@ -1248,6 +1271,84 @@ def tree_shape(tree) -> tuple[int, ...]:
         f"candidates {_format_candidates(meet.candidates)}; annotate "
         "element dims on at least one field to determine the batch shape"
     )
+
+
+def tree_dims(tree) -> dict:
+    """
+    Bind the symbolic dimension names appearing in a struct's field
+    annotations to their sizes in this instance, and check consistency.
+
+    Names share one namespace across the whole struct, including nested
+    structs and containers: annotate `weights: Float[Array, "n_in n_out"]`
+    and `biases: Float[Array, "n_out"]` and `tree_dims(net)` returns
+    `{"n_in": ..., "n_out": ...}` — or raises ValidationError if the two
+    `n_out`s disagree. (Construction does not enforce this; symbolic dims
+    are rank-only at construction. This query is the prototype of
+    eventual cross-field named-dim checking.)
+    """
+    # the batch shape is needed to pick union arms; without a determined
+    # batch, ambiguous unions are skipped rather than guessed
+    try:
+        batch = tree_shape(tree)
+    except ValueError:
+        batch = None
+    bindings = {}
+    cls = type(tree)
+    for name, spec in schema(cls).fields.items():
+        _bind_dims(
+            getattr(tree, name), spec, batch, bindings, f"{cls.__name__}.{name}",
+        )
+    return {name: size for name, (size, _) in bindings.items()}
+
+
+def _bind_dims(value, spec, batch, bindings, path):
+    if isinstance(spec, _ArraySpec):
+        if not spec.names or not _is_arraylike_value(value):
+            return
+        shape = tuple(value.shape)
+        for offset, dim_name in spec.names:
+            size = shape[len(shape) + offset]
+            if dim_name in bindings:
+                previous_size, previous_path = bindings[dim_name]
+                if previous_size != size:
+                    raise ValidationError(
+                        f"inconsistent dim '{dim_name}': {previous_size} at "
+                        f"{previous_path}, but {size} at {path}"
+                    )
+            else:
+                bindings[dim_name] = (size, path)
+    elif isinstance(spec, _ClassSpec):
+        value_cls = type(value)
+        if dataclasses.is_dataclass(value_cls):
+            for name, subspec in schema(value_cls).fields.items():
+                _bind_dims(
+                    getattr(value, name), subspec, batch, bindings,
+                    f"{path}.{name}",
+                )
+    elif isinstance(spec, _ContainerSpec):
+        if isinstance(value, dict):
+            for k, v in value.items():
+                _bind_dims(v, spec.elems[0], batch, bindings, f"{path}[{k!r}]")
+        elif isinstance(value, (list, tuple)):
+            if spec.kind == "tuple" and len(value) == len(spec.elems):
+                elem_specs = spec.elems
+            else:
+                elem_specs = (spec.elems[0],) * len(value)
+            for i, (v, e) in enumerate(zip(value, elem_specs)):
+                _bind_dims(v, e, batch, bindings, f"{path}[{i}]")
+    elif isinstance(spec, _UnionSpec):
+        # bind through the arm this value inhabits, when determinable
+        matching = []
+        for arm in spec.arms:
+            try:
+                candidates = _candidates(value, arm, path)
+            except ValidationError:
+                continue
+            if candidates is _TOP or batch is None or batch in candidates:
+                matching.append(arm)
+        if len(matching) == 1:
+            _bind_dims(value, matching[0], batch, bindings, path)
+    # scalar and None specs carry no named dims
 
 
 def tree_getitem(tree, index):

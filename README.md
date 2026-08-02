@@ -207,6 +207,28 @@ Output:
 True
 ```
 
+A template instance is not required: pass the struct *class* and the
+structure is derived from its schema (see below) and the saved keys. Static
+fields are not saved in checkpoints, so supply them via `statics` (a dict
+of '/'-separated field paths) or give them defaults:
+
+<!--pytest-codeblocks:cont-->
+```python
+# template-free restore: data fields rebuilt from the file, static fields
+# from statics= (or their defaults)
+restored = strux.load(path, template=MLP, statics={"activate": jax.nn.relu})
+print(jax.tree.all(jax.tree.map(jnp.array_equal, net, restored)))
+```
+
+Output:
+```console
+True
+```
+
+(One caveat: a field annotated with a base class but holding subclass
+instances can't be reconstructed from the class alone — restore those with
+an instance template.)
+
 For saving, if the filename has a `.npz` extension then the data fields are
 saved in compressed numpy format. If the filename has `.safetensors` extension,
 and strux is installed with the optional `safetensors` dependency (`pip install
@@ -477,7 +499,10 @@ reflect that:
 Annotations that promise nothing about array leaves (`Any`, `object`,
 `str`, callables) are rejected — such values belong in static fields
 (whose annotations are for static checkers only, and are not validated at
-construction). Inspect the compiled schema with `strux.schema`:
+construction). Symbolic dim names (`"h w"`) are rank-only at
+construction; `strux.tree_dims(obj)` binds them to sizes on demand and
+checks that shared names agree across fields. Inspect the compiled schema
+with `strux.schema`:
 
 <!--pytest-codeblocks:cont-->
 ```python
@@ -584,9 +609,11 @@ Advanced features:
 - [x] Support indexing and shape directly on batched structs, e.g., `env[0]`.
 - [x] Schema-driven batch-tolerant construction checking (`strux.schema`)
 - [x] Unions, optionals, containers, and unannotated arrays as data fields
-- [ ] Pretty print registered pytree classes that aren't dataclasses
-- [ ] Construct empty structs from type annotations (for use as load templates)
-- [ ] Bind symbolic dim names across fields (e.g. shared "n" checked equal)
+- [x] Pretty print registered pytree classes that aren't dataclasses
+- [x] Template-free restore: load from a struct class, no template instance
+      (`strux.load(path, template=Cls, statics=...)`)
+- [ ] Bind symbolic dim names across fields (prototype: `strux.tree_dims`;
+      constructor enforcement pending)
 
 Project:
 
