@@ -207,6 +207,28 @@ Output:
 True
 ```
 
+A template instance is not required: pass the struct *class* and the
+structure is derived from its schema (see below) and the saved keys. Static
+fields are not saved in checkpoints, so supply them via `statics` (a dict
+of '/'-separated field paths) or give them defaults:
+
+<!--pytest-codeblocks:cont-->
+```python
+# template-free restore: data fields rebuilt from the file, static fields
+# from statics= (or their defaults)
+restored = strux.load(path, template=MLP, statics={"activate": jax.nn.relu})
+print(jax.tree.all(jax.tree.map(jnp.array_equal, net, restored)))
+```
+
+Output:
+```console
+True
+```
+
+(One caveat: a field annotated with a base class but holding subclass
+instances can't be reconstructed from the class alone — restore those with
+an instance template.)
+
 For saving, if the filename has a `.npz` extension then the data fields are
 saved in compressed numpy format. If the filename has `.safetensors` extension,
 and strux is installed with the optional `safetensors` dependency (`pip install
@@ -381,6 +403,126 @@ For other element-wise operations, use `jax.tree.map`:
 shifted = jax.tree.map(lambda x: x + 1, env0)
 ```
 
+### Field annotations and checked construction
+
+A struct's field annotations describe one *element* of the struct, and they
+are compiled (lazily, on first use) into a per-class schema of shape
+constraints. Construction validates against the schema: dtype kind and
+trailing (element) dims are enforced, while leading batch dims are free —
+but must agree across every field. Batch tolerance is what makes
+annotations and batching coexist: instances routinely carry leading batch
+dims beyond the annotations (a stack of levels built from numpy, a restored
+checkpoint of rollouts), and construction accepts any consistent batch.
+
+Validation guards the user API boundary — direct construction and
+`.replace` — while reconstruction through JAX's tree machinery
+(`jax.tree.map` results, `vmap`/`scan`/`jit` outputs, gradients) is
+*structural* and never validated: transformed trees legitimately carry
+leaves that differ from the declared element types (mapping
+`jnp.array_equal` over two structs yields rank-0 bools; cotangents carry
+`float0`). In practice this still catches shape bugs where they are born,
+because traced code builds its result structs with `.replace(...)`, which
+validates at trace time.
+
+```python
+import jax
+import jax.numpy as jnp
+from jaxtyping import Array, Bool, Float
+import strux
+
+@strux.struct
+class Level:
+    walls: Bool[Array, "size size"]
+    reward: float
+    aux: jax.Array
+
+# element-level construction: batch shape ()
+level = Level(walls=jnp.zeros((5, 5), dtype=bool), reward=1.0, aux=jnp.zeros(7))
+print(level.shape)
+
+# batched construction: leading batch dims are free, but must agree
+levels = Level(
+    walls=jnp.zeros((32, 5, 5), dtype=bool),
+    reward=jnp.ones(32),
+    aux=jnp.zeros((32, 7)),
+)
+print(levels.shape)
+
+# inconsistent batch dims are rejected at construction
+try:
+    Level(
+        walls=jnp.zeros((32, 5, 5), dtype=bool),
+        reward=jnp.ones(16),
+        aux=jnp.zeros((32, 7)),
+    )
+except strux.ValidationError:
+    print("rejected!")
+```
+
+Output:
+```console
+()
+(32,)
+rejected!
+```
+
+Data fields hold *array-leaved pytrees* — that is what it means to be on
+the traced side of the data/static split — and the supported annotations
+reflect that:
+
+* **jaxtyping annotations** (`Float[Array, "n 2"]`): dtype kind and element
+  dims as written. Dims may be concrete (`"5 5"`, checked exactly),
+  symbolic (`"h w"`, checked by rank), or unknown (`Float[Array, "..."]`,
+  any element rank).
+* **plain scalars** (`float`, `int`, `bool`, `complex`): a python scalar of
+  that type, or an array of the matching dtype kind. Equivalent to the
+  explicit `Float[ArrayLike, ""]` spelling (`from jax.typing import
+  ArrayLike`). A python scalar value is batch-agnostic (it broadcasts).
+* **bare array classes** (`jax.Array`, `np.ndarray`): any dtype, any
+  element rank. The batch dims must still be a prefix of the shape, so
+  such fields participate in batch checking whenever a sibling field pins
+  the batch down — annotate at least one field with element dims and the
+  rest is inferred.
+* **nested structs and other annotated dataclass pytrees**: recursed via
+  the value's own schema (a field annotated with a base class accepts
+  subclass instances, validated against the subclass's schema).
+* **containers**: `dict[str, T]`, `list[T]`, `tuple[T, ...]`, and
+  fixed-shape `tuple[T1, T2]` of any supported annotation.
+* **unions**, including `T | None`: the value decides the arm at
+  construction. Note that which arm is chosen is a *structural* property,
+  like a static field: JIT recompiles per arm, traced control flow cannot
+  switch arms, and a batch must be on one arm.
+* **other pytree classes** (e.g. an abstract base class of several
+  structs): isinstance-checked, then every array leaf of the value
+  constrains the batch as a prefix of its shape.
+
+Annotations that promise nothing about array leaves (`Any`, `object`,
+`str`, callables) are rejected — such values belong in static fields
+(whose annotations are for static checkers only, and are not validated at
+construction). Symbolic dim names (`"h w"`) are rank-only at
+construction; `strux.tree_dims(obj)` binds them to sizes on demand and
+checks that shared names agree across fields. Inspect the compiled schema
+with `strux.schema`:
+
+<!--pytest-codeblocks:cont-->
+```python
+print(strux.schema(Level))
+```
+
+Output:
+```console
+schema Level:
+  walls: Bool[Array, 'size size']
+  reward: Float[Array, ''] | Float[ndarray, ''] | number | float
+  aux: Shaped[Array, '...']
+```
+
+Checked construction is on by default; pass `@strux.struct(check=False)`
+to opt a class out (its schema-driven features like `.shape` still work).
+The check costs about a microsecond per construction for simple schemas,
+and runs only on direct construction and `.replace` — JAX's internal tree
+reconstructions skip it entirely.
+
 ### Runtime type checking
 
 Strux works together with jaxtyping's runtime type checking. For example,
@@ -406,17 +548,14 @@ envs = checked_step(envs, actions) # envs, actions from previous example
 # checked_step(envs, jnp.array([1, 2]))  # beartype raises!
 ```
 
-The annotations on struct fields should always describe the components of
-a single *element* of the struct, even though instances may carry extra
-leading batch dims. Checked construction respects this: JAX rebuilds
-structs by calling the constructor during pytree unflattening, so `vmap`,
-`scan`, and tree-stacking all construct structs with batch-dim'd leaves.
-Strux therefore relaxes the annotations on the generated `__init__`, and a
-checker that wraps dataclass constructors (such as jaxtyping's import
-hook) enforces each field's dtype and trailing shape at construction while
-allowing any leading batch dims, so long as the fields agree on them.
-Discipline about a *specific* batch shape belongs at function boundaries,
-as above.
+Function-boundary checking composes cleanly with strux's own construction
+checking: constructors tolerate any (consistent) leading batch dims, and
+discipline about a *specific* batch shape belongs at function boundaries,
+as above. External checkers that wrap dataclass constructors (such as
+jaxtyping's import hook) find nothing to enforce on a struct's `__init__`
+— its runtime annotations are deliberately empty, precisely so that
+hook-checked modules don't reject legitimately batched constructions —
+while every other function in a hooked module is checked as usual.
 
 Development
 -----------
@@ -434,15 +573,13 @@ Installs normal dependencies plus also `jaxtyping`, `beartype`, `pytest`,
 
 Single-file implementation (`strux.py`, though see `tests.py` for tests).
 
-Jaxtyping is optional for non-development installations, people should be able
-to install and use strux for easily creating jit-compatible dataclasses even if
-they don't use jaxtyping for type annotations. However, jaxtyping is the
-*exclusive* supported annotation framework: strux imports it behind a guard
-(like safetensors) and checks hints against `jaxtyping.AbstractArray`. If
-jaxtyping is not installed then no field can carry an array annotation, so
-annotation-dependent features degrade cleanly: `.shape` sees only plain
-scalar hints, and the batched-annotation feature (`MyStruct["batch"]`)
-raises a clear ImportError.
+Jaxtyping is a required dependency: it is strux's annotation *language* —
+the schema (`strux.schema`) is compiled from jaxtyping annotations, and
+plain-scalar sugar expands through jaxtyping's ArrayLike support. It is a
+featherweight dependency (it does not itself require JAX). Beartype is
+*not* a dependency: construction checking is strux's own (schema-driven),
+and beartype/`@jaxtyped` remain the recommended tools at function
+boundaries only.
 
 Reserved field names: fields named `replace`, `size`, `shape`, `save`, or
 `restore` shadow the corresponding convenience member (strux warns and skips
@@ -470,9 +607,13 @@ Advanced features:
 - [x] `isinstance` support and integrate with jaxtyping + beartype
 - [x] Save/load structs to/from disk (e.g. serialisation with pytree structure)
 - [x] Support indexing and shape directly on batched structs, e.g., `env[0]`.
-- [x] Batch-tolerant constructor checking under runtime type checkers
-- [ ] Pretty print registered pytree classes that aren't dataclasses
-- [ ] Construct empty structs from type annotations (for use as load templates)
+- [x] Schema-driven batch-tolerant construction checking (`strux.schema`)
+- [x] Unions, optionals, containers, and unannotated arrays as data fields
+- [x] Pretty print registered pytree classes that aren't dataclasses
+- [x] Template-free restore: load from a struct class, no template instance
+      (`strux.load(path, template=Cls, statics=...)`)
+- [ ] Bind symbolic dim names across fields (prototype: `strux.tree_dims`;
+      constructor enforcement pending)
 
 Project:
 
