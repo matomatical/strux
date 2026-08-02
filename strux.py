@@ -30,22 +30,6 @@ except ImportError:
         "missing optional dependency group strux[safetensors]"
     )
 
-# dataclass_transform (PEP 681) tells static type checkers like mypy that
-# @strux.struct generates dataclass semantics (an __init__ from the field
-# annotations, frozen instances). In the standard library from python
-# 3.11; harmless no-op fallback below it.
-try:
-    from typing import dataclass_transform
-except ImportError:
-    try:
-        from typing_extensions import dataclass_transform
-    except ImportError:
-        def dataclass_transform(**kwargs):
-            def identity(cls_or_fn):
-                return cls_or_fn
-            return identity
-
-
 def _is_jaxtype(hint) -> bool:
     """
     Is this type hint a jaxtyping array annotation? Jaxtyping is the only
@@ -58,7 +42,13 @@ def _is_jaxtype(hint) -> bool:
 # Core wrapper
 
 
-@dataclass_transform(frozen_default=True, field_specifiers=(dataclasses.field,))
+# dataclass_transform (PEP 681) tells static type checkers like mypy that
+# @strux.struct generates dataclass semantics (an __init__ from the field
+# annotations, frozen instances)
+@typing.dataclass_transform(
+    frozen_default=True,
+    field_specifiers=(dataclasses.field,),
+)
 def struct(
     Class=None,
     *,
@@ -480,8 +470,20 @@ def _field_hint(cls, name):
     declared (annotations must be resolved in the *declaring* module's
     namespace, which under inheritance may differ from cls's own).
     """
+    # inspect.get_annotations rather than a raw __dict__ lookup: it likewise
+    # returns only the class's *own* annotations (never inherited ones), but
+    # also handles deferred annotations (PEP 649, python 3.14+), where the
+    # class dict carries an __annotate__ function instead of a ready dict
     for klass in cls.__mro__:
-        annotations = klass.__dict__.get("__annotations__", {})
+        try:
+            annotations = inspect.get_annotations(klass)
+        except NameError as e:
+            raise SchemaError(
+                f"{cls.__name__}.{name}: cannot evaluate deferred "
+                f"annotations of {klass.__name__} ({e}); if the name is "
+                "imported only under typing.TYPE_CHECKING, it must instead "
+                "be available at runtime for strux to build the schema"
+            ) from e
         if name in annotations:
             return annotations[name], klass
     raise SchemaError(f"{cls.__name__}.{name}: no annotation found")

@@ -12,13 +12,10 @@ Install:
 pip install git+https://github.com/matomatical/strux.git
 ```
 
-Dependencies: `jax`, `numpy`.
+Requires python 3.11+. Dependencies: `jax`, `numpy`, `jaxtyping`.
 
 Examples
 --------
-
-Note that some readme examples use `Self` which requires python 3.11, but these
-annotations are optional and otherwise strux only requires python 3.9.
 
 ### Basic usage
 
@@ -62,7 +59,7 @@ simple biased linear transformation layer module.
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Float, PRNGKeyArray  # pip install jaxtyping
-from typing import Self # python3.11+
+from typing import Self
 import strux
 
 @strux.struct
@@ -130,7 +127,7 @@ the MLP configurable.
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Float, PRNGKeyArray  # pip install jaxtyping
-from typing import Callable, Self  # python 3.11+
+from typing import Callable, Self
 import strux
 
 # flag 'activate' as a static field when defining the struct
@@ -291,7 +288,7 @@ parallel rollouts.
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Int, Bool, PRNGKeyArray  # pip install jaxtyping
-from typing import Self  # python 3.11+
+from typing import Self
 import strux
 
 @strux.struct

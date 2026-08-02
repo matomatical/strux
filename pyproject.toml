@@ -12,7 +12,7 @@ classifiers = [
     "Programming Language :: Python :: 3",
 ]
 
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "numpy",
     "jax",
