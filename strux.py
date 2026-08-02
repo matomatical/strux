@@ -1,12 +1,18 @@
+import collections.abc
 import dataclasses
 import functools
+import inspect
 import os
+import re
+import sys
 import tempfile
+import types
 import typing
 import warnings
 
 import jax
 import jax.numpy as jnp
+import jaxtyping
 import numpy as np
 
 # optional safetensors[numpy]
@@ -22,13 +28,6 @@ except ImportError:
     safetensors_numpy = _MissingDependency(
         "missing optional dependency group strux[safetensors]"
     )
-
-# optional jaxtyping (the exclusive supported annotation framework; required
-# only for annotation-dependent features, see _is_jaxtype)
-try:
-    import jaxtyping
-except ImportError:
-    jaxtyping = None
 
 # dataclass_transform (PEP 681) tells static type checkers like mypy that
 # @strux.struct generates dataclass semantics (an __init__ from the field
@@ -49,14 +48,9 @@ except ImportError:
 def _is_jaxtype(hint) -> bool:
     """
     Is this type hint a jaxtyping array annotation? Jaxtyping is the only
-    supported annotation framework, so if it is not installed, no hint can
-    be an array annotation.
+    supported array annotation framework.
     """
-    return (
-        jaxtyping is not None
-        and isinstance(hint, type)
-        and issubclass(hint, jaxtyping.AbstractArray)
-    )
+    return isinstance(hint, type) and issubclass(hint, jaxtyping.AbstractArray)
 
 
 # # # 
@@ -68,6 +62,7 @@ def struct(
     Class=None,
     *,
     static_fieldnames: typing.Sequence[str] = (),
+    check: bool = True,
 ):
     """
     Transform a class into an immutable dataclass that is also registered as a
@@ -84,9 +79,19 @@ def struct(
         field1: int
         label: str
     ```
+
+    By default, construction validates the data fields against the schema
+    derived from the field annotations (see `strux.schema`): dtype kind and
+    trailing (element) dims are enforced, leading batch dims are free but
+    must agree across fields. Pass `check=False` to skip this validation
+    (e.g. for a class constructed in a measured hot path).
     """
     if Class is None:
-        return functools.partial(struct, static_fieldnames=static_fieldnames)
+        return functools.partial(
+            struct,
+            static_fieldnames=static_fieldnames,
+            check=check,
+        )
     # wrap class as an immutable Python dataclass
     Dataclass = dataclasses.dataclass(Class, frozen=True)
 
@@ -166,66 +171,618 @@ def struct(
     Dataclass._is_strux_struct = True
     Dataclass.__class_getitem__ = classmethod(_make_struct_annotation)
 
-    # relax the generated __init__'s annotations on the data fields so that
-    # runtime type checkers tolerate leading batch dims at construction (the
-    # class's own field annotations stay rank-exact: they describe the
-    # element)
-    if jaxtyping is not None:
-        init_annotations = Dataclass.__init__.__annotations__
-        for name in data_fields:
-            init_annotations[name] = _relax_annotation(init_annotations[name])
+    # construction checking: the constructor validates the new instance
+    # against the schema derived from the field annotations (dtype kind and
+    # element dims enforced, leading batch dims free but consistent across
+    # fields; see strux.schema). The runtime __init__ deliberately carries
+    # no annotations of its own: external runtime checkers that wrap
+    # dataclass constructors (such as jaxtyping's import hook) would
+    # otherwise enforce the rank-exact field annotations and reject
+    # legitimately batched constructions (JAX rebuilds structs through the
+    # constructor when unflattening, so vmap/scan/tree-stack results all
+    # construct with batch-dim'd leaves). Static type checkers are
+    # unaffected: they derive __init__ from the field annotations (PEP 681).
+    original_init = Dataclass.__init__
+    if check:
+        def checked_init(self, *args, **kwargs):
+            original_init(self, *args, **kwargs)
+            _validate_struct(self)
+        # copy identity but not annotations, and expose an
+        # annotation-stripped signature: external checkers must find
+        # nothing to enforce, whether they read __annotations__ or
+        # inspect.signature (which is also why there is no __wrapped__
+        # link back to the annotated original)
+        checked_init.__name__ = original_init.__name__
+        checked_init.__qualname__ = original_init.__qualname__
+        checked_init.__module__ = original_init.__module__
+        checked_init.__doc__ = original_init.__doc__
+        checked_init.__signature__ = _strip_annotations_signature(
+            original_init
+        )
+        Dataclass.__init__ = checked_init
+    else:
+        original_init.__annotations__ = {}
+        original_init.__signature__ = _strip_annotations_signature(
+            original_init
+        )
 
     # done!
     return Dataclass
 
 
-def _relax_annotation(hint):
+def _strip_annotations_signature(fn):
+    signature = inspect.signature(fn)
+    return signature.replace(
+        parameters=[
+            param.replace(annotation=inspect.Parameter.empty)
+            for param in signature.parameters.values()
+        ],
+        return_annotation=inspect.Signature.empty,
+    )
+
+
+class SchemaError(TypeError):
     """
-    Return a batch-tolerant version of a field annotation, for use on the
-    generated __init__.
-
-    A struct's field annotations describe the *element*, but instances may
-    carry extra leading batch dims on every leaf, and batched instances are
-    constructed through __init__: JAX rebuilds structs by calling the
-    constructor during pytree unflattening, so a vmap that returns a struct,
-    a scan that collects one struct per step, or a tree-stack of structs all
-    call __init__ with batch-dim'd leaves. Runtime type checkers that wrap
-    dataclass constructors (such as jaxtyping's import hook with beartype)
-    would reject those calls if they enforced the field annotations exactly,
-    so the __init__ annotations must instead tolerate leading batch dims:
-
-    * jaxtyping annotations get a named variadic prefix ("n 2" becomes
-      "*batch n 2"), preserving the dtype check and the trailing shape
-      check while leaving the leading dims free — except that within one
-      call, "*batch" must bind to the same dims everywhere, so all array
-      fields must agree on the batch shape (annotations that already
-      contain a variadic dim are returned unchanged; a regular dim that a
-      user happens to name "batch" cannot collide, because jaxtyping keeps
-      variadic and regular dim names in separate namespaces);
-    * plain scalar annotations (bool/int/float/complex) become a union of
-      the scalar type and a "*batch" array of the matching dtype, mirroring
-      their promotion for batching purposes elsewhere (a Python scalar
-      matches the scalar arm and leaves "*batch" unbound, so scalar fields
-      never constrain the batch shape);
-    * anything else (nested structs, unresolved string annotations, other
-      types) is returned unchanged.
-
-    Static type checkers never see this rewrite: they derive __init__ from
-    the class's field annotations (PEP 681), which remain rank-exact.
+    A struct's field annotations cannot be compiled into a schema. Raised
+    when the schema is first needed (typically at first construction), not
+    at class decoration.
     """
-    if _is_jaxtype(hint) and hint.index_variadic is None:
-        batched_dims = f"*batch {hint.dim_str}".strip()
-        return hint.dtype[hint.array_type, batched_dims]
-    elif hint is bool:
-        return typing.Union[bool, jaxtyping.Bool[jaxtyping.Array, "*batch"]]
-    elif hint is int:
-        return typing.Union[int, jaxtyping.Int[jaxtyping.Array, "*batch"]]
-    elif hint is float:
-        return typing.Union[float, jaxtyping.Float[jaxtyping.Array, "*batch"]]
-    elif hint is complex:
-        return typing.Union[complex, jaxtyping.Complex[jaxtyping.Array, "*batch"]]
+
+
+class ValidationError(TypeError):
+    """
+    A value does not satisfy a struct's schema at construction: wrong type
+    or dtype kind, mismatched element dims, or inconsistent batch dims
+    across fields.
+    """
+
+
+# A struct's field annotations describe one *element*, but instances may
+# carry extra leading batch dims on every leaf (JAX rebuilds structs through
+# the constructor when unflattening, so vmap/scan/tree-stack results all
+# construct with batch-dim'd leaves). The schema machinery below compiles
+# each data field's annotation into a spec of per-leaf shape constraints;
+# batch inference and construction validation are then constraint solving
+# over "which leading batch shape B is consistent with every leaf", and
+# .shape, batched subscripting, and validation are all queries against the
+# same solution. Specs form a small grammar:
+#
+#   spec ::= _ArraySpec      jaxtyping annotations and bare array classes;
+#                            dims may be concrete, symbolic (rank-only), or
+#                            unknown (a leading "..." variadic)
+#          | _PyScalarSpec   python/numpy scalar classes: batch-agnostic
+#          | _NoneSpec       None (as a union arm): batch-agnostic
+#          | _ClassSpec      any other class: isinstance-checked, then
+#                            recursed via the *value's* dynamic type (a
+#                            nested struct/dataclass recurses its own
+#                            schema; any other pytree constrains the batch
+#                            as a prefix of every leaf's shape)
+#          | _ContainerSpec  dict[k, v], list[t], tuple[t, ...], tuple[...]
+#          | _UnionSpec      any union: the arm is decided by the value
+#
+# Plain scalar annotations (bool/int/float/complex) are sugar for the
+# corresponding jaxtyping-over-ArrayLike union. Annotations that promise
+# nothing about array leaves (Any, object, str, callables) are rejected:
+# data fields hold array-leaved pytrees by definition (that is what being
+# traced means); anything else belongs in static fields.
+
+
+@dataclasses.dataclass(frozen=True)
+class _ArraySpec:
+    jaxtype: type       # the jaxtyping annotation as declared
+    ndim: int | None    # element rank; None if unknown (leading variadic)
+    min_ndim: int       # known trailing dims (== ndim when rank is known)
+    fixed: tuple        # ((negative_offset, size), ...) concrete trailing dims
+    names: tuple        # ((negative_offset, name), ...) symbolic trailing dims
+    dtypes: tuple | None    # acceptable dtype names; None = any dtype
+
+    def __str__(self):
+        return getattr(self.jaxtype, "__name__", repr(self.jaxtype))
+
+
+@dataclasses.dataclass(frozen=True)
+class _PyScalarSpec:
+    cls: type
+
+    def __str__(self):
+        return self.cls.__name__
+
+
+@dataclasses.dataclass(frozen=True)
+class _NoneSpec:
+    def __str__(self):
+        return "None"
+
+
+@dataclasses.dataclass(frozen=True)
+class _ClassSpec:
+    cls: type
+
+    def __str__(self):
+        return self.cls.__name__
+
+
+@dataclasses.dataclass(frozen=True)
+class _ContainerSpec:
+    kind: str       # "dict" | "list" | "tuple" | "tuple_variadic"
+    elems: tuple    # child specs: one for dict/list/tuple_variadic, n for tuple
+
+    def __str__(self):
+        if self.kind == "dict":
+            return f"dict[..., {self.elems[0]}]"
+        elif self.kind == "list":
+            return f"list[{self.elems[0]}]"
+        elif self.kind == "tuple_variadic":
+            return f"tuple[{self.elems[0]}, ...]"
+        else:
+            return f"tuple[{', '.join(str(e) for e in self.elems)}]"
+
+
+@dataclasses.dataclass(frozen=True)
+class _UnionSpec:
+    arms: tuple
+
+    def __str__(self):
+        return " | ".join(str(arm) for arm in self.arms)
+
+
+@dataclasses.dataclass(frozen=True)
+class Schema:
+    """
+    The compiled form of a struct's data field annotations: a mapping from
+    field names to shape-constraint specs. Build one with `strux.schema`.
+    """
+    cls: type
+    fields: dict
+
+    def __str__(self):
+        lines = [f"schema {self.cls.__name__}:"]
+        for name, spec in self.fields.items():
+            lines.append(f"  {name}: {spec}")
+        return "\n".join(lines)
+
+
+def schema(cls) -> Schema:
+    """
+    Compile a dataclass's data field annotations into a Schema (cached on
+    the class). Works for strux structs and for other annotated dataclass
+    pytrees (fields whose dataclasses metadata marks them static via
+    `static=True` or `pytree_node=False` are excluded).
+
+    Raises SchemaError if any data field's annotation cannot be compiled
+    (e.g. Any, callables, unresolvable forward references).
+    """
+    if "_strux_schema" in cls.__dict__:
+        return cls.__dict__["_strux_schema"]
+    if not dataclasses.is_dataclass(cls):
+        raise SchemaError(
+            f"{cls.__name__} is not a dataclass; strux schemas describe "
+            "annotated dataclass pytrees"
+        )
+    if "_data_fields" in vars(cls):
+        data_fields = cls._data_fields
     else:
+        data_fields = [
+            f.name
+            for f in dataclasses.fields(cls)
+            if f.metadata.get("pytree_node", True)
+            and not f.metadata.get("static", False)
+        ]
+    fields = {}
+    for name in data_fields:
+        hint, owner = _field_hint(cls, name)
+        context = f"{cls.__name__}.{name}"
+        hint = _resolve_hint(hint, owner=owner, cls=cls, context=context)
+        fields[name] = _parse_hint(hint, context=context)
+    result = Schema(cls=cls, fields=fields)
+    cls._strux_schema = result
+    return result
+
+
+def _field_hint(cls, name):
+    """
+    Find a field's raw annotation and the class in whose body it was
+    declared (annotations must be resolved in the *declaring* module's
+    namespace, which under inheritance may differ from cls's own).
+    """
+    for klass in cls.__mro__:
+        annotations = klass.__dict__.get("__annotations__", {})
+        if name in annotations:
+            return annotations[name], klass
+    raise SchemaError(f"{cls.__name__}.{name}: no annotation found")
+
+
+def _resolve_hint(hint, owner, cls, context):
+    """
+    Resolve a string annotation (e.g. under `from __future__ import
+    annotations`) to a real type, in the declaring class's module namespace.
+    Resolution happens lazily (at first schema use, not at decoration), so
+    self-references and later definitions are already bound by the time
+    they are needed.
+    """
+    if not isinstance(hint, str):
         return hint
+    module = sys.modules.get(owner.__module__, None)
+    globalns = getattr(module, "__dict__", {})
+    localns = {owner.__name__: owner, cls.__name__: cls}
+    try:
+        return eval(hint, globalns, localns)
+    except NameError as e:
+        raise SchemaError(
+            f"{context}: cannot resolve annotation {hint!r} ({e}); if the "
+            "name is imported only under typing.TYPE_CHECKING, it must "
+            "instead be available at runtime for strux to build the schema"
+        ) from e
+
+
+def _parse_hint(hint, context):
+    """
+    Compile one data field annotation into a spec. Raises SchemaError for
+    annotations that don't promise an array-leaved pytree.
+    """
+    # unwrap Annotated[X, ...] to X
+    if typing.get_origin(hint) is typing.Annotated:
+        hint = typing.get_args(hint)[0]
+    # reject annotations that promise nothing about array leaves
+    if hint is typing.Any or hint is object:
+        raise SchemaError(
+            f"{context}: data fields must be array-leaved pytrees, but "
+            f"{hint} promises nothing about its values; annotate the array "
+            "structure, or mark the field static"
+        )
+    if hint in (str, bytes):
+        raise SchemaError(
+            f"{context}: {hint.__name__} is not pytree data; mark the "
+            "field static"
+        )
+    origin = typing.get_origin(hint)
+    if (
+        hint is collections.abc.Callable
+        or hint is typing.Callable
+        or origin is collections.abc.Callable
+    ):
+        raise SchemaError(
+            f"{context}: callables are not pytree data; mark the field "
+            "static"
+        )
+    # None (as a union arm or a bare annotation)
+    if hint is None or hint is type(None):
+        return _NoneSpec()
+    # unions (including Optional and jaxtyping-over-ArrayLike expansions);
+    # scalar classes as explicit union arms are plain scalar arms (the
+    # ArrayLike sugar below applies only to a bare scalar annotation)
+    if origin is typing.Union or isinstance(hint, types.UnionType):
+        return _UnionSpec(
+            arms=tuple(
+                _PyScalarSpec(cls=arm)
+                if arm in (bool, int, float, complex)
+                else _parse_hint(arm, context)
+                for arm in typing.get_args(hint)
+            ),
+        )
+    # jaxtyping array annotations
+    if _is_jaxtype(hint):
+        return _parse_jaxtype(hint, context)
+    # plain scalar annotations are sugar for jaxtyping over ArrayLike
+    if hint in (bool, int, float, complex):
+        return _scalar_spec(hint)
+    # containers of specs
+    if origin is dict:
+        _keytype, valtype = typing.get_args(hint)
+        return _ContainerSpec(
+            kind="dict",
+            elems=(_parse_hint(valtype, context),),
+        )
+    if origin is list:
+        (elemtype,) = typing.get_args(hint)
+        return _ContainerSpec(
+            kind="list",
+            elems=(_parse_hint(elemtype, context),),
+        )
+    if origin is tuple:
+        args = typing.get_args(hint)
+        if len(args) == 2 and args[1] is Ellipsis:
+            return _ContainerSpec(
+                kind="tuple_variadic",
+                elems=(_parse_hint(args[0], context),),
+            )
+        return _ContainerSpec(
+            kind="tuple",
+            elems=tuple(_parse_hint(arg, context) for arg in args),
+        )
+    # bare array classes: dtype and rank unknown
+    if hint is jax.Array or hint is np.ndarray:
+        return _parse_jaxtype(jaxtyping.Shaped[hint, "..."], context)
+    # scalar classes appearing as union arms (e.g. numpy.number inside a
+    # jaxtyping-over-ArrayLike expansion)
+    if isinstance(hint, type) and issubclass(
+        hint, (bool, int, float, complex, np.generic)
+    ):
+        return _PyScalarSpec(cls=hint)
+    # any other class: an instance-checked pytree (nested struct, foreign
+    # dataclass, abstract base of structs, or registered container); its
+    # constraints are derived from the value's dynamic type
+    if isinstance(hint, type):
+        return _ClassSpec(cls=hint)
+    raise SchemaError(
+        f"{context}: unsupported data field annotation {hint!r}"
+    )
+
+
+def _parse_jaxtype(hint, context):
+    if hint.index_variadic is not None and hint.index_variadic != 0:
+        raise SchemaError(
+            f"{context}: variadic dims are only supported leading (got "
+            f"{hint.dim_str!r}); a field annotation describes one element, "
+            "with any batch dims prepended in front"
+        )
+    tokens = hint.dim_str.split()
+    if hint.index_variadic == 0:
+        tokens = tokens[1:]
+        ndim = None
+    else:
+        ndim = len(tokens)
+    fixed = []
+    names = []
+    for i, token in enumerate(tokens):
+        offset = i - len(tokens)    # negative index from the end
+        if token.isdigit():
+            fixed.append((offset, int(token)))
+        elif token.isidentifier() and token != "_":
+            names.append((offset, token))
+        # other tokens (anonymous "_", broadcastable "#n", symbolic
+        # expressions) contribute rank only
+    dtypes = hint.dtypes if isinstance(hint.dtypes, tuple) else None
+    return _ArraySpec(
+        jaxtype=hint,
+        ndim=ndim,
+        min_ndim=len(tokens),
+        fixed=tuple(fixed),
+        names=tuple(names),
+        dtypes=dtypes,
+    )
+
+
+_SCALAR_DTYPE_CLASSNAMES = {
+    bool: "Bool",
+    int: "Int",
+    float: "Float",
+    complex: "Complex",
+}
+
+
+@functools.lru_cache(maxsize=None)
+def _scalar_spec(scalar_cls):
+    # a plain scalar annotation is sugar for the corresponding
+    # jaxtyping-over-ArrayLike union: the python scalar itself, or an
+    # array (of any batch shape) of the matching dtype kind
+    dtype_cls = getattr(jaxtyping, _SCALAR_DTYPE_CLASSNAMES[scalar_cls])
+    hint = dtype_cls[jax.typing.ArrayLike, ""]
+    context = f"scalar {scalar_cls.__name__}"
+    arms = tuple(
+        _parse_jaxtype(arm, context)
+        if _is_jaxtype(arm)
+        else _PyScalarSpec(cls=arm)
+        for arm in typing.get_args(hint)
+    )
+    return _UnionSpec(arms=arms)
+
+
+# # #
+# Solving for the batch shape
+
+
+# The candidate-set lattice: each (value, spec) pair yields the set of
+# leading batch shapes B consistent with it — a finite frozenset of tuples,
+# or _TOP (represented as None) meaning "unconstrained" (python scalars,
+# None arms, empty containers). Validation asks whether the intersection
+# across all fields is non-empty; .shape asks for its unique element.
+_TOP = None
+
+
+class _BatchMeet:
+    """Accumulate per-field candidate sets, intersecting as we go."""
+
+    def __init__(self):
+        self.candidates = _TOP
+        self.witnesses = []
+
+    def add(self, path, candidates):
+        if candidates is _TOP:
+            return
+        if self.candidates is _TOP:
+            self.candidates = candidates
+        else:
+            met = self.candidates & candidates
+            if not met:
+                raise ValidationError(
+                    "inconsistent batch shapes: "
+                    f"{', '.join(self.witnesses)} admit batch shapes "
+                    f"{_format_candidates(self.candidates)}, but {path} "
+                    f"admits {_format_candidates(candidates)}"
+                )
+            self.candidates = met
+        self.witnesses.append(path)
+
+
+def _format_candidates(candidates):
+    ordered = sorted(candidates, key=lambda b: (len(b), b))
+    inner = ", ".join(str(b) for b in ordered[:4])
+    if len(ordered) > 4:
+        inner += ", ..."
+    return "{" + inner + "}"
+
+
+def _is_arraylike_value(value):
+    return hasattr(value, "shape") and hasattr(value, "dtype")
+
+
+def _dtype_matches(dtype, patterns):
+    if patterns is None:
+        return True
+    name = dtype.name
+    if name in patterns:
+        return True
+    # zero-tangent dtype produced by autodiff for non-differentiable
+    # (integer/bool) leaves; accept anywhere so gradients of structs with
+    # such fields remain constructible
+    if dtype == jax.dtypes.float0:
+        return True
+    for pattern in patterns:
+        if pattern == "prng_key":
+            if jax.dtypes.issubdtype(dtype, jax.dtypes.prng_key):
+                return True
+        elif re.fullmatch(pattern, name):
+            return True
+    return False
+
+
+def _candidates(value, spec, path):
+    """
+    The set of batch shapes consistent with this value under this spec
+    (frozenset of tuples, or _TOP for "unconstrained"). Raises
+    ValidationError if no batch shape is consistent.
+    """
+    if isinstance(spec, _ArraySpec):
+        if not _is_arraylike_value(value):
+            raise ValidationError(
+                f"{path}: expected an array ({spec}), got "
+                f"{type(value).__name__}"
+            )
+        if not _dtype_matches(value.dtype, spec.dtypes):
+            raise ValidationError(
+                f"{path}: expected dtype kind {spec} but got dtype "
+                f"{value.dtype.name}"
+            )
+        shape = tuple(value.shape)
+        if len(shape) < spec.min_ndim:
+            raise ValidationError(
+                f"{path}: expected at least {spec.min_ndim} element dims "
+                f"({spec}), got shape {shape}"
+            )
+        for offset, size in spec.fixed:
+            if shape[len(shape) + offset] != size:
+                raise ValidationError(
+                    f"{path}: expected element dims matching {spec}, got "
+                    f"shape {shape} (trailing dim {offset} should be "
+                    f"{size})"
+                )
+        if spec.ndim is None:
+            return frozenset(
+                shape[:k] for k in range(len(shape) - spec.min_ndim + 1)
+            )
+        return frozenset((shape[:len(shape) - spec.ndim],))
+    elif isinstance(spec, _PyScalarSpec):
+        if isinstance(value, spec.cls):
+            return _TOP     # a scalar broadcasts: batch-agnostic
+        raise ValidationError(
+            f"{path}: expected {spec.cls.__name__}, got "
+            f"{type(value).__name__}"
+        )
+    elif isinstance(spec, _NoneSpec):
+        if value is None:
+            return _TOP
+        raise ValidationError(
+            f"{path}: expected None, got {type(value).__name__}"
+        )
+    elif isinstance(spec, _ClassSpec):
+        if not isinstance(value, spec.cls):
+            raise ValidationError(
+                f"{path}: expected an instance of {spec.cls.__name__}, got "
+                f"{type(value).__name__}"
+            )
+        value_cls = type(value)
+        if dataclasses.is_dataclass(value_cls):
+            # an annotated dataclass (nested struct or foreign): recurse
+            # via the *value's* schema (which may be a subclass of the
+            # annotated class, with more fields)
+            meet = _BatchMeet()
+            for name, subspec in schema(value_cls).fields.items():
+                meet.add(
+                    f"{path}.{name}",
+                    _candidates(getattr(value, name), subspec, f"{path}.{name}"),
+                )
+            return meet.candidates
+        # any other pytree: every array leaf constrains the batch as a
+        # prefix of its shape; scalar leaves are batch-agnostic
+        meet = _BatchMeet()
+        for keypath, leaf in jax.tree.flatten_with_path(value)[0]:
+            leafpath = path + "".join(str(k) for k in keypath)
+            if _is_arraylike_value(leaf):
+                shape = tuple(leaf.shape)
+                meet.add(
+                    leafpath,
+                    frozenset(shape[:k] for k in range(len(shape) + 1)),
+                )
+            elif isinstance(leaf, (bool, int, float, complex)):
+                continue
+            else:
+                raise ValidationError(
+                    f"{leafpath}: value of type {type(leaf).__name__} "
+                    "inside a data field is not an array; restructure, or "
+                    "mark the field static"
+                )
+        return meet.candidates
+    elif isinstance(spec, _ContainerSpec):
+        expected_cls = dict if spec.kind == "dict" else (
+            list if spec.kind == "list" else tuple
+        )
+        if not isinstance(value, expected_cls):
+            raise ValidationError(
+                f"{path}: expected {spec}, got {type(value).__name__}"
+            )
+        if spec.kind == "dict":
+            children = [(f"{path}[{k!r}]", v, spec.elems[0]) for k, v in value.items()]
+        elif spec.kind in ("list", "tuple_variadic"):
+            children = [
+                (f"{path}[{i}]", v, spec.elems[0]) for i, v in enumerate(value)
+            ]
+        else:
+            if len(value) != len(spec.elems):
+                raise ValidationError(
+                    f"{path}: expected {spec} (length {len(spec.elems)}), "
+                    f"got length {len(value)}"
+                )
+            children = [
+                (f"{path}[{i}]", v, e)
+                for i, (v, e) in enumerate(zip(value, spec.elems))
+            ]
+        meet = _BatchMeet()
+        for childpath, child, childspec in children:
+            meet.add(childpath, _candidates(child, childspec, childpath))
+        return meet.candidates
+    elif isinstance(spec, _UnionSpec):
+        arm_candidates = []
+        arm_failures = []
+        for arm in spec.arms:
+            try:
+                arm_candidates.append(_candidates(value, arm, path))
+            except ValidationError as e:
+                arm_failures.append(f"as {arm}: {e}")
+        if not arm_candidates:
+            raise ValidationError(
+                f"{path}: value matches no arm of {spec}: "
+                + "; ".join(arm_failures)
+            )
+        if any(c is _TOP for c in arm_candidates):
+            return _TOP
+        return frozenset().union(*arm_candidates)
+    else:
+        raise AssertionError(f"unknown spec {spec!r}")
+
+
+def _validate_struct(instance):
+    """
+    Check a freshly-constructed struct against its schema: array kinds and
+    element dims as annotated, and a consistent leading batch shape across
+    all data fields. Raises ValidationError (or SchemaError if the
+    annotations themselves cannot be compiled).
+    """
+    cls = type(instance)
+    meet = _BatchMeet()
+    for name, spec in schema(cls).fields.items():
+        path = f"{cls.__name__}.{name}"
+        meet.add(path, _candidates(getattr(instance, name), spec, path))
 
 
 # # # 
@@ -381,54 +938,128 @@ def _make_struct_annotation(struct_cls, dims):
         class Envs:
             pos: Int[Array, "batch 2"]
             walls: Bool[Array, "batch h w"]
+
+    Each field's expansion is derived from its schema spec. Fields whose
+    element rank is unknown (leading-variadic annotations, bare array
+    classes, abstract pytree classes) are checked for *consistency with*
+    the batch dims (the leading dims must be there; where the element ends
+    cannot be known), rather than certainty.
     """
-    # batched annotations bottom out in jaxtyping annotations (every data
-    # field must be a jaxtype, a nested struct thereof, or a promoted plain
-    # scalar), so the feature as a whole requires the optional dependency
-    if jaxtyping is None:
-        raise ImportError(
-            f'Batched struct annotations like {struct_cls.__name__}["{dims}"] '
-            f"require jaxtyping (pip install jaxtyping)"
-        )
-    hints = typing.get_type_hints(struct_cls, include_extras=True)
-    expanded = {}
-    for name, hint in hints.items():
-        # don't propagate dims to meta fields
-        if name in struct_cls._meta_fields:
-            continue
-        # propagate dims to jaxtype and struct fields
-        is_jaxtype = _is_jaxtype(hint)
-        is_struct = getattr(hint, '_is_strux_struct', False)
-        if is_jaxtype:
-            new_dims = f"{dims} {hint.dim_str}".strip()
-            expanded[name] = hint.dtype[hint.array_type, new_dims]
-        elif is_struct:
-            expanded[name] = hint[dims]
-        elif hint in (bool, int, float, complex):
-            # promote plain scalar hints to rank-0 jaxtyping annotations, so
-            # that scalar fields batch like everything else
-            scalar_dtypes = {
-                bool: jaxtyping.Bool,
-                int: jaxtyping.Int,
-                float: jaxtyping.Float,
-                complex: jaxtyping.Complex,
-            }
-            expanded[name] = scalar_dtypes[hint][jaxtyping.Array, dims]
-        # unclear how to propagate otherwise
-        else:
-            raise TypeError(
-                f"Cannot batch data field '{name}' of {struct_cls.__name__}: "
-                f"type {hint} is not a jaxtyping annotation, strux struct, "
-                f"or plain scalar type"
-            )
+    field_hints = {}
+    for name, spec in schema(struct_cls).fields.items():
+        context = f'{struct_cls.__name__}["{dims}"].{name}'
+        field_hints[name] = _expand_spec(spec, dims, context)
     return _StructAnnotationMeta(
         f'{struct_cls.__name__}["{dims}"]',
         (),
         {
             '_struct_type': struct_cls,
-            '_field_hints': expanded,
+            '_dims': dims,
+            '_field_hints': field_hints,
         },
     )
+
+
+def _expand_spec(spec, dims, context):
+    """
+    Turn a field spec into an isinstance-checkable object (a class, or a
+    flat tuple of classes for unions) representing the field with batch
+    dims prepended. Returns None for specs that cannot carry batch dims
+    (python scalar arms of a union when dims is non-empty).
+    """
+    if isinstance(spec, _ArraySpec):
+        jt = spec.jaxtype
+        return jt.dtype[jt.array_type, f"{dims} {jt.dim_str}".strip()]
+    elif isinstance(spec, _PyScalarSpec):
+        if dims.strip():
+            return None     # a python scalar cannot carry batch dims
+        return spec.cls
+    elif isinstance(spec, _NoneSpec):
+        return type(None)   # a batch of Nones is still (structurally) None
+    elif isinstance(spec, _ClassSpec):
+        if dataclasses.is_dataclass(spec.cls):
+            return _make_struct_annotation(spec.cls, dims)
+        # abstract base classes and other registered pytrees: check the
+        # class and require every array leaf to carry the batch dims
+        # (python scalar leaves are batch-agnostic, as in the solver)
+        leaf_hints = (
+            jaxtyping.Shaped[jax.Array, f"{dims} ..."],
+            jaxtyping.Shaped[np.ndarray, f"{dims} ..."],
+            bool, int, float, complex,
+        )
+        def check_node(value, _cls=spec.cls, _leaf_hints=leaf_hints):
+            if not isinstance(value, _cls):
+                return False
+            value_cls = type(value)
+            if dataclasses.is_dataclass(value_cls):
+                return isinstance(
+                    value, _make_struct_annotation(value_cls, dims),
+                )
+            return all(
+                isinstance(leaf, _leaf_hints)
+                for leaf in jax.tree.leaves(value)
+            )
+        return _make_checker(f'{spec.cls.__name__}["{dims}"]', check_node)
+    elif isinstance(spec, _ContainerSpec):
+        elem_hints = tuple(
+            _expand_spec(elem, dims, context) for elem in spec.elems
+        )
+        if any(hint is None for hint in elem_hints):
+            raise SchemaError(
+                f"{context}: container elements cannot carry batch dims"
+            )
+        def check_container(value, _spec=spec, _elem_hints=elem_hints):
+            if _spec.kind == "dict":
+                return isinstance(value, dict) and all(
+                    isinstance(v, _elem_hints[0]) for v in value.values()
+                )
+            elif _spec.kind == "list":
+                return isinstance(value, list) and all(
+                    isinstance(v, _elem_hints[0]) for v in value
+                )
+            elif _spec.kind == "tuple_variadic":
+                return isinstance(value, tuple) and all(
+                    isinstance(v, _elem_hints[0]) for v in value
+                )
+            else:
+                return (
+                    isinstance(value, tuple)
+                    and len(value) == len(_elem_hints)
+                    and all(
+                        isinstance(v, hint)
+                        for v, hint in zip(value, _elem_hints)
+                    )
+                )
+        return _make_checker(f'{spec}["{dims}"]', check_container)
+    elif isinstance(spec, _UnionSpec):
+        arms = []
+        for arm in spec.arms:
+            expanded = _expand_spec(arm, dims, context)
+            if expanded is None:
+                continue
+            if isinstance(expanded, tuple):
+                arms.extend(expanded)
+            else:
+                arms.append(expanded)
+        if not arms:
+            raise SchemaError(
+                f"{context}: no arm of {spec} can carry batch dims"
+            )
+        if len(arms) == 1:
+            return arms[0]
+        return tuple(arms)
+    else:
+        raise AssertionError(f"unknown spec {spec!r}")
+
+
+class _CheckerMeta(type):
+    """Metaclass giving a synthetic annotation a custom isinstance check."""
+    def __instancecheck__(cls, instance):
+        return cls._check(instance)
+
+
+def _make_checker(name, check_fn):
+    return _CheckerMeta(name, (), {"_check": staticmethod(check_fn)})
 
 
 class _StructAnnotationMeta(type):
@@ -436,6 +1067,15 @@ class _StructAnnotationMeta(type):
     def __instancecheck__(cls, instance):
         if not isinstance(instance, cls._struct_type):
             return False
+        instance_cls = type(instance)
+        if instance_cls is not cls._struct_type and dataclasses.is_dataclass(
+            instance_cls
+        ):
+            # a subclass instance: check against the subclass's own schema
+            # (it may declare more fields than the annotated base)
+            return isinstance(
+                instance, _make_struct_annotation(instance_cls, cls._dims),
+            )
         for field_name, expected_type in cls._field_hints.items():
             if not isinstance(getattr(instance, field_name), expected_type):
                 return False
@@ -448,40 +1088,33 @@ class _StructAnnotationMeta(type):
 
 def tree_shape(tree) -> tuple[int, ...]:
     """
-    Return the batch shape of a struct, i.e. the leading dimensions beyond
-    each field's base annotation.
+    Return the batch shape of a struct: the leading dimensions beyond each
+    field's element annotation.
 
-    Uses type hints to determine how many trailing dimensions belong to each
-    field's base type, and returns the remaining leading (batch) dimensions.
-    All data fields must agree on the batch shape.
+    The batch shape is solved from the schema (see `strux.schema`): each
+    field constrains the possible batch shapes, and all data fields must
+    agree. Fields whose element rank is unknown (leading-variadic
+    annotations, bare array classes, abstract pytree classes) and
+    batch-agnostic values (python scalars, None) are consistent with many
+    batch shapes; if the fields that *do* determine ranks don't pin the
+    batch down to a single shape, this raises ValueError listing the
+    consistent candidates — annotate element dims on at least one field to
+    resolve it. A struct with only batch-agnostic values has batch shape ().
     """
     cls = type(tree)
-    hints = typing.get_type_hints(cls, include_extras=True)
-    batch_shape = None
-    for name in cls._data_fields:
-        hint = hints[name]
-        val = getattr(tree, name)
-        is_jaxtype = _is_jaxtype(hint)
-        is_struct = getattr(hint, '_is_strux_struct', False)
-        if is_jaxtype:
-            base_ndim = len(hint.dim_str.split()) if hint.dim_str else 0
-            bs = val.shape[:val.ndim - base_ndim] if base_ndim > 0 else val.shape
-        elif is_struct:
-            bs = val.shape
-        elif hint in (bool, int, float, complex):
-            # plain scalar hint: all of the value's dims are batch dims
-            # (np.shape handles Python scalars, which have shape ())
-            bs = np.shape(val)
-        else:
-            continue
-        if batch_shape is None:
-            batch_shape = bs
-        elif bs != batch_shape:
-            raise ValueError(
-                f"Inconsistent batch shapes in {cls.__name__}: "
-                f"field '{name}' has batch shape {bs}, expected {batch_shape}"
-            )
-    return batch_shape if batch_shape is not None else ()
+    meet = _BatchMeet()
+    for name, spec in schema(cls).fields.items():
+        path = f"{cls.__name__}.{name}"
+        meet.add(path, _candidates(getattr(tree, name), spec, path))
+    if meet.candidates is _TOP:
+        return ()
+    if len(meet.candidates) == 1:
+        return next(iter(meet.candidates))
+    raise ValueError(
+        f"{cls.__name__}: batch shape under-determined: consistent "
+        f"candidates {_format_candidates(meet.candidates)}; annotate "
+        "element dims on at least one field to determine the batch shape"
+    )
 
 
 def tree_getitem(tree, index):

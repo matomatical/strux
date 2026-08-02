@@ -12,10 +12,11 @@ classifiers = [
     "Programming Language :: Python :: 3",
 ]
 
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
     "numpy",
     "jax",
+    "jaxtyping",
 ]
 
 [project.optional-dependencies]
@@ -23,7 +24,6 @@ safetensors = [
     "safetensors[numpy]",
 ]
 dev = [
-    "jaxtyping",
     "pytest",
     "pytest-codeblocks",
     "beartype",

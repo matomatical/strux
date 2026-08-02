@@ -347,29 +347,20 @@ class TestAnnotationExpansion:
         # meta field is not included
         assert "name" not in hints
 
-    def test_non_batchable_data_field_raises(self):
+    def test_non_pytree_data_field_raises(self):
         @strux.struct
         class Bad:
             pos: Int[Array, "2"]
             name: str
 
-        with pytest.raises(TypeError, match="Cannot batch data field 'name'"):
+        with pytest.raises(strux.SchemaError, match="not pytree data"):
             Bad["batch"]
 
-    def test_missing_jaxtyping_friendly_error(self, monkeypatch):
-        # without jaxtyping installed, batched annotations fail up front
-        # with a clear ImportError, whatever the field types
-        @strux.struct
-        class Fresh:
-            pos: Int[Array, "2"]
-
-        monkeypatch.setattr(strux, "jaxtyping", None)
-        with pytest.raises(ImportError, match="require jaxtyping"):
-            Fresh["batch"]
-
     def test_jaxtype_detection_is_exact(self):
-        # a class that merely duck-types the jaxtyping attributes is not
-        # treated as an array annotation
+        # a class that merely duck-types some jaxtyping attributes is not
+        # treated as an array annotation: it is an instance-checked pytree
+        # class, and an instance (with no array leaves inside) fails
+        # validation at construction
         class Impostor:
             dtype = None
             array_type = None
@@ -379,12 +370,12 @@ class TestAnnotationExpansion:
         class HasImpostor:
             pos: Impostor
 
-        with pytest.raises(TypeError, match="Cannot batch data field 'pos'"):
-            HasImpostor["batch"]
+        with pytest.raises(strux.ValidationError, match="not an array"):
+            HasImpostor(pos=Impostor())
 
     def test_plain_scalar_hints_promoted(self):
-        # plain float/int/bool hints are promoted to rank-0 jaxtyping
-        # annotations, so scalar fields batch like everything else
+        # plain float/int/bool hints mean "python scalar or array of the
+        # matching dtype kind"; batching keeps the array arms
         @strux.struct
         class Metrics:
             pos: Int[Array, "2"]
@@ -393,9 +384,11 @@ class TestAnnotationExpansion:
             done: bool
 
         ann = Metrics["batch"]
-        assert ann._field_hints["loss"].dim_str == "batch"
-        assert ann._field_hints["step"].dim_str == "batch"
-        assert ann._field_hints["done"].dim_str == "batch"
+        # each scalar field expands to a union of batched array arms
+        for name in ("loss", "step", "done"):
+            arms = ann._field_hints[name]
+            assert isinstance(arms, tuple)
+            assert any(getattr(arm, "dim_str", None) == "batch" for arm in arms)
         # a batched instance passes the isinstance check
         batched = Metrics(
             pos=jnp.zeros((4, 2), dtype=jnp.int32),
@@ -406,7 +399,7 @@ class TestAnnotationExpansion:
         assert isinstance(batched, ann)
 
     def test_plain_scalar_hint_wrong_dtype_fails(self):
-        @strux.struct
+        @strux.struct(check=False)
         class Loss:
             loss: float
 
@@ -475,12 +468,16 @@ class TestInstanceCheck:
         assert isinstance(env, Environment["batch"])
 
     def test_wrong_dtype_fails(self):
-        env = Environment(
+        # a wrong-dtype instance cannot be constructed under checking, so
+        # use an unchecked class to exercise the isinstance path
+        @strux.struct(check=False)
+        class LooseEnv:
+            hero_pos: Int[Array, "2"]
+
+        env = LooseEnv(
             hero_pos=jnp.ones((3, 2), dtype=jnp.float32),  # wrong dtype
-            goal_pos=jnp.ones((3, 2), dtype=jnp.int32),
-            walls=jnp.zeros((3, 5, 5), dtype=bool),
         )
-        assert not isinstance(env, Environment["batch"])
+        assert not isinstance(env, LooseEnv["batch"])
 
     def test_wrong_type_fails(self):
         assert not isinstance("not an env", Environment["batch"])
@@ -498,15 +495,22 @@ class TestInstanceCheck:
         assert isinstance(world, World["batch"])
 
     def test_nested_struct_fails_if_child_wrong(self):
-        world = World(
-            env=Environment(
-                hero_pos=jnp.ones((2,), dtype=jnp.int32),  # unbatched
-                goal_pos=jnp.ones((2,), dtype=jnp.int32),
-                walls=jnp.zeros((5, 5), dtype=bool),
-            ),
+        # an unbatched child with a batched sibling cannot be constructed
+        # under checking, so use unchecked classes for the isinstance path
+        @strux.struct(check=False)
+        class LooseChild:
+            pos: Int[Array, "2"]
+
+        @strux.struct(check=False)
+        class LooseWorld:
+            env: LooseChild
+            score: Float[Array, ""]
+
+        world = LooseWorld(
+            env=LooseChild(pos=jnp.ones((2,), dtype=jnp.int32)),  # unbatched
             score=jnp.array([1.0, 2.0, 3.0]),
         )
-        assert not isinstance(world, World["batch"])
+        assert not isinstance(world, LooseWorld["batch"])
 
     def test_meta_field_not_checked(self):
         @strux.struct(static_fieldnames=("name",))
@@ -577,15 +581,21 @@ class TestJaxtypedIntegration:
 
     def test_dimension_consistency_checked(self):
         """Within a @jaxtyped context, named dims must be consistent."""
+        # such an instance cannot be constructed under checking, so use an
+        # unchecked class to exercise the annotation path
+        @strux.struct(check=False)
+        class LooseEnv:
+            hero_pos: Int[Array, "2"]
+            goal_pos: Int[Array, "2"]
+
         @jaxtyped(typechecker=beartype)
-        def step(env: Environment["batch"]) -> Environment["batch"]:
+        def step(env: LooseEnv["batch"]) -> LooseEnv["batch"]:
             return env
 
         # hero_pos batch=3, goal_pos batch=4 — inconsistent "batch" dim
-        env = Environment(
+        env = LooseEnv(
             hero_pos=jnp.ones((3, 2), dtype=jnp.int32),
             goal_pos=jnp.ones((4, 2), dtype=jnp.int32),
-            walls=jnp.zeros((3, 5, 5), dtype=bool),
         )
         with pytest.raises(Exception):
             step(env)
@@ -597,11 +607,13 @@ class TestJaxtypedIntegration:
 
 class TestCheckedConstruction:
     """
-    Runtime type checkers that wrap dataclass constructors see relaxed
-    __init__ annotations: dtype and trailing shape are enforced, leading
-    batch dims are free. Applying @jaxtyped directly to the class is
-    equivalent to what jaxtyping's import hook does to every class in a
-    checked module (it wraps the generated __init__ in place).
+    Construction validates against the schema: dtype kind and trailing
+    (element) dims are enforced, leading batch dims are free but must
+    agree across fields. The checking is strux's own — the @jaxtyped
+    wrapper left on some tests here documents that external checkers
+    wrapping the constructor (as jaxtyping's import hook does to every
+    class in a checked module) find nothing to enforce and do not
+    interfere with batched construction.
     """
 
     def test_element_construction_passes(self):
@@ -741,16 +753,16 @@ class TestCheckedConstruction:
         with pytest.raises(Exception):
             Config(coeff=jnp.ones(4), u=jnp.ones(3))
 
-    def test_static_field_checked_exactly(self):
-        @jaxtyped(typechecker=beartype)
+    def test_static_field_not_runtime_checked(self):
+        # static fields are metadata: their annotations are for static
+        # checkers, and construction does not validate them
         @strux.struct(static_fieldnames=("label",))
         class Config:
             coeff: Float[Array, ""]
             label: str
 
         Config(coeff=jnp.float32(1.0), label="ok")
-        with pytest.raises(Exception):
-            Config(coeff=jnp.float32(1.0), label=42)
+        Config(coeff=jnp.float32(1.0), label=42)    # not rejected
 
     def test_variadic_annotation_left_alone(self):
         @jaxtyped(typechecker=beartype)
@@ -808,16 +820,6 @@ class TestShape:
         batched = Metrics(loss=jnp.zeros(4), step=jnp.arange(4))
         assert batched.shape == (4,)
 
-    def test_plain_scalar_shape_without_jaxtyping(self, monkeypatch):
-        # .shape degrades cleanly when jaxtyping is unavailable: no field
-        # can carry a jaxtyping annotation, plain scalar hints still work
-        @strux.struct
-        class Metrics:
-            loss: float
-
-        monkeypatch.setattr(strux, "jaxtyping", None)
-        assert Metrics(loss=jnp.zeros(4)).shape == (4,)
-
     def test_nested_struct(self):
         world = World(
             env=Environment(
@@ -830,13 +832,22 @@ class TestShape:
         assert world.shape == (4,)
 
     def test_inconsistent_batch_raises(self):
-        env = Environment(
-            hero_pos=jnp.ones((3, 2), dtype=jnp.int32),
-            goal_pos=jnp.ones((4, 2), dtype=jnp.int32),
-            walls=jnp.zeros((3, 5, 5), dtype=bool),
-        )
-        with pytest.raises(ValueError, match="Inconsistent batch shapes"):
-            env.shape
+        # checked construction refuses inconsistent batch shapes outright
+        with pytest.raises(strux.ValidationError, match="inconsistent batch"):
+            Environment(
+                hero_pos=jnp.ones((3, 2), dtype=jnp.int32),
+                goal_pos=jnp.ones((4, 2), dtype=jnp.int32),
+                walls=jnp.zeros((3, 5, 5), dtype=bool),
+            )
+        # .shape raises the same for an unchecked inconsistent struct
+        @strux.struct(check=False)
+        class LoosePair:
+            u: Float[Array, ""]
+            v: Float[Array, ""]
+
+        pair = LoosePair(u=jnp.ones(3), v=jnp.ones(4))
+        with pytest.raises(strux.ValidationError, match="inconsistent batch"):
+            pair.shape
 
     def test_shape_field_collision_warns(self):
         with pytest.warns(UserWarning, match="field named 'shape'"):
@@ -1163,3 +1174,354 @@ class TestSaveRestoreMethods:
                 restore: int
                 x: float
 
+
+
+# # #
+# Schema compilation
+
+
+class TestSchema:
+    def test_schema_is_cached_on_class(self):
+        assert strux.schema(Environment) is strux.schema(Environment)
+
+    def test_schema_repr_lists_fields(self):
+        rendered = str(strux.schema(Environment))
+        assert "hero_pos" in rendered
+        assert "walls" in rendered
+
+    def test_subclass_gets_own_schema(self):
+        @strux.struct
+        class Base:
+            steps: Int[Array, ""]
+
+        @strux.struct
+        class Derived(Base):
+            walls: Bool[Array, "h w"]
+
+        assert set(strux.schema(Base).fields) == {"steps"}
+        assert set(strux.schema(Derived).fields) == {"steps", "walls"}
+
+    def test_bad_annotations_raise_lazily(self):
+        # decoration succeeds; the schema (and hence the error) is built
+        # at first construction
+        from typing import Any
+
+        @strux.struct
+        class Bad:
+            x: Any
+
+        with pytest.raises(strux.SchemaError, match="array-leaved pytrees"):
+            Bad(x=jnp.zeros(3))
+
+    def test_object_and_callable_rejected(self):
+        from typing import Callable
+
+        @strux.struct
+        class BadObject:
+            x: object
+
+        with pytest.raises(strux.SchemaError):
+            BadObject(x=jnp.zeros(3))
+
+        @strux.struct
+        class BadCallable:
+            f: Callable
+
+        with pytest.raises(strux.SchemaError, match="mark the field static"):
+            BadCallable(f=lambda x: x)
+
+    def test_static_fields_may_be_anything(self):
+        from typing import Any, Callable
+
+        @strux.struct(static_fieldnames=("f", "meta"))
+        class Fine:
+            x: Float[Array, ""]
+            f: Callable
+            meta: Any
+
+        Fine(x=jnp.float32(1.0), f=lambda v: v, meta=object())
+
+    def test_non_leading_variadic_rejected(self):
+        @strux.struct
+        class Bad:
+            x: Float[Array, "n ..."]
+
+        with pytest.raises(strux.SchemaError, match="variadic"):
+            Bad(x=jnp.zeros((2, 3)))
+
+    def test_unresolvable_forward_reference_raises_clearly(self):
+        @strux.struct
+        class Bad:
+            x: "NotDefinedAnywhere"  # noqa: F821
+
+        with pytest.raises(strux.SchemaError, match="cannot resolve"):
+            Bad(x=jnp.zeros(3))
+
+    def test_foreign_registered_dataclass(self):
+        # a plain jax.tree_util.register_dataclass dataclass (the hijax
+        # style) gets a schema via the same parser, with metadata-static
+        # fields excluded
+        import dataclasses as dc
+        import functools
+
+        @functools.partial(
+            jax.tree_util.register_dataclass,
+            data_fields=("pos",),
+            meta_fields=("name",),
+        )
+        @dc.dataclass(frozen=True)
+        class Foreign:
+            pos: jax.Array
+            name: str = dc.field(metadata=dict(static=True))
+
+        sch = strux.schema(Foreign)
+        assert set(sch.fields) == {"pos"}
+
+
+# # #
+# Schema-driven construction and batch inference
+
+
+class TestSchemaSolver:
+    def test_unannotated_array_pinned_by_sibling(self):
+        # a bare jax.Array field gives only a prefix constraint; a
+        # rank-determined sibling pins the batch and the bare field
+        # participates fully
+        @strux.struct
+        class WithAux:
+            walls: Bool[Array, "h w"]
+            aux: jax.Array
+
+        unbatched = WithAux(walls=jnp.zeros((5, 5), bool), aux=jnp.zeros((7, 3)))
+        assert unbatched.shape == ()
+        batched = WithAux(
+            walls=jnp.zeros((4, 5, 5), bool),
+            aux=jnp.zeros((4, 7, 3)),
+        )
+        assert batched.shape == (4,)
+        with pytest.raises(strux.ValidationError, match="inconsistent batch"):
+            WithAux(walls=jnp.zeros((4, 5, 5), bool), aux=jnp.zeros((3, 7)))
+
+    def test_underdetermined_shape_raises(self):
+        @strux.struct
+        class Blob:
+            data: Float[Array, "..."]
+
+        blob = Blob(data=jnp.zeros((2, 3)))
+        with pytest.raises(ValueError, match="under-determined"):
+            blob.shape
+
+    def test_optional_field(self):
+        @strux.struct
+        class Opt:
+            momentum: Float[Array, "n"] | None
+            count: Int[Array, ""]
+
+        assert Opt(momentum=None, count=jnp.int32(0)).shape == ()
+        assert Opt(momentum=jnp.zeros(5), count=jnp.int32(0)).shape == ()
+        batched = Opt(momentum=jnp.zeros((8, 5)), count=jnp.zeros(8, jnp.int32))
+        assert batched.shape == (8,)
+        with pytest.raises(strux.ValidationError, match="no arm"):
+            Opt(momentum="hello", count=jnp.int32(0))
+
+    def test_rank_ambiguous_union_disambiguated_by_sibling(self):
+        @strux.struct
+        class Amb:
+            history: Float[Array, "n"] | Float[Array, "n m"]
+            anchor: Int[Array, ""]
+
+        # same history value, arm decided by the anchor's batch
+        arm1 = Amb(history=jnp.zeros((32, 5)), anchor=jnp.zeros(32, jnp.int32))
+        assert arm1.shape == (32,)
+        arm2 = Amb(history=jnp.zeros((32, 5)), anchor=jnp.int32(0))
+        assert arm2.shape == ()
+
+    def test_arraylike_scalar_field_all_features(self):
+        # the annotation style that motivated the schema: works through
+        # construction, .shape, and batched subscripting alike
+        import jax.typing
+
+        @strux.struct
+        class Scaled:
+            coeff: Float[jax.typing.ArrayLike, ""]
+            walls: Float[Array, "h w"]
+
+        s = Scaled(coeff=0.5, walls=jnp.zeros((5, 5)))
+        assert s.shape == ()
+        b = Scaled(coeff=jnp.ones(32), walls=jnp.zeros((32, 5, 5)))
+        assert b.shape == (32,)
+        assert isinstance(b, Scaled["batch"])
+        assert not isinstance(s, Scaled["batch"])
+        with pytest.raises(strux.ValidationError):
+            Scaled(coeff=jnp.zeros(3, dtype=int), walls=jnp.zeros((3, 5, 5)))
+
+    def test_container_fields(self):
+        @strux.struct
+        class Bank:
+            layers: tuple[Float[Array, "n"], ...]
+            table: dict[str, Float[Array, "2"]]
+
+        bank = Bank(
+            layers=(jnp.zeros(3), jnp.zeros(5)),
+            table={"a": jnp.zeros(2), "b": jnp.ones(2)},
+        )
+        assert bank.shape == ()
+        batched = Bank(
+            layers=(jnp.zeros((4, 3)), jnp.zeros((4, 5))),
+            table={"a": jnp.zeros((4, 2))},
+        )
+        assert batched.shape == (4,)
+        assert isinstance(batched, Bank["batch"])
+        assert not isinstance(bank, Bank["batch"])
+        with pytest.raises(strux.ValidationError, match="inconsistent batch"):
+            Bank(
+                layers=(jnp.zeros((4, 3)), jnp.zeros((3, 5))),
+                table={},
+            )
+        with pytest.raises(strux.ValidationError):
+            Bank(layers=(jnp.zeros(3),), table={"a": jnp.zeros(7)})
+
+    def test_fixed_tuple_field(self):
+        @strux.struct
+        class Pair:
+            bounds: tuple[Float[Array, ""], Int[Array, "2"]]
+
+        Pair(bounds=(jnp.float32(0.0), jnp.zeros(2, jnp.int32)))
+        with pytest.raises(strux.ValidationError, match="length"):
+            Pair(bounds=(jnp.float32(0.0),))
+
+    def test_polymorphic_class_field(self):
+        # an abstract (non-struct) base annotation: instances are checked
+        # by isinstance and recursed via their own dynamic type
+        class RewardFn:
+            pass
+
+        @strux.struct
+        class Constant(RewardFn):
+            value: Float[Array, ""]
+
+        @strux.struct
+        class Sum(RewardFn):
+            terms: tuple[RewardFn, ...]
+
+        s = Sum(terms=(Constant(value=jnp.float32(1.0)),))
+        assert s.shape == ()
+        batched = Sum(terms=(Constant(value=jnp.zeros(4)),))
+        assert batched.shape == (4,)
+        assert isinstance(batched, Sum["batch"])
+        with pytest.raises(strux.ValidationError, match="expected an instance"):
+            Sum(terms=(jnp.zeros(3),))
+
+    def test_base_annotation_subclass_value(self):
+        # a field annotated with a struct base class holding a subclass
+        # instance validates against the subclass's own schema
+        @strux.struct
+        class Base:
+            steps: Int[Array, ""]
+
+        @strux.struct
+        class Derived(Base):
+            walls: Bool[Array, "h w"]
+
+        @strux.struct
+        class Holder:
+            env: Base
+
+        d = Derived(steps=jnp.int32(0), walls=jnp.zeros((5, 5), bool))
+        assert Holder(env=d).shape == ()
+        db = Derived(
+            steps=jnp.zeros(4, jnp.int32),
+            walls=jnp.zeros((4, 5, 5), bool),
+        )
+        assert Holder(env=db).shape == (4,)
+        assert isinstance(Holder(env=db), Holder["batch"])
+
+    def test_python_scalars_are_batch_agnostic(self):
+        @strux.struct
+        class Config:
+            coeff: float
+            u: Float[Array, ""]
+
+        assert Config(coeff=0.5, u=jnp.ones(3)).shape == (3,)
+        with pytest.raises(strux.ValidationError):
+            Config(coeff=jnp.ones(4), u=jnp.ones(3))
+
+    def test_vjp_through_struct_with_int_field(self):
+        # autodiff produces float0 cotangents for integer leaves; the
+        # cotangent struct must remain constructible
+        @strux.struct
+        class Mixed:
+            w: Float[Array, "3"]
+            count: Int[Array, ""]
+
+        def loss(m):
+            return jnp.sum(m.w ** 2)
+
+        m = Mixed(w=jnp.ones(3), count=jnp.int32(2))
+        _, vjp_fn = jax.vjp(loss, m)
+        (g,) = vjp_fn(1.0)
+        assert g.w.shape == (3,)
+        assert g.count.dtype == jax.dtypes.float0
+
+    def test_init_signature_carries_no_annotations(self):
+        # external checkers wrapping the constructor must find nothing to
+        # enforce, whether they read __annotations__ or inspect.signature
+        import inspect
+
+        assert Environment.__init__.__annotations__ in ({}, None) or all(
+            a is inspect.Parameter.empty
+            for a in Environment.__init__.__annotations__.values()
+        )
+        signature = inspect.signature(Environment.__init__)
+        assert all(
+            p.annotation is inspect.Parameter.empty
+            for p in signature.parameters.values()
+        )
+
+
+# # #
+# Annotation-resolution regressions (future-style strings, forward refs)
+
+
+class TestAnnotationResolution:
+    def test_future_style_string_annotations(self):
+        # equivalent to `from __future__ import annotations`: dataclasses
+        # store the strings; the schema resolves them lazily in the
+        # declaring module's namespace
+        @strux.struct
+        class Stringy:
+            x: "Float[Array, ''] | None"
+            count: "Int[Array, '']"
+
+        s = Stringy(x=jnp.zeros(()), count=jnp.int32(0))
+        assert s.shape == ()
+        batched = Stringy(x=jnp.zeros(4), count=jnp.zeros(4, jnp.int32))
+        assert batched.shape == (4,)
+        assert isinstance(batched, Stringy["batch"])
+
+    def test_self_referential_struct(self):
+        # the class name is not bound at decoration time, but the schema
+        # is built lazily, and the class itself is in scope by then
+        @strux.struct
+        class Linked:
+            value: Float[Array, ""]
+            prev: "Linked | None"
+
+        first = Linked(value=jnp.float32(0.0), prev=None)
+        second = Linked(value=jnp.float32(1.0), prev=first)
+        assert second.shape == ()
+
+    def test_inherited_field_resolves_in_declaring_module(self):
+        # a subclass's inherited fields resolve against the class that
+        # declared them (exercised via the shared test structs)
+        @strux.struct
+        class Extended(Environment):
+            score: Float[Array, ""]
+
+        e = Extended(
+            hero_pos=jnp.zeros(2, jnp.int32),
+            goal_pos=jnp.zeros(2, jnp.int32),
+            walls=jnp.zeros((5, 5), bool),
+            score=jnp.float32(0.0),
+        )
+        assert e.shape == ()
