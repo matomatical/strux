@@ -55,10 +55,11 @@ Structs can hold arrays and define jit-compiled methods. Among other things,
 you can use this to define neural network modules. For example, here is a
 simple biased linear transformation layer module.
 
+<!--pytest-codeblocks:cont-->
 ```python
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Float, PRNGKeyArray  # pip install jaxtyping
+from jaxtyping import Array, Float, PRNGKeyArray
 from typing import Self
 import strux
 
@@ -117,16 +118,16 @@ neural networks (among other things). For example, here is a multi-layer
 perceptron module that combines two of the previous AffineTransform modules.
 
 You can use the `static_fieldnames` flag for fields that shouldn't be traced
-by JAX (e.g. configuration, shapes, activation functions). These fields are
-excluded from `jax.jit` and `jax.tree.map` (unlike equinox, no need for
-filters). In the below example we use this to make the activation function of
-the MLP configurable.
+by JAX (e.g. configuration, shapes). These fields are excluded from `jax.jit`
+and `jax.tree.map`. In the below example we use this to make the activation
+function of the MLP configurable.
+
 
 <!--pytest-codeblocks:cont-->
 ```python
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Float, PRNGKeyArray  # pip install jaxtyping
+from jaxtyping import Array, Float, PRNGKeyArray
 from typing import Callable, Self
 import strux
 
@@ -178,129 +179,90 @@ MLP(
 )
 ```
 
-### Saving and loading
+Unlike in equinox, the decision of whether a field is static happens at class
+definition time. This removes the need for filters and filtered JAX
+transformations at a slight flexibility cost.
 
-Structs can be saved to disk and restored later using the `save` and `restore`
-methods.
+### Field annotations
+
+What are all of these field annotations? A struct's field annotations describe
+the elements of the struct. They are used by strux internally to support
+validation, batch operations, and serialisation (described in later sections).
+
+Data fields in particular come with some restrictions on their type
+annotations. They should hold *array-leaved pytrees,* since these are the
+things that can be traced. The most important supported annotations are as
+follows.
+
+* **Jaxtyping annotations** (e.g., `Float[Array, "n 2"]`): dtype kind and
+  element dims as written. Dims may be concrete (`"5 5"`, checked exactly),
+  symbolic (`"h w"`, checked by rank), or unknown (`Float[Array, "..."]`, any
+  element rank). See jaxtyping documentation for more information.
+* **Plain scalars** (`float`, `int`, `bool`, `complex`): a Python scalar of
+  that type, or a scalar array of the matching dtype kind. Equivalent to the
+  explicit `Float[ArrayLike, ""]` spelling (`from jax.typing import
+  ArrayLike`).
+* **Unions**, including optional values `T | None`: the value decides the arm
+  at construction. Note that which arm is instantiated is a *static* property:
+  JIT recompiles per arm, traced control flow cannot switch arms.
+* **Containers**: Containers such as `dict[str, T]`, `list[T]`, `tuple[T,
+  ...]`, `tuple[T1, T2]`, as long as the leaves are supported.
+* **Nested structs, other pytrees:** Nested structs are allowed. Actually, any
+  other registered pytree is allowed, as long as the leaves are supported.
+
+If you don't want to fully annotate your array types with jaxtyping, you can
+use `jax.Array`. However, we don't allow `Any`.
 
 <!--pytest-codeblocks:cont-->
 ```python
-import os, tempfile
+from jaxtyping import Array, Bool
 
-# save the MLP to disk
-path = os.path.join(tempfile.mkdtemp(), "mlp.npz")
-net.save(path)
+@strux.struct
+class Level:
+    walls: Bool[Array, "size size"]  # jaxtyping annotation
+    reward: float                    # plain scalar
+    aux: jax.Array                   # bare array class
 
-# restore from disk using a fresh MLP as a template
-template = MLP.init(jax.random.key(999), features=4, hidden=8, outputs=1)
-restored = template.restore(path)
-
-# the restored model matches the original, not the template
-print(jax.tree.all(jax.tree.map(jnp.array_equal, net, restored)))
+level = Level(
+    walls=jnp.zeros((5, 5), dtype=bool),
+    reward=1.0,
+    aux=jnp.zeros(7),
+)
+print(level)
 ```
 
 Output:
 ```console
-True
-```
-
-A template instance is not required: pass the struct *class* and the
-structure is derived from its schema (see below) and the saved keys. Static
-fields are not saved in checkpoints, so supply them via `statics` (a dict
-of '/'-separated field paths) or give them defaults:
-
-<!--pytest-codeblocks:cont-->
-```python
-# template-free restore: data fields rebuilt from the file, static fields
-# from statics= (or their defaults)
-restored = strux.load(path, template=MLP, statics={"activate": jax.nn.relu})
-print(jax.tree.all(jax.tree.map(jnp.array_equal, net, restored)))
-```
-
-Output:
-```console
-True
-```
-
-(One caveat: a field annotated with a base class but holding subclass
-instances can't be reconstructed from the class alone — restore those with
-an instance template.)
-
-For saving, if the filename has a `.npz` extension then the data fields are
-saved in compressed numpy format. If the filename has `.safetensors` extension,
-and strux is installed with the optional `safetensors` dependency (`pip install
-strux[safetensors]`, then strux uses the
-[safetensors](https://huggingface.co/docs/safetensors/) memory-mapped format.
-
-By default, saving refuses to overwrite an existing file; pass
-`overwrite=True` to replace it (e.g. for repeatedly saving the latest
-checkpoint during training). Writes are atomic: data is written to a
-temporary file that is then renamed over the destination, so an interrupted
-save never leaves a partial file.
-
-For loading, by default the format of the file is inferred from the file
-extension. Strux requires a template struct, complete with values for all
-static fields, to load the data into memory. The shapes and data types of the
-arrays are overridden by those in the saved checkpoint.
-
-You can also use `strux.to_dict` / `strux.from_dict` to convert structs to /
-from flat dictionaries of arrays, for use with other serialisation tools. In
-the case of [orbax](https://orbax.readthedocs.io/), structs can be checkpointed
-out of the box since they are just pytrees:
-
-<!--pytest-codeblocks:cont-->
-```python
-import orbax.checkpoint as ocp # pip install orbax-checkpoint
-
-orbax_path = os.path.join(tempfile.mkdtemp(), "mlp_orbax")
-
-# save
-ocp.StandardCheckpointer().save(orbax_path, net)
-
-# restore
-restored = ocp.StandardCheckpointer().restore(orbax_path, target=template)
-
-print(jax.tree.all(jax.tree.map(jnp.array_equal, net, restored)))
-```
-
-Output:
-```console
-True
+Level(
+  walls=jnp.bool[5,5],
+  reward=float(1.0),
+  aux=jnp.float32[7],
+)
 ```
 
 ### Vmapping and batch annotations
 
-Structs work naturally with vectorisation and `jax.vmap`, for example for
-batches of data, parameters, or anything else. You can define your struct for
-the individual elements of the batch, and then annotate batched structs with
-the `strux.Struct` type form (e.g. `strux.Struct[Image, "batch_size"]`). The
-result is a new type whose isinstance checks verify the batch dimension(s)
-prepended to each (non-static) field's jaxtyping annotation. Plain scalar
-hints (`float`, `int`, `bool`, `complex`) are promoted to rank-0 jaxtyping
-annotations, so e.g. a `loss: float` field batches as
-`Float[Array, "batch"]`.
+Structs work naturally with vectorisation and `jax.vmap`.
 
-To static type checkers, `strux.Struct` is `typing.Annotated` (the same
-trick jaxtyping's own forms use), so these annotations are legal in
-signatures: checkers read `strux.Struct[Image, "batch_size"]` as plain
-`Image` — batch dims are beyond static checking, like jaxtyping's shape
-strings — while runtime tools enforce the full form. The dims string uses
-jaxtyping's dims language, so `strux.Struct[Image, ""]` is a rank-exact
-check (no batch dims allowed) and `strux.Struct[Image, "..."]` accepts any
-batch rank. (Note that a struct *class* is not subscriptable with dims
-strings: subscripting a class is Python's generic-parameterisation syntax,
-which structs leave alone — PEP 695 generic structs like
-`class Box[T: Env]: ...` work as usual.)
+You can define your struct for the individual elements of the batch, and then
+annotate batched structs with the `strux.Struct` type form, following jaxtyping
+dimensions syntax. For example, if `Image` is a struct, then:
 
-We could use this to implement a data batch or a neural network ensemble, or
-even depth-wise batches of layer parameters for use as inputs to
-`jax.lax.scan`.  Here we give an example of a batched gridworld for collecting
-parallel rollouts.
+* `Struct[Image, "batch_size"]` denotes a batched image.
+* `Struct[Image, "b1 b2"]` denotes a batched batched image.
+* `Struct[Image, "..."]` accepts any batch rank.
+* `Struct[Image, ""]` is a rank-exact version (no batch dims).
 
+We can use batch annotations to describe data batches, neural network
+ensembles, or even depth-wise batches of layer parameters for use as inputs to
+`jax.lax.scan`.  Here we give an example of a batching a gridworld for
+collecting parallel rollouts.
+
+<!--pytest-codeblocks:cont-->
 ```python
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Int, Bool, PRNGKeyArray  # pip install jaxtyping
+from jaxtyping import Array, Int, Bool, PRNGKeyArray
 from typing import Self
 import strux
 
@@ -366,12 +328,16 @@ hero positions after step:
  [0 1]]
 ```
 
+Note that plain scalar fields (annotated `float`, `int`, `bool`, `complex`) are
+promoted to rank-0 jaxtyping annotations. For example, a `loss: float` field
+batches as `Float[Array, "batch"]`.
+
 ### Indexing and shape for batched structs
 
-Batched structs support `.shape` and indexing. The `.shape` property returns the
-batch dimensions (the leading dimensions beyond each field's base annotation).
-Indexing with `env[i]` or slicing with `env[i:j]` indexes into the batch
-dimensions of every field at once.
+Batched structs support `.shape` and indexing. The `.shape` property returns
+the batch dimensions (the leading dimensions beyond each field's base
+annotation). Indexing with `env[i]` or slicing with `env[i:j]` indexes into the
+batch dimensions of every field at once.
 
 <!--pytest-codeblocks:cont-->
 ```python
@@ -413,82 +379,84 @@ For other element-wise operations, use `jax.tree.map`:
 shifted = jax.tree.map(lambda x: x + 1, env0)
 ```
 
-### Functor annotations: types for tree.map images
+### Functor/map annotations
 
-Leaf-wise operations produce trees with the *structure* of the struct but
-transformed leaves — for example, `jax.tree.map(jnp.array_equal, a, b)`
-rebuilds the struct with every leaf replaced by a boolean scalar. The
-`strux.Struct` form can name these types too: alongside dims strings
-(which prepend batch dims) it accepts *functors* describing what happened
-to each leaf, applied left to right:
-
-* `strux.astype(kind)` — every leaf keeps its dims but takes on the given
-  scalar kind (`bool`, `int`, `float`, or `complex`): the image of an
-  elementwise map like `tree.map(lambda a, b: a == b, x, y)`.
-* `strux.mapped(kind)` — every leaf becomes a scalar of the kind: the
-  image of a full reduction like `tree.map(jnp.array_equal, x, y)` or
-  `tree.map(jnp.count_nonzero, x)`.
+Prepending batch dimensions to each leaf is one example of a more general type
+transformation: transforming the shape/datatype of leaves while preserving the
+pytree structure. `strux.Struct` also allows us to annotate more general
+transformed types. To explore, let's compare two checkpoints of the MLP from
+the earlier examples: `net`, and a copy with one layer re-initialised.
 
 <!--pytest-codeblocks:cont-->
 ```python
-# the elementwise comparison keeps each leaf's dims, as bools:
-elementwise = jax.tree.map(lambda a, b: a == b, env0, env0)
-assert isinstance(elementwise, strux.Struct[GridWorld, strux.astype(bool)])
-
-# the full reduction collapses each leaf to a bool scalar:
-reduced = jax.tree.map(jnp.array_equal, env0, env0)
-assert isinstance(reduced, strux.Struct[GridWorld, strux.mapped(bool)])
-
-# functors compose left to right: a vmapped reduction is mapped, then
-# batched
-vmapped = jax.vmap(lambda a, b: jax.tree.map(jnp.array_equal, a, b))(
-    envs, envs,
+net2 = net.replace(
+    linear2=AffineTransform.init(jax.random.key(1), 8, 1),
 )
-assert isinstance(vmapped, strux.Struct[GridWorld, strux.mapped(bool), "batch"])
 ```
 
-These are annotation-and-check types, not constructors: functor images
-arise from tree operations (whose structural rebuilding bypasses
-construction checking by design), and the forms name them at function
-boundaries. Beware that `.replace` on such an image re-enters checked
-construction against the *element* schema and will raise.
+* Type casting: The annotation `strux.astype(dtype)` denotes every leaf keeping
+  its dims but taking on the given dtype (`bool`, `int`, `float`, or
+  `complex`). Useful for elementwise maps, like so:
+  <!--pytest-codeblocks:cont-->
+  ```python
+  # which entries changed? a bool mask per entry, shapes preserved
+  def changed_entries(a: MLP, b: MLP) -> strux.Struct[MLP, strux.astype(bool)]:
+      return jax.tree.map(lambda ai, bi: ai != bi, a, b)
 
-### Field annotations and checked construction
+  print(changed_entries(net, net2))
+  ```
 
-A struct's field annotations describe one *element* of the struct, and they
-are compiled (lazily, on first use) into a per-class schema of shape
-constraints. Construction validates against the schema: dtype kind and
-trailing (element) dims are enforced, while leading batch dims are free —
-but must agree across every field. Batch tolerance is what makes
-annotations and batching coexist: instances routinely carry leading batch
-dims beyond the annotations (a stack of levels built from numpy, a restored
-checkpoint of rollouts), and construction accepts any consistent batch.
+  Output:
+  ```console
+  MLP(
+    linear1=AffineTransform(
+      weights=jnp.bool[4,8],
+      biases=jnp.bool[8],
+    ),
+    linear2=AffineTransform(
+      weights=jnp.bool[8,1],
+      biases=jnp.bool[1],
+    ),
+    activate=<fn:relu>,
+  )
+  ```
 
-Validation guards the user API boundary — direct construction and
-`.replace` — while reconstruction through JAX's tree machinery
-(`jax.tree.map` results, `vmap`/`scan`/`jit` outputs, gradients) is
-*structural* and never validated: transformed trees legitimately carry
-leaves that differ from the declared element types (mapping
-`jnp.array_equal` over two structs yields rank-0 bools; cotangents carry
-`float0`). In practice this still catches shape bugs where they are born,
-because traced code builds its result structs with `.replace(...)`, which
-validates at trace time.
+* Full reduction: The annotation `strux.mapped(dtype)` denotes every leaf
+  becoming replaced with a scalar of the given dtype:
+  <!--pytest-codeblocks:cont-->
+  ```python
+  # how many entries changed in each field? one int per leaf
+  def changed_counts(a: MLP, b: MLP) -> strux.Struct[MLP, strux.mapped(int)]:
+      return jax.tree.map(lambda ai, bi: jnp.sum(ai != bi), a, b)
 
+  counts = changed_counts(net, net2)
+  print(counts.linear1.weights, counts.linear2.weights, counts.linear2.biases)
+  ```
+
+  Output:
+  ```console
+  0 8 0
+  ```
+
+  (Only the re-initialised layer's weights changed; its biases are zero in
+  both checkpoints.)
+
+* Axis reduction (planned): an annotation denoting every leaf reduced along a
+  named element axis is designed but not yet implemented — see the roadmap.
+
+`strux.Struct` takes a list of strings or the above functors and applies them
+to the type of each leaf, left to right.
+
+
+### Type validation on construction
+
+By default, strux checks that field values match their type annotations at
+construction time, and raises an error if there is a mismatch. (Pass
+`@strux.struct(check=False)` to opt a class out of this feature.)
+
+<!--pytest-codeblocks:cont-->
 ```python
-import jax
-import jax.numpy as jnp
-from jaxtyping import Array, Bool, Float
-import strux
-
-@strux.struct
-class Level:
-    walls: Bool[Array, "size size"]
-    reward: float
-    aux: jax.Array
-
-# element-level construction: batch shape ()
-level = Level(walls=jnp.zeros((5, 5), dtype=bool), reward=1.0, aux=jnp.zeros(7))
-print(level.shape)
+# recall `Level` defined in the field annotations section above:
 
 # batched construction: leading batch dims are free, but must agree
 levels = Level(
@@ -511,77 +479,27 @@ except strux.ValidationError:
 
 Output:
 ```console
-()
 (32,)
 rejected!
 ```
 
-Data fields hold *array-leaved pytrees* — that is what it means to be on
-the traced side of the data/static split — and the supported annotations
-reflect that:
+The check costs microseconds per construction for simple schemas, and runs only
+on direct construction and `.replace` (JAX's internal tree reconstructions skip
+it).
 
-* **jaxtyping annotations** (`Float[Array, "n 2"]`): dtype kind and element
-  dims as written. Dims may be concrete (`"5 5"`, checked exactly),
-  symbolic (`"h w"`, checked by rank), or unknown (`Float[Array, "..."]`,
-  any element rank).
-* **plain scalars** (`float`, `int`, `bool`, `complex`): a python scalar of
-  that type, or an array of the matching dtype kind. Equivalent to the
-  explicit `Float[ArrayLike, ""]` spelling (`from jax.typing import
-  ArrayLike`). A python scalar value is batch-agnostic (it broadcasts).
-* **bare array classes** (`jax.Array`, `np.ndarray`): any dtype, any
-  element rank. The batch dims must still be a prefix of the shape, so
-  such fields participate in batch checking whenever a sibling field pins
-  the batch down — annotate at least one field with element dims and the
-  rest is inferred.
-* **nested structs and other annotated dataclass pytrees**: recursed via
-  the value's own schema (a field annotated with a base class accepts
-  subclass instances, validated against the subclass's schema).
-* **containers**: `dict[str, T]`, `list[T]`, `tuple[T, ...]`, and
-  fixed-shape `tuple[T1, T2]` of any supported annotation.
-* **unions**, including `T | None`: the value decides the arm at
-  construction. Note that which arm is chosen is a *structural* property,
-  like a static field: JIT recompiles per arm, traced control flow cannot
-  switch arms, and a batch must be on one arm.
-* **other pytree classes** (e.g. an abstract base class of several
-  structs): isinstance-checked, then every array leaf of the value
-  constrains the batch as a prefix of its shape.
-
-Annotations that promise nothing about array leaves (`Any`, `object`,
-`str`, callables) are rejected — such values belong in static fields
-(whose annotations are for static checkers only, and are not validated at
-construction). Symbolic dim names (`"h w"`) are rank-only at
-construction; `strux.tree_dims(obj)` binds them to sizes on demand and
-checks that shared names agree across fields. Inspect the compiled schema
-with `strux.schema`:
-
-<!--pytest-codeblocks:cont-->
-```python
-print(strux.schema(Level))
-```
-
-Output:
-```console
-schema Level:
-  walls: Bool[Array, 'size size']
-  reward: Float[Array, ''] | Float[ndarray, ''] | number | float
-  aux: Shaped[Array, '...']
-```
-
-Checked construction is on by default; pass `@strux.struct(check=False)`
-to opt a class out (its schema-driven features like `.shape` still work).
-The check costs about a microsecond per construction for simple schemas,
-and runs only on direct construction and `.replace` — JAX's internal tree
-reconstructions skip it entirely.
+Symbolic dim names (`"h w"`) are rank-only at construction;
+`strux.tree_dims(obj)` binds them to sizes on demand and checks that shared
+names agree across fields.
 
 ### Runtime type checking
 
-Strux works together with jaxtyping's runtime type checking. For example,
+Strux also works together with jaxtyping's runtime type checking. For example,
 if you combine it with a typechecker like beartype, shape and dtype mismatches
 are caught at function boundaries.
 
 <!--pytest-codeblocks:cont-->
 ```python
-from jaxtyping import jaxtyped  # pip install jaxtyping
+from jaxtyping import jaxtyped
 from beartype import beartype   # pip install beartype
 
 @jaxtyped(typechecker=beartype)
@@ -601,11 +519,154 @@ envs = checked_step(envs, actions) # envs, actions from previous example
 Function-boundary checking composes cleanly with strux's own construction
 checking: constructors tolerate any (consistent) leading batch dims, and
 discipline about a *specific* batch shape belongs at function boundaries,
-as above. External checkers that wrap dataclass constructors (such as
-jaxtyping's import hook) find nothing to enforce on a struct's `__init__`
-— its runtime annotations are deliberately empty, precisely so that
-hook-checked modules don't reject legitimately batched constructions —
-while every other function in a hooked module is checked as usual.
+as above.
+
+External checkers that wrap dataclass constructors (such as jaxtyping's import
+hook) find nothing to enforce on a struct's `__init__`: its runtime annotations
+are deliberately empty, precisely so that hook-checked modules don't reject
+legitimately batched constructions. Every other function in a hooked module is
+checked as usual.
+
+### Saving structs to disk
+
+Structs can be saved to disk to be restored later, using the `save` method.
+
+<!--pytest-codeblocks:cont-->
+```python
+import os, tempfile
+
+# save the MLP to disk
+path = os.path.join(tempfile.mkdtemp(), "mlp.npz")
+net.save(path)
+```
+
+Two file formats are supported:
+
+* If the filename has a `.npz` extension then the data fields are saved in
+  compressed numpy format (pass `fmt="savez"` for uncompressed).
+
+* If the filename has `.safetensors` extension, and strux is installed with the
+  optional `safetensors` dependency (`pip install strux[safetensors]`), then
+  strux uses the [safetensors](https://huggingface.co/docs/safetensors/)
+  memory-mapped format.
+
+By default, saving refuses to overwrite an existing file; pass `overwrite=True`
+to replace it (e.g. for repeatedly saving the latest checkpoint during
+training). Writes are atomic: data is written to a temporary file that is then
+renamed over the destination, so an interrupted save never leaves a partial
+file.
+
+### Loading structs from disk
+
+Structs saved to disk can be restored with the `restore` method of a
+template instance, or with `strux.load`.
+
+Restoration requires a template to determine the pytree structure.
+
+1. One option is to supply an instance of the struct. The struct instance
+   provides the static field values, and the data leaves are read from the file
+   (including overwriting the shapes/dtypes of the template struct).
+
+   <!--pytest-codeblocks:cont-->
+   ```python
+   # restore from disk using a fresh MLP as a template
+   template = MLP.init(jax.random.key(999), features=4, hidden=8, outputs=1)
+   restored = template.restore(path)
+   
+   # the restored model matches the original (not the template)
+   print(jax.tree.all(jax.tree.map(jnp.array_equal, net, restored)))
+   ```
+   
+   Output:
+   ```console
+   True
+   ```
+   
+2. Alternatively, one can provide the struct class as a template. If there are
+   static fields, their values should be provided via `statics=` (a dict keyed
+   by `/`-separated field paths). If a static value is not provided, the field
+   is populated with its default value, or an error is raised if there is no
+   default.
+   
+   <!--pytest-codeblocks:cont-->
+   ```python
+   # template-free restore: data fields rebuilt from the file, static fields
+   # from statics= (or their defaults)
+   restored = strux.load(
+       path,
+       template=MLP,
+       statics={"activate": jax.nn.relu},
+   )
+   
+   # matches
+   print(jax.tree.all(jax.tree.map(jnp.array_equal, net, restored)))
+   ```
+   
+   Output:
+   ```console
+   True
+   ```
+
+Template-free restore isn't always available. For example, if a field is
+annotated with a base class but populated with a subclass, we can't know the
+subclass at restore time without an instance template. Likewise, if the field
+is annotated with a union, we might not be able to tell which arm was in play.
+In these cases, use an instance-template. (We might improve this situation in
+the future.)
+
+By default the format of the file is inferred from the file extension (use
+`fmt=` to override).
+
+### Other serialisation options
+
+You can also use `strux.to_dict` and `strux.from_dict` to convert structs to
+and from flat dictionaries of arrays. This can compose with other Python
+serialisation tools.
+
+Strux natively supports checkpointing with
+  [orbax](https://orbax.readthedocs.io/),
+since structs are just pytrees:
+
+<!--pytest-codeblocks:cont-->
+```python
+import orbax.checkpoint as ocp # pip install orbax-checkpoint
+
+orbax_path = os.path.join(tempfile.mkdtemp(), "mlp_orbax")
+
+# save
+ocp.StandardCheckpointer().save(orbax_path, net)
+
+# restore
+restored = ocp.StandardCheckpointer().restore(orbax_path, target=template)
+
+print(jax.tree.all(jax.tree.map(jnp.array_equal, net, restored)))
+```
+
+Output:
+```console
+True
+```
+
+### Schema inference
+
+Type checking (TODO: And structure serialisation) is supported internally by a
+schema inferred from annotations. Inspect the inferred schema with
+`strux.schema`:
+
+<!--pytest-codeblocks:cont-->
+```python
+print(strux.schema(Level))
+```
+
+Output:
+```console
+schema Level:
+  walls: Bool[Array, 'size size']
+  reward: Float[Array, ''] | Float[ndarray, ''] | number | float
+  aux: Shaped[Array, '...']
+```
+
+TODO: Describe schema inference.
 
 Development
 -----------
@@ -666,14 +727,36 @@ Advanced features:
 - [x] Schema-driven batch-tolerant construction checking (`strux.schema`)
 - [x] Unions, optionals, containers, and unannotated arrays as data fields
 - [x] Pretty print registered pytree classes that aren't dataclasses
+
+Advanced serialisation:
+
 - [x] Template-free restore: load from a struct class, no template instance
       (`strux.load(path, template=Cls, statics=...)`)
+- [ ] Serialise literal static fields where possible.
+  * Literals, standard python collections. `repr`/`ast.literal_eval`
+    round-trip. No code execution on load (literal parsing only, keeping
+    npz/safetensors' security level).
+  * However don't attempt to serialise callables etc.
+- [ ] Serialise instance-level structure aside from shapes/dtypes (e.g.,
+      subclasses? tags for unions).
+  * Stored in the safetensors metadata header / a reserved npz entry?
+  * This will increase the amount of structs that are amenable to
+    instance-free restoration.
+  * And it will help with checkpoint archaeology.
+- [ ] Consider making it an error to load a leaf with a different shape/dtype
+      from the template? In analogy with if there were spare/missing leaves,
+      which should result in an error.
+
+Advanced typing:
+
 - [x] Generic structs (PEP 695): bounded-TypeVar and generic-alias field
       annotations (constraints erased to the bound/origin at runtime)
 - [x] Schema functors: leaf-spec transformations as annotations —
       `strux.astype(kind)` and `strux.mapped(kind)`, composing with dims
       strings in the `Struct` form (the prepend being the invertible
       special case)
+* Not happy with the whole strux relationship to annotations / types, since we
+  can't check the result of maps for example.
 - [ ] More functors as needs arise: `reduced(*names)` (drop named element
       axes) and `promoted()` (sum-semantics dtype promotion) are designed
       in the meta-repo journal
