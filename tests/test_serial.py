@@ -372,3 +372,80 @@ class TestTemplateFreeRestore:
         p.save(path)
         with pytest.raises(TypeError, match="instance template"):
             strux.load(path, template=p, statics={"x": 1})
+
+
+# # #
+# Union arm inference: sound only when unambiguous
+
+
+@strux.struct
+class _Metric:
+    value: Float[Array, ""]
+
+
+@strux.struct
+class _Score:  # key-layout-isomorphic to _Metric
+    value: Float[Array, ""]
+
+
+@strux.struct
+class _Pos:  # distinguishable from both by key layout
+    coords: Float[Array, "2"]
+
+
+class TestUnionArmInference:
+    def test_isomorphic_arms_raise(self, tmp_path):
+        # two arms with identical key layouts are indistinguishable in
+        # the saved file: refuse rather than silently pick one
+        @strux.struct
+        class Holder:
+            item: _Metric | _Score
+
+        h = Holder(item=_Score(value=jnp.float32(3.0)))
+        path = str(tmp_path / "h.npz")
+        h.save(path)
+        with pytest.raises(KeyError, match="more than one arm"):
+            strux.load(path, template=Holder)
+
+    def test_isomorphic_arms_instance_template_ok(self, tmp_path):
+        @strux.struct
+        class Holder:
+            item: _Metric | _Score
+
+        h = Holder(item=_Score(value=jnp.float32(3.0)))
+        path = str(tmp_path / "h.npz")
+        h.save(path)
+        restored = strux.load(path, template=h)
+        assert type(restored.item) is _Score
+
+    def test_distinguishable_arms_restore(self, tmp_path):
+        @strux.struct
+        class Holder:
+            item: _Pos | _Metric
+
+        for item in (_Metric(value=jnp.float32(1.0)),
+                     _Pos(coords=jnp.zeros(2))):
+            h = Holder(item=item)
+            path = str(tmp_path / f"h_{type(item).__name__}.npz")
+            h.save(path)
+            restored = strux.load(path, template=Holder)
+            assert type(restored.item) is type(item)
+
+    def test_subset_arms_choose_full_explanation(self, tmp_path):
+        # one arm's keys are a subset of another's: the unique arm that
+        # explains every saved key wins, regardless of declaration order
+        @strux.struct
+        class Both:
+            value: Float[Array, ""]
+            extra: Float[Array, ""]
+
+        @strux.struct
+        class Holder:
+            item: _Metric | Both   # _Metric's keys ⊂ Both's keys
+
+        h = Holder(item=Both(value=jnp.float32(1.0),
+                             extra=jnp.float32(2.0)))
+        path = str(tmp_path / "h.npz")
+        h.save(path)
+        restored = strux.load(path, template=Holder)
+        assert type(restored.item) is Both

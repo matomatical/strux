@@ -102,9 +102,13 @@ def from_dict(d: dict, *, template, statics=None):
 
     The template-free path covers schemas made of arrays, scalars, nested
     dataclass structs, containers, and optionals (a union whose data is
-    absent restores as None). It cannot reconstruct polymorphic fields
-    (annotated with a base class but holding subclass instances) — restore
-    those with an instance template.
+    absent restores as None). The saved file records arrays only, never
+    type identity, so fields whose type must be *inferred* are restored
+    only when the inference is unambiguous: a union arm is chosen only if
+    it is the unique arm explaining the saved keys (arms with identical
+    key layouts raise), and polymorphic fields (annotated with a base
+    class but holding subclass instances) are refused outright — restore
+    either with an instance template.
 
     The keys in `d` must exactly match the keys expected by the template.
     Raises KeyError on missing or extra keys.
@@ -183,22 +187,49 @@ def _build_value(spec, d, statics, path):
         # an array saved at exactly this path: the array arm
         if path in d:
             return jnp.asarray(d[path]), {path}
-        # keys strictly below this path: the first structured arm that fits
-        if any(key.startswith(path + "/") for key in d):
-            failures = []
-            for arm in spec.arms:
-                if isinstance(arm, (_ClassSpec, _ContainerSpec)):
-                    try:
-                        return _build_value(arm, d, statics, path)
-                    except (KeyError, TypeError) as e:
-                        failures.append(f"as {arm}: {e}")
+        # otherwise the arm must be inferred from the saved keys under
+        # this path — and the file records arrays only, never which arm
+        # produced them, so the inference is only sound if exactly one
+        # arm explains them. A candidate arm must reconstruct AND consume
+        # every key under the path (arms with identical key layouts are
+        # indistinguishable in the file: refuse rather than guess).
+        keys_below = {key for key in d if key.startswith(path + "/")}
+        candidates = []
+        failures = []
+        for arm in spec.arms:
+            if isinstance(arm, (_ClassSpec, _ContainerSpec)):
+                try:
+                    value, consumed = _build_value(arm, d, statics, path)
+                except (KeyError, TypeError) as e:
+                    failures.append(f"as {arm}: {e}")
+                    continue
+                if consumed == keys_below:
+                    candidates.append((str(arm), value, consumed))
+                else:
+                    failures.append(
+                        f"as {arm}: does not explain saved keys "
+                        f"{sorted(keys_below - consumed)}"
+                    )
+        if not keys_below and any(
+            isinstance(arm, _NoneSpec) for arm in spec.arms
+        ):
+            candidates.append(("None", None, set()))
+        if len(candidates) > 1:
+            arm_names = ", ".join(name for name, _, _ in candidates)
+            raise KeyError(
+                f"cannot reconstruct {path!r}: the saved arrays are "
+                f"consistent with more than one arm of {spec} "
+                f"({arm_names}); the file does not record which arm was "
+                "saved — restore with an instance template"
+            )
+        if candidates:
+            (_, value, consumed), = candidates
+            return value, consumed
+        if failures:
             raise KeyError(
                 f"cannot reconstruct {path!r} under any arm of {spec}: "
                 + "; ".join(failures)
             )
-        # no data at all: the None arm, if there is one
-        if any(isinstance(arm, _NoneSpec) for arm in spec.arms):
-            return None, set()
         raise KeyError(f"missing saved data for {path!r}")
     elif isinstance(spec, _ClassSpec):
         if dataclasses.is_dataclass(spec.cls):
