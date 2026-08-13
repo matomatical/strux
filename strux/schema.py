@@ -284,6 +284,12 @@ def _resolve_hint(hint, owner, cls, context):
     module = sys.modules.get(owner.__module__, None)
     globalns = getattr(module, "__dict__", {})
     localns = {owner.__name__: owner, cls.__name__: cls}
+    # the declaring class's type parameters (class C[T]: ...) live in a
+    # lexical scope of their own, not the module globals; bind them so
+    # annotations like tuple[C[T], ...] resolve
+    localns.update(
+        {param.__name__: param for param in getattr(owner, "__type_params__", ())}
+    )
     try:
         return eval(hint, globalns, localns)
     except NameError as e:
@@ -383,6 +389,21 @@ def _parse_hint(hint, context):
     # constraints are derived from the value's dynamic type
     if isinstance(hint, type):
         return _ClassSpec(cls=hint)
+    # generic aliases over ordinary classes (e.g. RewardFn[EnvT]): type
+    # parameters are erased at runtime, so the constraint is the origin
+    # class, recursed like any class annotation
+    if isinstance(origin, type):
+        return _parse_hint(origin, context)
+    # type variables: a bounded one promises its bound; an unbounded one
+    # promises nothing about its values
+    if isinstance(hint, typing.TypeVar):
+        if hint.__bound__ is None:
+            raise SchemaError(
+                f"{context}: unbounded type variable {hint!r} promises "
+                "nothing about its values; give it a bound "
+                "(class C[T: Bound]) or mark the field static"
+            )
+        return _parse_hint(hint.__bound__, context)
     raise SchemaError(
         f"{context}: unsupported data field annotation {hint!r}"
     )

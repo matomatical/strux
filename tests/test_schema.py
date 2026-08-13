@@ -133,7 +133,7 @@ class TestAnnotationResolution:
         assert s.shape == ()
         batched = Stringy(x=jnp.zeros(4), count=jnp.zeros(4, jnp.int32))
         assert batched.shape == (4,)
-        assert isinstance(batched, Stringy["batch"])
+        assert isinstance(batched, strux.Struct[Stringy, "batch"])
 
     def test_self_referential_struct(self):
         # the class name is not bound at decoration time, but the schema
@@ -161,3 +161,87 @@ class TestAnnotationResolution:
             score=jnp.float32(0.0),
         )
         assert e.shape == ()
+
+
+# # #
+# Generic structs
+
+
+class TestGenericStructs:
+    def test_bounded_typevar_field(self):
+        # a field annotated with a bounded TypeVar constrains to the bound,
+        # recursed via the value's dynamic type
+        @strux.struct
+        class Ref[T: Environment]:
+            env: T
+
+        env = Environment(
+            hero_pos=jnp.zeros(2, jnp.int32),
+            goal_pos=jnp.zeros(2, jnp.int32),
+            walls=jnp.zeros((5, 5), bool),
+        )
+        ref = Ref(env=env)
+        assert ref.shape == ()
+        with pytest.raises(strux.ValidationError):
+            Ref(env="not an environment")
+
+    def test_unbounded_typevar_field_rejected(self):
+        @strux.struct
+        class Bad[T]:
+            value: T
+
+        with pytest.raises(strux.SchemaError, match="unbounded type variable"):
+            Bad(value=jnp.zeros(()))
+
+    def test_generic_alias_field(self):
+        # a generic-alias annotation constrains to the origin class (type
+        # parameters are erased at runtime)
+        @strux.struct
+        class Box[T: Environment]:
+            env: T
+
+        @strux.struct
+        class Pair[T: Environment]:
+            boxes: tuple[Box[T], ...]
+
+        env = Environment(
+            hero_pos=jnp.zeros(2, jnp.int32),
+            goal_pos=jnp.zeros(2, jnp.int32),
+            walls=jnp.zeros((5, 5), bool),
+        )
+        pair = Pair(boxes=(Box(env=env), Box(env=env)))
+        assert pair.shape == ()
+        with pytest.raises(strux.ValidationError):
+            Pair(boxes=(env,))  # an Environment is not a Box
+
+    def test_generic_alias_in_string_annotation(self):
+        # under `from __future__ import annotations` the annotation is a
+        # string mentioning the class's own type parameter, which lives in
+        # a lexical scope of its own and must still resolve
+        @strux.struct
+        class Node[T: Environment]:
+            env: "T"
+            children: "tuple[Node[T], ...]"
+
+        env = Environment(
+            hero_pos=jnp.zeros(2, jnp.int32),
+            goal_pos=jnp.zeros(2, jnp.int32),
+            walls=jnp.zeros((5, 5), bool),
+        )
+        node = Node(env=env, children=(Node(env=env, children=()),))
+        assert node.shape == ()
+
+    def test_generic_struct_batch_solving(self):
+        # batched leaves in a generic struct still solve to a batch shape
+        @strux.struct
+        class Ref[T: Environment]:
+            env: T
+
+        batched_env = Environment(
+            hero_pos=jnp.zeros((4, 2), jnp.int32),
+            goal_pos=jnp.zeros((4, 2), jnp.int32),
+            walls=jnp.zeros((4, 5, 5), bool),
+        )
+        ref = Ref(env=batched_env)
+        assert ref.shape == (4,)
+        assert isinstance(ref, strux.Struct[Ref, "batch"])

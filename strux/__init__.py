@@ -5,6 +5,8 @@ schema-checked pytree with batch-aware shapes, indexing, pretty printing,
 annotations, and serialisation.
 """
 
+import typing
+
 from strux.schema import (
     Schema,
     SchemaError,
@@ -12,6 +14,19 @@ from strux.schema import (
     schema,
 )
 from strux.struct import struct
+from strux.annotate import (
+    astype,
+    mapped,
+)
+
+if typing.TYPE_CHECKING:
+    # the Struct form is typing.Annotated to static checkers (an import-as,
+    # since Annotated is a typeform and cannot be assigned): checkers read
+    # Struct[Env, "batch"] as Env with inert metadata, while at runtime the
+    # same expression builds a synthetic isinstance-checkable class
+    from typing import Annotated as Struct
+else:
+    from strux.annotate import Struct
 from strux.shapes import (
     tree_dims,
     tree_getitem,
@@ -31,6 +46,9 @@ from strux.serial import (
 
 __all__ = [
     "struct",
+    "Struct",
+    "astype",
+    "mapped",
     "schema",
     "Schema",
     "SchemaError",

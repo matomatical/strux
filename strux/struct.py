@@ -12,7 +12,6 @@ import warnings
 
 import jax
 
-from strux.annotate import _make_struct_annotation
 from strux.batch import _validate_struct
 from strux.pprint import to_str, tree_format
 from strux.serial import load, save
@@ -165,10 +164,6 @@ def struct(
             f"convenience method .restore() will not be available; use "
             f"strux.load(path, template=obj) instead",
         )
-
-    # allow type subscripting for annotating batched/vmapped pytrees,
-    Dataclass._is_strux_struct = True
-    Dataclass.__class_getitem__ = classmethod(_make_struct_annotation)
 
     # construction checking: the constructor validates the new instance
     # against the schema derived from the field annotations (dtype kind and

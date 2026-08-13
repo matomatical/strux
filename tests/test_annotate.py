@@ -1,6 +1,7 @@
 """
-Tests for batch annotations (Cls["batch"]): static expansion, runtime
-isinstance checks, and integration with jaxtyping + beartype.
+Tests for the Struct type form (strux.Struct[Cls, ...]): static expansion,
+functor images, runtime isinstance checks, and integration with jaxtyping +
+beartype.
 """
 
 import jax
@@ -20,27 +21,27 @@ from example_structs import Environment, Point, World
 
 class TestAnnotationExpansion:
     def test_jaxtyping_fields_prepended(self):
-        ann = Environment["batch"]
+        ann = strux.Struct[Environment, "batch"]
         hints = ann._field_hints
         assert hints["hero_pos"].dim_str == "batch 2"
         assert hints["goal_pos"].dim_str == "batch 2"
         assert hints["walls"].dim_str == "batch h w"
 
     def test_preserves_dtype_class(self):
-        ann = Environment["batch"]
+        ann = strux.Struct[Environment, "batch"]
         hints = ann._field_hints
         # dtype should point back to the original jaxtyping dtype class
         assert hints["hero_pos"].dtype is Int
         assert hints["walls"].dtype is Bool
 
     def test_preserves_array_type(self):
-        ann = Environment["batch"]
+        ann = strux.Struct[Environment, "batch"]
         hints = ann._field_hints
         for hint in hints.values():
             assert hint.array_type is jax.Array
 
     def test_nested_struct_recursion(self):
-        ann = World["batch"]
+        ann = strux.Struct[World, "batch"]
         hints = ann._field_hints
         # env field should be an expanded struct annotation
         env_ann = hints["env"]
@@ -55,7 +56,7 @@ class TestAnnotationExpansion:
         class WithMeta:
             pos: Int[Array, "2"]
             name: str
-        ann = WithMeta["batch"]
+        ann = strux.Struct[WithMeta, "batch"]
         hints = ann._field_hints
         # jaxtyping data field is expanded
         assert hints["pos"].dim_str == "batch 2"
@@ -69,7 +70,7 @@ class TestAnnotationExpansion:
             name: str
 
         with pytest.raises(strux.SchemaError, match="not pytree data"):
-            Bad["batch"]
+            strux.Struct[Bad, "batch"]
 
     def test_jaxtype_detection_is_exact(self):
         # a class that merely duck-types some jaxtyping attributes is not
@@ -98,7 +99,7 @@ class TestAnnotationExpansion:
             step: int
             done: bool
 
-        ann = Metrics["batch"]
+        ann = strux.Struct[Metrics, "batch"]
         # each scalar field expands to a union of batched array arms
         for name in ("loss", "step", "done"):
             arms = ann._field_hints[name]
@@ -119,38 +120,182 @@ class TestAnnotationExpansion:
             loss: float
 
         batched = Loss(loss=jnp.zeros(4, dtype=jnp.int32))
-        assert not isinstance(batched, Loss["batch"])
+        assert not isinstance(batched, strux.Struct[Loss, "batch"])
 
     def test_scalar_fields_no_trailing_space(self):
         # Float[Array, ""] is a scalar; batching should give "batch", not "batch "
-        ann = Point["batch"]
+        ann = strux.Struct[Point, "batch"]
         assert ann._field_hints["x"].dim_str == "batch"
         assert ann._field_hints["y"].dim_str == "batch"
 
-    def test_empty_dims_is_noop(self):
-        ann = Environment[""]
+    def test_empty_dims_is_rank_exact(self):
+        ann = strux.Struct[Environment, ""]
         assert ann._field_hints["hero_pos"].dim_str == "2"
         assert ann._field_hints["walls"].dim_str == "h w"
 
     def test_multi_dims(self):
-        ann = Environment["batch time"]
+        ann = strux.Struct[Environment, "batch time"]
         hints = ann._field_hints
         assert hints["hero_pos"].dim_str == "batch time 2"
         assert hints["walls"].dim_str == "batch time h w"
 
+    def test_chained_prepends_apply_left_to_right(self):
+        # "time" is applied first, then "batch" in front of it
+        ann = strux.Struct[Environment, "time", "batch"]
+        assert ann._field_hints["hero_pos"].dim_str == "batch time 2"
+
     def test_caching(self):
-        a = Environment["batch"]
-        b = Environment["batch"]
+        a = strux.Struct[Environment, "batch"]
+        b = strux.Struct[Environment, "batch"]
         assert a is b
 
     def test_different_dims_not_cached_together(self):
-        a = Environment["batch"]
-        b = Environment["time"]
+        a = strux.Struct[Environment, "batch"]
+        b = strux.Struct[Environment, "time"]
         assert a is not b
 
     def test_annotation_name(self):
-        ann = Environment["batch"]
-        assert ann.__name__ == 'Environment["batch"]'
+        ann = strux.Struct[Environment, "batch"]
+        assert ann.__name__ == "Struct[Environment, 'batch']"
+
+
+# # #
+# The form's argument handling
+
+
+class TestStructFormArguments:
+    def test_class_subscripting_is_gone(self):
+        # the breaking change: structs no longer overload subscripts —
+        # subscripting a non-generic struct is a plain TypeError
+        with pytest.raises(TypeError):
+            Environment["batch"]
+
+    def test_generic_structs_keep_typing_subscripts(self):
+        @strux.struct
+        class Box[T]:
+            item: T | None
+
+        alias = Box[Environment]
+        import typing
+        assert typing.get_origin(alias) is Box
+
+    def test_single_argument_rejected(self):
+        with pytest.raises(TypeError, match="at least one"):
+            strux.Struct[Environment]
+
+    def test_non_dataclass_rejected(self):
+        with pytest.raises(TypeError, match="dataclass"):
+            strux.Struct[42, "batch"]
+
+    def test_bad_functor_rejected(self):
+        with pytest.raises(TypeError, match="dims strings or functors"):
+            strux.Struct[Environment, 42]
+
+    def test_form_not_instantiable(self):
+        from strux.annotate import Struct as RuntimeStruct
+        with pytest.raises(TypeError, match="type form"):
+            RuntimeStruct()
+
+    def test_generic_alias_target_unwrapped(self):
+        # Struct[Box[Environment], "b"]: parameters are erased at runtime,
+        # the check is against the origin class
+        @strux.struct
+        class Box[T: Environment]:
+            item: T | None
+
+        ann = strux.Struct[Box[Environment], "b"]
+        assert ann._struct_type is Box
+
+    def test_bad_scalar_kind_rejected(self):
+        with pytest.raises(TypeError, match="scalar class"):
+            strux.astype(str)
+        with pytest.raises(TypeError, match="scalar class"):
+            strux.mapped(list)
+
+
+# # #
+# Functor images
+
+
+class TestFunctorImages:
+    def _env(self, batched=False):
+        shape = (4,) if batched else ()
+        return Environment(
+            hero_pos=jnp.ones((*shape, 2), dtype=jnp.int32),
+            goal_pos=jnp.ones((*shape, 2), dtype=jnp.int32),
+            walls=jnp.zeros((*shape, 5, 5), dtype=bool),
+        )
+
+    def test_astype_keeps_dims(self):
+        ann = strux.Struct[Environment, strux.astype(bool)]
+        assert ann._field_hints["hero_pos"].dim_str == "2"
+        assert ann._field_hints["hero_pos"].dtype is Bool
+        assert ann._field_hints["walls"].dim_str == "h w"
+
+    def test_astype_matches_elementwise_compare_image(self):
+        env = self._env()
+        image = jax.tree.map(lambda a, b: a == b, env, env)
+        assert isinstance(image, strux.Struct[Environment, strux.astype(bool)])
+        # and the original does not satisfy the image type
+        assert not isinstance(env, strux.Struct[Environment, strux.astype(bool)])
+
+    def test_mapped_matches_full_reduction_image(self):
+        env = self._env()
+        image = jax.tree.map(jnp.array_equal, env, env)
+        assert isinstance(image, strux.Struct[Environment, strux.mapped(bool)])
+        counts = jax.tree.map(jnp.count_nonzero, env)
+        assert isinstance(counts, strux.Struct[Environment, strux.mapped(int)])
+        assert not isinstance(counts, strux.Struct[Environment, strux.mapped(bool)])
+
+    def test_mapped_recurses_nested_structs(self):
+        world = World(env=self._env(), score=jnp.zeros(()))
+        image = jax.tree.map(jnp.array_equal, world, world)
+        assert isinstance(image, strux.Struct[World, strux.mapped(bool)])
+
+    def test_mapped_then_prepend_is_vmapped_reduction(self):
+        batched = self._env(batched=True)
+        vimage = jax.vmap(
+            lambda a, b: jax.tree.map(jnp.array_equal, a, b)
+        )(batched, batched)
+        ann = strux.Struct[Environment, strux.mapped(bool), "b"]
+        assert isinstance(vimage, ann)
+        # the unbatched reduction image does not carry the batch dim
+        unbatched_image = jax.tree.map(
+            jnp.array_equal, self._env(), self._env(),
+        )
+        assert not isinstance(unbatched_image, ann)
+
+    def test_mapped_absorbs_earlier_functors(self):
+        # a full reduction of a batched struct eats the batch dim too:
+        # Struct[Env, "b", mapped(bool)] and Struct[Env, mapped(bool)]
+        # describe the same image
+        batched = self._env(batched=True)
+        image = jax.tree.map(jnp.array_equal, batched, batched)
+        assert isinstance(image, strux.Struct[Environment, "b", strux.mapped(bool)])
+        assert isinstance(image, strux.Struct[Environment, strux.mapped(bool)])
+
+    def test_astype_then_prepend(self):
+        batched = self._env(batched=True)
+        image = jax.tree.map(lambda a, b: a == b, batched, batched)
+        assert isinstance(
+            image, strux.Struct[Environment, strux.astype(bool), "b"],
+        )
+
+    def test_mapped_scalar_sugar(self):
+        # the mapped image accepts python scalars as well as rank-0 arrays,
+        # like a plain scalar field annotation
+        @strux.struct(check=False)
+        class Loose:
+            x: Float[Array, "n"]
+
+        assert isinstance(Loose(x=True), strux.Struct[Loose, strux.mapped(bool)])
+        assert isinstance(
+            Loose(x=jnp.array(True)), strux.Struct[Loose, strux.mapped(bool)],
+        )
+
+    def test_functor_repr(self):
+        assert repr(strux.astype(bool)) == "astype(bool)"
+        assert repr(strux.mapped(int)) == "mapped(int)"
 
 
 # # #
@@ -172,7 +317,7 @@ class TestInstanceCheck:
             goal_pos=jnp.array([3, 4], dtype=jnp.int32),
             walls=jnp.zeros((5, 5), dtype=bool),
         )
-        assert not isinstance(env, Environment["batch"])
+        assert not isinstance(env, strux.Struct[Environment, "batch"])
 
     def test_batched_passes(self):
         env = Environment(
@@ -180,7 +325,37 @@ class TestInstanceCheck:
             goal_pos=jnp.ones((3, 2), dtype=jnp.int32),
             walls=jnp.zeros((3, 5, 5), dtype=bool),
         )
-        assert isinstance(env, Environment["batch"])
+        assert isinstance(env, strux.Struct[Environment, "batch"])
+
+    def test_any_rank_dims(self):
+        unbatched = Environment(
+            hero_pos=jnp.array([1, 2], dtype=jnp.int32),
+            goal_pos=jnp.array([3, 4], dtype=jnp.int32),
+            walls=jnp.zeros((5, 5), dtype=bool),
+        )
+        batched = Environment(
+            hero_pos=jnp.ones((3, 2), dtype=jnp.int32),
+            goal_pos=jnp.ones((3, 2), dtype=jnp.int32),
+            walls=jnp.zeros((3, 5, 5), dtype=bool),
+        )
+        ann = strux.Struct[Environment, "..."]
+        assert isinstance(unbatched, ann)
+        assert isinstance(batched, ann)
+
+    def test_rank_exact_dims(self):
+        unbatched = Environment(
+            hero_pos=jnp.array([1, 2], dtype=jnp.int32),
+            goal_pos=jnp.array([3, 4], dtype=jnp.int32),
+            walls=jnp.zeros((5, 5), dtype=bool),
+        )
+        batched = Environment(
+            hero_pos=jnp.ones((3, 2), dtype=jnp.int32),
+            goal_pos=jnp.ones((3, 2), dtype=jnp.int32),
+            walls=jnp.zeros((3, 5, 5), dtype=bool),
+        )
+        ann = strux.Struct[Environment, ""]
+        assert isinstance(unbatched, ann)
+        assert not isinstance(batched, ann)
 
     def test_wrong_dtype_fails(self):
         # a wrong-dtype instance cannot be constructed under checking, so
@@ -192,11 +367,11 @@ class TestInstanceCheck:
         env = LooseEnv(
             hero_pos=jnp.ones((3, 2), dtype=jnp.float32),  # wrong dtype
         )
-        assert not isinstance(env, LooseEnv["batch"])
+        assert not isinstance(env, strux.Struct[LooseEnv, "batch"])
 
     def test_wrong_type_fails(self):
-        assert not isinstance("not an env", Environment["batch"])
-        assert not isinstance(42, Environment["batch"])
+        assert not isinstance("not an env", strux.Struct[Environment, "batch"])
+        assert not isinstance(42, strux.Struct[Environment, "batch"])
 
     def test_nested_struct_passes(self):
         world = World(
@@ -207,7 +382,7 @@ class TestInstanceCheck:
             ),
             score=jnp.array([1.0, 2.0, 3.0]),
         )
-        assert isinstance(world, World["batch"])
+        assert isinstance(world, strux.Struct[World, "batch"])
 
     def test_nested_struct_fails_if_child_wrong(self):
         # an unbatched child with a batched sibling cannot be constructed
@@ -225,7 +400,7 @@ class TestInstanceCheck:
             env=LooseChild(pos=jnp.ones((2,), dtype=jnp.int32)),  # unbatched
             score=jnp.array([1.0, 2.0, 3.0]),
         )
-        assert not isinstance(world, LooseWorld["batch"])
+        assert not isinstance(world, strux.Struct[LooseWorld, "batch"])
 
     def test_meta_field_not_checked(self):
         @strux.struct(static_fieldnames=("name",))
@@ -237,14 +412,14 @@ class TestInstanceCheck:
             name="hello",
         )
         # check that meta field (name) is not checked during isinstance
-        assert isinstance(obj, WithMeta["batch"])
+        assert isinstance(obj, strux.Struct[WithMeta, "batch"])
 
     def test_scalar_struct_batched(self):
         point = Point(
             x=jnp.array([1.0, 2.0, 3.0]),
             y=jnp.array([4.0, 5.0, 6.0]),
         )
-        assert isinstance(point, Point["batch"])
+        assert isinstance(point, strux.Struct[Point, "batch"])
 
 
 # # #
@@ -254,7 +429,9 @@ class TestInstanceCheck:
 class TestJaxtypedIntegration:
     def test_correct_annotation_passes(self):
         @jaxtyped(typechecker=beartype)
-        def step(env: Environment["batch"]) -> Environment["batch"]:
+        def step(
+            env: strux.Struct[Environment, "batch"],
+        ) -> strux.Struct[Environment, "batch"]:
             return env
 
         env = Environment(
@@ -267,7 +444,9 @@ class TestJaxtypedIntegration:
 
     def test_wrong_annotation_raises(self):
         @jaxtyped(typechecker=beartype)
-        def step(env: Environment["batch"]) -> Environment["batch"]:
+        def step(
+            env: strux.Struct[Environment, "batch"],
+        ) -> strux.Struct[Environment, "batch"]:
             return env
 
         env = Environment(
@@ -278,9 +457,27 @@ class TestJaxtypedIntegration:
         with pytest.raises(Exception):
             step(env)
 
+    def test_functor_image_jaxtyped(self):
+        @jaxtyped(typechecker=beartype)
+        def same(
+            a: strux.Struct[Environment, ""],
+            b: strux.Struct[Environment, ""],
+        ) -> strux.Struct[Environment, strux.mapped(bool)]:
+            return jax.tree.map(jnp.array_equal, a, b)
+
+        env = Environment(
+            hero_pos=jnp.array([1, 2], dtype=jnp.int32),
+            goal_pos=jnp.array([3, 4], dtype=jnp.int32),
+            walls=jnp.zeros((5, 5), dtype=bool),
+        )
+        result = same(env, env)
+        assert bool(result.walls)
+
     def test_nested_struct_jaxtyped(self):
         @jaxtyped(typechecker=beartype)
-        def step(world: World["batch"]) -> World["batch"]:
+        def step(
+            world: strux.Struct[World, "batch"],
+        ) -> strux.Struct[World, "batch"]:
             return world
 
         world = World(
@@ -304,7 +501,9 @@ class TestJaxtypedIntegration:
             goal_pos: Int[Array, "2"]
 
         @jaxtyped(typechecker=beartype)
-        def step(env: LooseEnv["batch"]) -> LooseEnv["batch"]:
+        def step(
+            env: strux.Struct[LooseEnv, "batch"],
+        ) -> strux.Struct[LooseEnv, "batch"]:
             return env
 
         # hero_pos batch=3, goal_pos batch=4 — inconsistent "batch" dim

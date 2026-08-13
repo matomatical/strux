@@ -12,7 +12,7 @@ Install:
 pip install git+https://github.com/matomatical/strux.git
 ```
 
-Requires python 3.11+. Dependencies: `jax`, `numpy`, `jaxtyping`.
+Requires python 3.12+. Dependencies: `jax`, `numpy`, `jaxtyping`.
 
 Examples
 --------
@@ -272,12 +272,25 @@ True
 
 Structs work naturally with vectorisation and `jax.vmap`, for example for
 batches of data, parameters, or anything else. You can define your struct for
-the individual elements of the batch, and then annotate batched structs using
-type subscripting (e.g. `Image["batch_size"]`). The result is a new struct type
-with the batch dimension(s) prepended to each (non-static) field's jaxtyping
-annotation. Plain scalar hints (`float`, `int`, `bool`, `complex`) are
-promoted to rank-0 jaxtyping annotations, so e.g. a `loss: float` field
-batches as `Float[Array, "batch"]`.
+the individual elements of the batch, and then annotate batched structs with
+the `strux.Struct` type form (e.g. `strux.Struct[Image, "batch_size"]`). The
+result is a new type whose isinstance checks verify the batch dimension(s)
+prepended to each (non-static) field's jaxtyping annotation. Plain scalar
+hints (`float`, `int`, `bool`, `complex`) are promoted to rank-0 jaxtyping
+annotations, so e.g. a `loss: float` field batches as
+`Float[Array, "batch"]`.
+
+To static type checkers, `strux.Struct` is `typing.Annotated` (the same
+trick jaxtyping's own forms use), so these annotations are legal in
+signatures: checkers read `strux.Struct[Image, "batch_size"]` as plain
+`Image` — batch dims are beyond static checking, like jaxtyping's shape
+strings — while runtime tools enforce the full form. The dims string uses
+jaxtyping's dims language, so `strux.Struct[Image, ""]` is a rank-exact
+check (no batch dims allowed) and `strux.Struct[Image, "..."]` accepts any
+batch rank. (Note that a struct *class* is not subscriptable with dims
+strings: subscripting a class is Python's generic-parameterisation syntax,
+which structs leave alone — PEP 695 generic structs like
+`class Box[T: Env]: ...` work as usual.)
 
 We could use this to implement a data batch or a neural network ensemble, or
 even depth-wise batches of layer parameters for use as inputs to
@@ -325,13 +338,13 @@ envs = jax.vmap(GridWorld.step)(envs, actions)
 print("hero positions after step:")
 print(envs.hero_pos)
 
-# GridWorld["batch"] expands each field's annotation:
+# strux.Struct[GridWorld, "batch"] expands each field's annotation:
 #   hero_pos: Int[Array, "batch 2"]
 #   walls:    Bool[Array, "batch size size"]
 def batched_step(
-    envs: GridWorld["batch"],
+    envs: strux.Struct[GridWorld, "batch"],
     actions: Int[Array, "batch"],
-) -> GridWorld["batch"]:
+) -> strux.Struct[GridWorld, "batch"]:
     return jax.vmap(GridWorld.step)(envs, actions)
 ```
 
@@ -399,6 +412,46 @@ For other element-wise operations, use `jax.tree.map`:
 # adding a constant to every field isn't built in, but jax.tree.map works:
 shifted = jax.tree.map(lambda x: x + 1, env0)
 ```
+
+### Functor annotations: types for tree.map images
+
+Leaf-wise operations produce trees with the *structure* of the struct but
+transformed leaves — for example, `jax.tree.map(jnp.array_equal, a, b)`
+rebuilds the struct with every leaf replaced by a boolean scalar. The
+`strux.Struct` form can name these types too: alongside dims strings
+(which prepend batch dims) it accepts *functors* describing what happened
+to each leaf, applied left to right:
+
+* `strux.astype(kind)` — every leaf keeps its dims but takes on the given
+  scalar kind (`bool`, `int`, `float`, or `complex`): the image of an
+  elementwise map like `tree.map(lambda a, b: a == b, x, y)`.
+* `strux.mapped(kind)` — every leaf becomes a scalar of the kind: the
+  image of a full reduction like `tree.map(jnp.array_equal, x, y)` or
+  `tree.map(jnp.count_nonzero, x)`.
+
+<!--pytest-codeblocks:cont-->
+```python
+# the elementwise comparison keeps each leaf's dims, as bools:
+elementwise = jax.tree.map(lambda a, b: a == b, env0, env0)
+assert isinstance(elementwise, strux.Struct[GridWorld, strux.astype(bool)])
+
+# the full reduction collapses each leaf to a bool scalar:
+reduced = jax.tree.map(jnp.array_equal, env0, env0)
+assert isinstance(reduced, strux.Struct[GridWorld, strux.mapped(bool)])
+
+# functors compose left to right: a vmapped reduction is mapped, then
+# batched
+vmapped = jax.vmap(lambda a, b: jax.tree.map(jnp.array_equal, a, b))(
+    envs, envs,
+)
+assert isinstance(vmapped, strux.Struct[GridWorld, strux.mapped(bool), "batch"])
+```
+
+These are annotation-and-check types, not constructors: functor images
+arise from tree operations (whose structural rebuilding bypasses
+construction checking by design), and the forms name them at function
+boundaries. Beware that `.replace` on such an image re-enters checked
+construction against the *element* schema and will raise.
 
 ### Field annotations and checked construction
 
@@ -533,9 +586,9 @@ from beartype import beartype   # pip install beartype
 
 @jaxtyped(typechecker=beartype)
 def checked_step(
-    envs: GridWorld["batch"], # GridWorld defined in previous example
+    envs: strux.Struct[GridWorld, "batch"], # GridWorld from previous example
     actions: Int[Array, "batch"],
-) -> GridWorld["batch"]:
+) -> strux.Struct[GridWorld, "batch"]:
     return jax.vmap(GridWorld.step)(envs, actions)
 
 # this passes: shapes and dtypes are consistent
@@ -571,8 +624,9 @@ Installs normal dependencies plus also `jaxtyping`, `beartype`, `pytest`,
 The implementation is a small package (`strux/`), one module per component:
 the `@struct` decorator (`struct.py`), schema compilation (`schema.py`), the
 batch-shape solver (`batch.py`), shape queries and indexing (`shapes.py`),
-batched type annotations (`annotate.py`), pretty printing (`pprint.py`), and
-serialisation (`serial.py`). Tests mirror this layout in `tests/`.
+the `Struct` type form and its functors (`annotate.py`), pretty printing
+(`pprint.py`), and serialisation (`serial.py`). Tests mirror this layout in
+`tests/`.
 
 Jaxtyping is a required dependency: it is strux's annotation *language* —
 the schema (`strux.schema`) is compiled from jaxtyping annotations, and
@@ -601,7 +655,8 @@ Basics:
 - [x] Pretty printing with shape/dtype summaries for arrays
 - [x] Static field support via `static_fieldnames`
 - [x] Decorator syntax with keyword arguments (`@strux.struct(...)`)
-- [x] Annotation-only batched type subscripting (`MyStruct["batch"]`)
+- [x] Batched type annotations (`strux.Struct[MyStruct, "batch"]`; statically
+      `typing.Annotated`, so legal and inert in checked signatures)
 
 Advanced features:
 
@@ -613,12 +668,18 @@ Advanced features:
 - [x] Pretty print registered pytree classes that aren't dataclasses
 - [x] Template-free restore: load from a struct class, no template instance
       (`strux.load(path, template=Cls, statics=...)`)
+- [x] Generic structs (PEP 695): bounded-TypeVar and generic-alias field
+      annotations (constraints erased to the bound/origin at runtime)
+- [x] Schema functors: leaf-spec transformations as annotations —
+      `strux.astype(kind)` and `strux.mapped(kind)`, composing with dims
+      strings in the `Struct` form (the prepend being the invertible
+      special case)
+- [ ] More functors as needs arise: `reduced(*names)` (drop named element
+      axes) and `promoted()` (sum-semantics dtype promotion) are designed
+      in the meta-repo journal
 - [ ] Bind symbolic dim names across fields (prototype: `strux.tree_dims`;
-      constructor enforcement pending)
-- [ ] Schema functors: generic leaf-spec transformations as annotations,
-      e.g. `Cls[strux.leaves(Bool, "")]` as the type of
-      `jax.tree.map(jnp.array_equal, a, b)` — the batch subscript being
-      the invertible special case (design seed in the meta-repo journal)
+      constructor enforcement pending; also wanted for `Struct`-form
+      isinstance checks, which currently check fields independently)
 
 Project:
 

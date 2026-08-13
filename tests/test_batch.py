@@ -260,8 +260,8 @@ class TestSchemaSolver:
         assert s.shape == ()
         b = Scaled(coeff=jnp.ones(32), walls=jnp.zeros((32, 5, 5)))
         assert b.shape == (32,)
-        assert isinstance(b, Scaled["batch"])
-        assert not isinstance(s, Scaled["batch"])
+        assert isinstance(b, strux.Struct[Scaled, "batch"])
+        assert not isinstance(s, strux.Struct[Scaled, "batch"])
         with pytest.raises(strux.ValidationError):
             Scaled(coeff=jnp.zeros(3, dtype=int), walls=jnp.zeros((3, 5, 5)))
 
@@ -281,8 +281,8 @@ class TestSchemaSolver:
             table={"a": jnp.zeros((4, 2))},
         )
         assert batched.shape == (4,)
-        assert isinstance(batched, Bank["batch"])
-        assert not isinstance(bank, Bank["batch"])
+        assert isinstance(batched, strux.Struct[Bank, "batch"])
+        assert not isinstance(bank, strux.Struct[Bank, "batch"])
         with pytest.raises(strux.ValidationError, match="inconsistent batch"):
             Bank(
                 layers=(jnp.zeros((4, 3)), jnp.zeros((3, 5))),
@@ -318,7 +318,7 @@ class TestSchemaSolver:
         assert s.shape == ()
         batched = Sum(terms=(Constant(value=jnp.zeros(4)),))
         assert batched.shape == (4,)
-        assert isinstance(batched, Sum["batch"])
+        assert isinstance(batched, strux.Struct[Sum, "batch"])
         with pytest.raises(strux.ValidationError, match="expected an instance"):
             Sum(terms=(jnp.zeros(3),))
 
@@ -344,7 +344,7 @@ class TestSchemaSolver:
             walls=jnp.zeros((4, 5, 5), bool),
         )
         assert Holder(env=db).shape == (4,)
-        assert isinstance(Holder(env=db), Holder["batch"])
+        assert isinstance(Holder(env=db), strux.Struct[Holder, "batch"])
 
     def test_python_scalars_are_batch_agnostic(self):
         @strux.struct
