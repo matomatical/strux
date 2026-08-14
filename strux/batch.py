@@ -24,10 +24,45 @@ from strux.schema import (
 
 # The candidate-set lattice: each (value, spec) pair yields the set of
 # leading batch shapes B consistent with it — a finite frozenset of tuples,
-# or _TOP (represented as None) meaning "unconstrained" (python scalars,
-# None arms, empty containers). Validation asks whether the intersection
-# across all fields is non-empty; .shape asks for its unique element.
+# or _TOP (represented as None) meaning "unconstrained". Only pytree
+# *structure* is unconstrained (None arms, empty containers): every leaf
+# constrains the batch, and in particular a python scalar admits exactly
+# batch () — batching produces arrays, never scalars, and strux does not
+# broadcast. Validation asks whether the intersection across all fields is
+# non-empty; .shape asks for its unique element.
 _TOP = None
+
+# solved candidates are cached on instances under this attribute (structs
+# are immutable, so a computed solution never goes stale); _UNSOLVED marks
+# its absence, since _TOP itself is a cacheable solution
+_CACHED_SOLUTION = "_strux_candidates"
+_UNSOLVED = object()
+
+
+def _solved_candidates(tree):
+    """
+    The tree's batch-shape candidate set, from the instance cache when
+    present (validation populates it at construction; unflattened and
+    unchecked instances are solved on first query), else freshly solved
+    and cached.
+    """
+    cached = getattr(tree, _CACHED_SOLUTION, _UNSOLVED)
+    if cached is not _UNSOLVED:
+        return cached
+    cls = type(tree)
+    meet = _BatchMeet()
+    for name, spec in schema(cls).fields.items():
+        path = f"{cls.__name__}.{name}"
+        meet.add(path, _candidates(getattr(tree, name), spec, path))
+    _cache_solution(tree, meet.candidates)
+    return meet.candidates
+
+
+def _cache_solution(tree, candidates):
+    try:
+        object.__setattr__(tree, _CACHED_SOLUTION, candidates)
+    except AttributeError:
+        pass    # e.g. a foreign dataclass with __slots__; solve per query
 
 
 class _BatchMeet:
@@ -124,7 +159,10 @@ def _candidates(value, spec, path):
         return frozenset((shape[:len(shape) - spec.ndim],))
     elif isinstance(spec, _PyScalarSpec):
         if isinstance(value, spec.cls):
-            return _TOP     # a scalar broadcasts: batch-agnostic
+            # a python scalar is one element's worth of data: batch ()
+            # exactly (batched structs carry arrays; strux never
+            # broadcasts a scalar across a batch)
+            return frozenset(((),))
         raise ValidationError(
             f"{path}: expected {spec.cls.__name__}, got "
             f"{type(value).__name__}"
@@ -143,18 +181,14 @@ def _candidates(value, spec, path):
             )
         value_cls = type(value)
         if dataclasses.is_dataclass(value_cls):
-            # an annotated dataclass (nested struct or foreign): recurse
-            # via the *value's* schema (which may be a subclass of the
-            # annotated class, with more fields)
-            meet = _BatchMeet()
-            for name, subspec in schema(value_cls).fields.items():
-                meet.add(
-                    f"{path}.{name}",
-                    _candidates(getattr(value, name), subspec, f"{path}.{name}"),
-                )
-            return meet.candidates
+            # an annotated dataclass (nested struct or foreign): its own
+            # candidate set is exactly this field's contribution, so use
+            # the instance cache (populated when the child was validated
+            # at its construction) rather than re-solving its subtree;
+            # solving here also covers subclasses of the annotated class
+            return _solved_candidates(value)
         # any other pytree: every array leaf constrains the batch as a
-        # prefix of its shape; scalar leaves are batch-agnostic
+        # prefix of its shape; a scalar leaf admits batch () only
         meet = _BatchMeet()
         for keypath, leaf in jax.tree.flatten_with_path(value)[0]:
             leafpath = path + "".join(str(k) for k in keypath)
@@ -165,7 +199,7 @@ def _candidates(value, spec, path):
                     frozenset(shape[:k] for k in range(len(shape) + 1)),
                 )
             elif isinstance(leaf, (bool, int, float, complex)):
-                continue
+                meet.add(leafpath, frozenset(((),)))
             else:
                 raise ValidationError(
                     f"{leafpath}: value of type {type(leaf).__name__} "
@@ -235,39 +269,54 @@ def _validate_struct(instance):
     # prng-key dtypes) falls through to the general solver, which either
     # accepts them or raises with a precise message
     plan = sch.fast_plan
-    if plan is not None and _fast_validate(instance, plan):
-        return
+    if plan is not None:
+        batch = _fast_validate(instance, plan)
+        if batch is not _UNSOLVED:
+            _cache_solution(
+                instance, _TOP if batch is None else frozenset((batch,)),
+            )
+            return
     meet = _BatchMeet()
     for name, spec in sch.fields.items():
         path = f"{cls.__name__}.{name}"
         meet.add(path, _candidates(getattr(instance, name), spec, path))
+    _cache_solution(instance, meet.candidates)
 
 
 def _fast_validate(instance, plan):
+    """
+    Validate against a precompiled plan. Returns the batch shape (or None
+    for an empty plan), or _UNSOLVED to fall through to the general solver.
+    """
     batch = None
     for name, dtype_set, ndim, fixed in plan:
         value = getattr(instance, name)
         if ndim is None and isinstance(value, (bool, int, float, complex)):
-            continue    # scalar-ish slot with a python scalar
+            value_batch = ()    # scalar-ish slot with a python scalar
+            if batch is None:
+                batch = value_batch
+            elif value_batch != batch:
+                return _UNSOLVED
+            continue
         try:
             shape = value.shape
             dtype = value.dtype
         except AttributeError:
-            return False
+            return _UNSOLVED
         if dtype_set is not None and dtype not in dtype_set:
-            return False
+            return _UNSOLVED
         if ndim is None:
             value_batch = tuple(shape)
         else:
             cut = len(shape) - ndim
             if cut < 0:
-                return False
+                return _UNSOLVED
             for offset, size in fixed:
                 if shape[len(shape) + offset] != size:
-                    return False
+                    return _UNSOLVED
             value_batch = tuple(shape[:cut])
         if batch is None:
             batch = value_batch
         elif value_batch != batch:
-            return False
-    return True
+            return _UNSOLVED
+    return batch

@@ -201,7 +201,9 @@ follows.
 * **Plain scalars** (`float`, `int`, `bool`, `complex`): a Python scalar of
   that type, or a scalar array of the matching dtype kind. Equivalent to the
   explicit `Float[ArrayLike, ""]` spelling (`from jax.typing import
-  ArrayLike`).
+  ArrayLike`). A Python scalar is one element's worth of data: a *batched*
+  struct holds an array in such a field (strux never broadcasts a scalar
+  across a batch).
 * **Unions**, including optional values `T | None`: the value decides the arm
   at construction. Note that which arm is instantiated is a *static* property:
   JIT recompiles per arm, traced control flow cannot switch arms.
@@ -334,10 +336,19 @@ batches as `Float[Array, "batch"]`.
 
 ### Indexing and shape for batched structs
 
-Batched structs support `.shape` and indexing. The `.shape` property returns
-the batch dimensions (the leading dimensions beyond each field's base
-annotation). Indexing with `env[i]` or slicing with `env[i:j]` indexes into the
-batch dimensions of every field at once.
+Batched structs support `.shape`, `len`, indexing, and iteration. The `.shape`
+property returns the batch dimensions (the leading dimensions beyond each
+field's base annotation). Indexing with `env[i]` or slicing with `env[i:j]`
+indexes into the batch dimensions of every field at once, `len(envs)` is the
+leading batch dimension, and `for env in envs:` iterates over it.
+
+Batch access is bounds-aware: integer indices are checked against the batch
+shape (raising IndexError out of bounds, with negative indices in the python
+style), and an *unbatched* struct refuses indexing, `len`, and iteration
+outright (TypeError) — batch access never silently reaches into element
+dimensions. Slices follow python slice semantics, and traced or array indices
+are passed through to the leaves. The batch shape is solved once and cached on
+the instance (structs are immutable), so these operations are cheap.
 
 <!--pytest-codeblocks:cont-->
 ```python
@@ -483,6 +494,13 @@ Output:
 rejected!
 ```
 
+`.replace` is validated like direct construction, with one shortcut: a
+replacement whose leaf layout (pytree structure, shapes, dtypes, python
+scalar types) exactly matches the field it replaces cannot change the
+instance's validity, so it skips revalidation — the common case of swapping
+in same-shaped values (e.g. updated parameters each training step) costs no
+solving.
+
 The check costs microseconds per construction for simple schemas, and runs only
 on direct construction and `.replace` (JAX's internal tree reconstructions skip
 it).
@@ -565,10 +583,8 @@ Restoration requires a template to determine the pytree structure.
 
 1. One option is to supply an instance of the struct. The struct instance
    provides the pytree structure and the static field values, and the data
-   leaves are read from the file. Restore is strict: every saved leaf must
-   match the template leaf's shape and dtype, and the error names every
-   mismatched path (a template with the wrong architecture refuses to load,
-   rather than silently adopting the saved shapes).
+   leaves are read from the file. Strux raises an error if saved leaves don't
+   match the template's shapes and dtypes.
 
    <!--pytest-codeblocks:cont-->
    ```python
@@ -585,15 +601,16 @@ Restoration requires a template to determine the pytree structure.
    True
    ```
    
-2. Alternatively, one can provide the struct class as a template. Static
-   fields take their values from `statics=` (a dict keyed by `/`-separated
-   field paths), else from literal values recorded in the file (see below),
-   else from their defaults; a static resolvable by none of these raises an
-   error naming the path to pass.
+2. Alternatively, one can provide the struct class as a template. The shapes
+   and dtypes are then taken from the file, along with some other static
+   information (literal values for static fields involving python builtins or
+   collections, union tags, etc.). Missing static information can be provided
+   via a `statics=`, a dict keyed by `/`-separated field paths, or from
+   defaults defined in the struct.
    
    <!--pytest-codeblocks:cont-->
    ```python
-   # template-free restore: data fields rebuilt from the file, static fields
+   # instance-free restore: data fields rebuilt from the file, static fields
    # from statics= (or their defaults)
    restored = strux.load(
        path,
@@ -613,44 +630,30 @@ Restoration requires a template to determine the pytree structure.
 By default the format of the file is inferred from the file extension (use
 `fmt=` to override).
 
-### What saved files record
+### More about serialisation
 
-Alongside the arrays, saved files carry a small string-to-string metadata
-mapping (the safetensors metadata header, or a reserved npz entry named
-`__strux__`) recording what the arrays alone cannot:
+You can inspect a saved struct without any template obligations using
+`strux.describe`. This function inspects a saved file and renders its recorded
+leaf data and structural information without constructing the actual structs.
 
-* **Structure tags**: the class saved at each struct position and the arm
-  saved at each union-annotated field. Template-free restore uses these to
-  rebuild fields whose type would otherwise be ambiguous: a field annotated
-  with a base class but holding a subclass restores as the subclass
-  (resolved by name among imported classes — a name lookup, never an import
-  or code execution), and recorded union arms are rebuilt directly, even
-  when several arms would leave identical arrays behind.
-* **Literal statics**: static field values that are python literals, stored
-  via `repr` and restored with `ast.literal_eval` — literal parsing only,
-  keeping npz/safetensors' security level. Non-literal statics (callables,
-  arrays) are not recorded and still need `statics=`, an instance template,
-  or a default.
-* **Recorded dtypes**: true dtypes for leaves that npz stores as raw bytes
-  (ml_dtypes such as `bfloat16`), restored by view-casting. Safetensors
-  stores these natively.
+<!--pytest-codeblocks:cont-->
+```python
+strux.describe(path)
+```
 
-The metadata also guards instance-template restore: a checkpoint saved with
-one union arm or class refuses to restore into a template carrying another,
-even when the array layouts coincide.
+Output:
+```console
+mlp.npz (savez_compressed, strux format 2): 4 arrays, 49 elements, 196 B
+__main__.MLP
+  linear1: __main__.AffineTransform
+    weights: float32[4 8]
+    biases: float32[8]
+  linear2: __main__.AffineTransform
+    weights: float32[8 1]
+    biases: float32[1]
+```
 
-Files without metadata (saved by other tools, or by strux before 0.1.0)
-restore only where the structure is unambiguous from the saved keys and the
-schema: ambiguous unions and subclass-holding fields refuse rather than
-guess, and need an instance template.
-
-### Inspecting saved files
-
-`strux.describe(path)` renders a saved file's arrays, recorded classes, and
-literal statics without constructing any structs (so inspecting a checkpoint
-never requires the code that saved it). It works on any npz or safetensors
-file of named arrays. The same description is available from the command
-line:
+The same functionality is available via the command line:
 
 ```console
 $ python -m strux mlp.npz
@@ -664,11 +667,10 @@ __main__.MLP
     biases: float32[1]
 ```
 
-### Other serialisation options
-
-You can also use `strux.to_dict` and `strux.from_dict` to convert structs to
-and from flat dictionaries of arrays. This can compose with other Python
-serialisation tools.
+You can also use raw `strux.to_dict` and `strux.from_dict` to convert structs
+to and from flat dictionaries of arrays, with `strux.metadata` providing the
+structure metadata that `save` would record (pass it back to `from_dict` as
+`meta=`). This can compose with other Python serialisation tools.
 
 Strux natively supports checkpointing with
   [orbax](https://orbax.readthedocs.io/),

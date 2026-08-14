@@ -169,6 +169,108 @@ class TestGetitem:
         assert jnp.array_equal(e.hero_pos, jnp.array([30, 40]))
         assert jnp.array_equal(e.goal_pos, jnp.array([70, 80]))
 
+    def test_out_of_bounds_raises(self):
+        batched = Point(x=jnp.arange(4.0), y=jnp.ones(4))
+        with pytest.raises(IndexError, match="out of bounds"):
+            batched[4]
+        with pytest.raises(IndexError, match="out of bounds"):
+            batched[-5]
+
+    def test_negative_index(self):
+        batched = Point(x=jnp.arange(4.0), y=jnp.ones(4))
+        assert jnp.array_equal(batched[-1].x, batched[3].x)
+
+    def test_unbatched_refuses_indexing(self):
+        p = Point(x=jnp.float32(1.0), y=jnp.float32(2.0))
+        with pytest.raises(TypeError, match="not batched"):
+            p[0]
+
+    def test_too_many_indices_raises(self):
+        # a tuple longer than the batch rank would reach into element dims
+        env = Environment(
+            hero_pos=jnp.ones((4, 2), dtype=jnp.int32),
+            goal_pos=jnp.ones((4, 2), dtype=jnp.int32),
+            walls=jnp.zeros((4, 5, 5), dtype=bool),
+        )
+        with pytest.raises(IndexError, match="too many indices"):
+            env[0, 0]
+
+    def test_tuple_indices_bounds_checked(self):
+        env = Environment(
+            hero_pos=jnp.ones((4, 3, 2), dtype=jnp.int32),
+            goal_pos=jnp.ones((4, 3, 2), dtype=jnp.int32),
+            walls=jnp.zeros((4, 3, 5, 5), dtype=bool),
+        )
+        with pytest.raises(IndexError, match="axis 1"):
+            env[0, 3]
+
+    def test_overlong_slice_clamps(self):
+        # python slice semantics: slices clamp, they don't error
+        batched = Point(x=jnp.arange(4.0), y=jnp.ones(4))
+        assert batched[2:99].shape == (2,)
+
+
+# # #
+# Length and iteration
+
+
+class TestLenIter:
+    def test_len(self):
+        batched = Point(x=jnp.arange(4.0), y=jnp.ones(4))
+        assert len(batched) == 4
+
+    def test_iteration_terminates_and_yields_elements(self):
+        batched = Point(x=jnp.arange(3.0), y=jnp.ones(3))
+        elements = list(batched)
+        assert len(elements) == 3
+        assert all(isinstance(p, Point) for p in elements)
+        assert jnp.array_equal(elements[2].x, jnp.float32(2.0))
+
+    def test_unbatched_refuses_len_and_iteration(self):
+        p = Point(x=jnp.float32(1.0), y=jnp.float32(2.0))
+        with pytest.raises(TypeError, match="not batched"):
+            len(p)
+        with pytest.raises(TypeError, match="not batched"):
+            next(iter(p))
+
+    def test_multi_batch_iterates_leading_dim(self):
+        batched = Point(x=jnp.ones((4, 3)), y=jnp.ones((4, 3)))
+        elements = list(batched)
+        assert len(elements) == 4
+        assert elements[0].shape == (3,)
+
+
+# # #
+# Solved-batch caching
+
+
+class TestSolutionCache:
+    def test_shape_cached_at_construction(self):
+        batched = Point(x=jnp.arange(4.0), y=jnp.ones(4))
+        assert batched.shape == (4,)
+        # validation stored the solution: no field access needed to answer
+        assert batched.__dict__["_strux_candidates"] == frozenset({(4,)})
+
+    def test_unflattened_instances_solve_lazily(self):
+        import jax
+        batched = Point(x=jnp.arange(4.0), y=jnp.ones(4))
+        doubled = jax.tree.map(lambda a: a * 2, batched)   # bypasses init
+        assert "_strux_candidates" not in doubled.__dict__
+        assert doubled.shape == (4,)
+        assert "_strux_candidates" in doubled.__dict__
+
+    def test_nested_construction_uses_child_cache(self):
+        world = World(
+            env=Environment(
+                hero_pos=jnp.ones((4, 2), dtype=jnp.int32),
+                goal_pos=jnp.ones((4, 2), dtype=jnp.int32),
+                walls=jnp.zeros((4, 5, 5), dtype=bool),
+            ),
+            score=jnp.array([1.0, 2.0, 3.0, 4.0]),
+        )
+        assert world.shape == (4,)
+        assert world.env.shape == (4,)
+
 
 # # #
 # Symbolic dim binding (tree_dims)

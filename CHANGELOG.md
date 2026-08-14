@@ -3,6 +3,46 @@
 Versions and breaking changes are tracked here from 0.1.0 onward. Earlier
 development (0.0.x) is untracked; see the git history.
 
+## 0.2.0 (2026-08-14)
+
+The batch view becomes a first-class, safe API: bounds-aware indexing,
+length and iteration, no scalar broadcasting, and cached batch solving.
+
+### Added
+
+* Batched structs support `len(s)` and `for x in s:` (iterating the
+  leading batch dimension); module-level `strux.tree_len` and
+  `strux.tree_iter`.
+* The solved batch-shape candidates are cached on instances at
+  construction (or on first query for unflattened/unchecked instances),
+  so `.shape` and indexing are O(1) and nested construction no longer
+  re-validates already-validated children (measured: nested checked
+  construction 17.6µs → 2.9µs, `.shape` 17.3µs → 0.2µs on the dev box).
+* `.replace` skips revalidation when the replacement's leaf layout
+  (structure, shapes, dtypes, python scalar types) exactly matches the
+  field it replaces — such a replace cannot change validity. A side
+  effect (provisional, pending the functor-annotations design): layout-
+  identical replaces on tree-transformed instances now succeed instead of
+  failing validation.
+* User-defined `__getitem__`/`__len__`/`__iter__` are preserved with a
+  warning (previously a user `__getitem__` was silently overwritten).
+* `strux.metadata(tree)` — the metadata mapping `save` records, publicly
+  available as the companion of `to_dict`/`from_dict`.
+
+### Changed (breaking)
+
+* A python scalar in a data field admits batch shape `()` only:
+  constructing a *batched* struct with a python-scalar field value is now
+  a ValidationError (previously scalars were treated as batch-agnostic,
+  i.e. silently broadcast). Batched structs carry arrays; scalar leaves
+  inside generic registered-pytree fields constrain the same way.
+* Indexing is strict: integer batch indices are bounds-checked
+  (IndexError out of bounds — previously out-of-bounds indices silently
+  clamped, which also made accidental iteration loop forever), tuple
+  indices must not exceed the batch rank, and indexing, `len`, or
+  iterating an *unbatched* struct raises TypeError (previously indexing
+  silently reached into element dimensions, producing invalid structs).
+
 ## 0.1.0 (2026-08-14)
 
 Serialisation v2: saved files become self-describing.

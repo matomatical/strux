@@ -30,6 +30,8 @@ else:
 from strux.shapes import (
     tree_dims,
     tree_getitem,
+    tree_iter,
+    tree_len,
     tree_shape,
     tree_size,
 )
@@ -40,6 +42,7 @@ from strux.pprint import (
 from strux.serial import (
     from_dict,
     load,
+    metadata,
     save,
     to_dict,
 )
@@ -57,11 +60,14 @@ __all__ = [
     "tree_shape",
     "tree_dims",
     "tree_getitem",
+    "tree_len",
+    "tree_iter",
     "tree_size",
     "to_str",
     "tree_format",
     "to_dict",
     "from_dict",
+    "metadata",
     "save",
     "load",
     "describe",

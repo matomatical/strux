@@ -685,3 +685,23 @@ class TestStructureTags:
             strux.save(path, c)
         # the safetensors header is separate from the arrays: no collision
         c.save(str(tmp_path / "clash.safetensors"))
+
+
+# # #
+# Public metadata: the dict-level companion of to_dict/from_dict
+
+
+class TestPublicMetadata:
+    def test_dict_level_roundtrip_with_metadata(self):
+        @strux.struct(static_fieldnames=("name",))
+        class Tagged:
+            x: Float[Array, ""]
+            name: str
+
+        t = Tagged(x=jnp.float32(1.0), name="custom")
+        d = strux.to_dict(t)
+        meta = strux.metadata(t)
+        assert meta["strux"] == "2"
+        restored = strux.from_dict(d, template=Tagged, meta=meta)
+        assert restored.name == "custom"
+        assert jnp.array_equal(restored.x, t.x)

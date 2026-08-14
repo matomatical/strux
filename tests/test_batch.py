@@ -153,16 +153,19 @@ class TestCheckedConstruction:
             Config(coeff=jnp.ones(3, dtype=jnp.int32))
 
     def test_scalar_field_batch_constraints(self):
-        # a python scalar leaves the batch shape unconstrained; an array
-        # value participates in the cross-field consistency check
+        # a python scalar is one element's worth of data (batch () only);
+        # batching a scalar field means holding an array (strux never
+        # broadcasts a scalar across a batch)
         @jaxtyped(typechecker=beartype)
         @strux.struct
         class Config:
             coeff: float
             u: Float[Array, ""]
 
-        Config(coeff=0.5, u=jnp.ones(3))
+        Config(coeff=0.5, u=jnp.float32(1.0))
         Config(coeff=jnp.ones(3), u=jnp.ones(3))
+        with pytest.raises(Exception):
+            Config(coeff=0.5, u=jnp.ones(3))
         with pytest.raises(Exception):
             Config(coeff=jnp.ones(4), u=jnp.ones(3))
 
@@ -346,13 +349,17 @@ class TestSchemaSolver:
         assert Holder(env=db).shape == (4,)
         assert isinstance(Holder(env=db), strux.Struct[Holder, "batch"])
 
-    def test_python_scalars_are_batch_agnostic(self):
+    def test_python_scalars_constrain_batch_to_unbatched(self):
         @strux.struct
         class Config:
             coeff: float
             u: Float[Array, ""]
 
-        assert Config(coeff=0.5, u=jnp.ones(3)).shape == (3,)
+        assert Config(coeff=0.5, u=jnp.float32(1.0)).shape == ()
+        # a batched struct holds arrays in its scalar-annotated fields
+        assert Config(coeff=jnp.ones(3), u=jnp.ones(3)).shape == (3,)
+        with pytest.raises(strux.ValidationError):
+            Config(coeff=0.5, u=jnp.ones(3))
         with pytest.raises(strux.ValidationError):
             Config(coeff=jnp.ones(4), u=jnp.ones(3))
 

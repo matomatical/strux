@@ -12,10 +12,15 @@ import warnings
 
 import jax
 
-from strux.batch import _validate_struct
+from strux.batch import (
+    _CACHED_SOLUTION,
+    _UNSOLVED,
+    _is_arraylike_value,
+    _validate_struct,
+)
 from strux.pprint import to_str, tree_format
 from strux.serial import load, save
-from strux.shapes import tree_getitem, tree_shape, tree_size
+from strux.shapes import tree_getitem, tree_iter, tree_len, tree_shape, tree_size
 
 
 # dataclass_transform (PEP 681) tells static type checkers like mypy that
@@ -118,7 +123,17 @@ def struct(
 
     # add some other convenience methods
     if "replace" not in fields:
-        Dataclass.replace = dataclasses.replace
+        # a replacement value with exactly the leaf layout (structure,
+        # shapes, dtypes, python scalar types) of the field it replaces
+        # cannot change the instance's validity, so it skips revalidation
+        # and constructs structurally; anything else goes through the
+        # constructor (and hence validation) as a direct construction
+        # would. Classes with __post_init__ always take the constructor
+        # path, so their hook always runs.
+        if check and not hasattr(Class, "__post_init__"):
+            Dataclass.replace = _checked_replace
+        else:
+            Dataclass.replace = dataclasses.replace
     else:
         warnings.warn(
             f"{Class.__name__} has a field named 'replace', so the "
@@ -141,7 +156,19 @@ def struct(
             f"convenience property .shape will not be available; use "
             f"strux.tree_shape(obj) instead",
         )
-    Dataclass.__getitem__ = tree_getitem
+    for dunder, method, module_name in (
+        ("__getitem__", tree_getitem, "strux.tree_getitem"),
+        ("__len__", tree_len, "strux.tree_len"),
+        ("__iter__", tree_iter, "strux.tree_iter"),
+    ):
+        if dunder not in Class.__dict__:
+            setattr(Dataclass, dunder, method)
+        else:
+            warnings.warn(
+                f"{Class.__name__} defines {dunder}, so strux's batch "
+                f"version will not be installed; the module-level "
+                f"equivalent ({module_name}) remains available",
+            )
     if "save" not in fields:
         def _save_method(self, path, *, fmt=None, overwrite=False):
             """Save this struct to disk. See strux.save for details."""
@@ -202,6 +229,62 @@ def struct(
 
     # done!
     return Dataclass
+
+
+def _checked_replace(self, **changes):
+    """
+    Return a copy of this struct with the given fields replaced.
+
+    Replacements whose leaf layout (pytree structure, array shapes and
+    dtypes, python scalar types) exactly matches the field they replace
+    cannot change the instance's validity, so they are constructed
+    directly without revalidation — the common case of swapping
+    same-shaped values (e.g. updated parameters each training step) costs
+    no solving. Any other replacement constructs through the class (and is
+    validated like any direct construction).
+    """
+    all_fields = dataclasses.fields(self)
+    names = {field.name for field in all_fields}
+    if not changes.keys() <= names or any(not f.init for f in all_fields):
+        # unknown names (or unusual field configs): dataclasses.replace
+        # raises the standard errors
+        return dataclasses.replace(self, **changes)
+    data_fields = set(type(self)._data_fields)
+    for name, new in changes.items():
+        if name not in data_fields:
+            continue    # statics are not validated: never block fast path
+        old = getattr(self, name)
+        if new is old:
+            continue
+        if not _same_leaf_layout(old, new):
+            return dataclasses.replace(self, **changes)
+    obj = object.__new__(type(self))
+    for field in all_fields:
+        object.__setattr__(
+            obj, field.name, changes.get(field.name, getattr(self, field.name)),
+        )
+    solution = getattr(self, _CACHED_SOLUTION, _UNSOLVED)
+    if solution is not _UNSOLVED:
+        # identical layouts solve to identical candidates
+        object.__setattr__(obj, _CACHED_SOLUTION, solution)
+    return obj
+
+
+def _same_leaf_layout(old, new):
+    old_leaves, old_treedef = jax.tree.flatten(old)
+    new_leaves, new_treedef = jax.tree.flatten(new)
+    if old_treedef != new_treedef:
+        return False
+    for old_leaf, new_leaf in zip(old_leaves, new_leaves):
+        if _is_arraylike_value(old_leaf) and _is_arraylike_value(new_leaf):
+            if (
+                tuple(old_leaf.shape) != tuple(new_leaf.shape)
+                or old_leaf.dtype != new_leaf.dtype
+            ):
+                return False
+        elif type(old_leaf) is not type(new_leaf):
+            return False
+    return True
 
 
 def _strip_annotations_signature(fn):

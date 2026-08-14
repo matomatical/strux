@@ -137,6 +137,18 @@ def _fullname(cls):
     return f"{cls.__module__}.{cls.__qualname__}"
 
 
+def metadata(tree) -> dict[str, str]:
+    """
+    The metadata mapping `strux.save` records alongside a tree's arrays
+    (see the module docstring): format version, class and union-arm tags,
+    literal static values, and true dtype names for leaves whose npz
+    storage is lossy. The companion of `strux.to_dict`: pass the result to
+    `strux.from_dict` as `meta=` to restore with the same structural
+    guidance a saved file provides.
+    """
+    return _collect_metadata(tree, to_dict(tree), record_dtypes=True)
+
+
 def _collect_metadata(tree, d, record_dtypes):
     """
     Build the metadata mapping for a tree about to be saved. `d` is the
