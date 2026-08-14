@@ -55,7 +55,6 @@ Structs can hold arrays and define jit-compiled methods. Among other things,
 you can use this to define neural network modules. For example, here is a
 simple biased linear transformation layer module.
 
-<!--pytest-codeblocks:cont-->
 ```python
 import jax
 import jax.numpy as jnp
@@ -123,7 +122,6 @@ and `jax.tree.map`. In the below example we use this to make the activation
 function of the MLP configurable.
 
 
-<!--pytest-codeblocks:cont-->
 ```python
 import jax
 import jax.numpy as jnp
@@ -215,7 +213,6 @@ follows.
 If you don't want to fully annotate your array types with jaxtyping, you can
 use `jax.Array`. However, we don't allow `Any`.
 
-<!--pytest-codeblocks:cont-->
 ```python
 from jaxtyping import Array, Bool
 
@@ -260,7 +257,6 @@ ensembles, or even depth-wise batches of layer parameters for use as inputs to
 `jax.lax.scan`.  Here we give an example of a batching a gridworld for
 collecting parallel rollouts.
 
-<!--pytest-codeblocks:cont-->
 ```python
 import jax
 import jax.numpy as jnp
@@ -350,7 +346,6 @@ dimensions. Slices follow python slice semantics, and traced or array indices
 are passed through to the leaves. The batch shape is solved once and cached on
 the instance (structs are immutable), so these operations are cheap.
 
-<!--pytest-codeblocks:cont-->
 ```python
 # continuing from the previous example...
 
@@ -384,7 +379,6 @@ GridWorld(
 These are convenience shortcuts for common operations on batched structs.
 For other element-wise operations, use `jax.tree.map`:
 
-<!--pytest-codeblocks:cont-->
 ```python
 # adding a constant to every field isn't built in, but jax.tree.map works:
 shifted = jax.tree.map(lambda x: x + 1, env0)
@@ -398,7 +392,6 @@ pytree structure. `strux.Struct` also allows us to annotate more general
 transformed types. To explore, let's compare two checkpoints of the MLP from
 the earlier examples: `net`, and a copy with one layer re-initialised.
 
-<!--pytest-codeblocks:cont-->
 ```python
 net2 = net.replace(
     linear2=AffineTransform.init(jax.random.key(1), 8, 1),
@@ -408,7 +401,6 @@ net2 = net.replace(
 * Type casting: The annotation `strux.astype(dtype)` denotes every leaf keeping
   its dims but taking on the given dtype (`bool`, `int`, `float`, or
   `complex`). Useful for elementwise maps, like so:
-  <!--pytest-codeblocks:cont-->
   ```python
   # which entries changed? a bool mask per entry, shapes preserved
   def changed_entries(a: MLP, b: MLP) -> strux.Struct[MLP, strux.astype(bool)]:
@@ -434,7 +426,6 @@ net2 = net.replace(
 
 * Full reduction: The annotation `strux.mapped(dtype)` denotes every leaf
   becoming replaced with a scalar of the given dtype:
-  <!--pytest-codeblocks:cont-->
   ```python
   # how many entries changed in each field? one int per leaf
   def changed_counts(a: MLP, b: MLP) -> strux.Struct[MLP, strux.mapped(int)]:
@@ -465,7 +456,6 @@ By default, strux checks that field values match their type annotations at
 construction time, and raises an error if there is a mismatch. (Pass
 `@strux.struct(check=False)` to opt a class out of this feature.)
 
-<!--pytest-codeblocks:cont-->
 ```python
 # recall `Level` defined in the field annotations section above:
 
@@ -515,7 +505,6 @@ Strux also works together with jaxtyping's runtime type checking. For example,
 if you combine it with a typechecker like beartype, shape and dtype mismatches
 are caught at function boundaries.
 
-<!--pytest-codeblocks:cont-->
 ```python
 from jaxtyping import jaxtyped
 from beartype import beartype   # pip install beartype
@@ -549,7 +538,6 @@ checked as usual.
 
 Structs can be saved to disk to be restored later, using the `save` method.
 
-<!--pytest-codeblocks:cont-->
 ```python
 import os, tempfile
 
@@ -586,7 +574,6 @@ Restoration requires a template to determine the pytree structure.
    leaves are read from the file. Strux raises an error if saved leaves don't
    match the template's shapes and dtypes.
 
-   <!--pytest-codeblocks:cont-->
    ```python
    # restore from disk using a fresh MLP as a template
    template = MLP.init(jax.random.key(999), features=4, hidden=8, outputs=1)
@@ -608,7 +595,6 @@ Restoration requires a template to determine the pytree structure.
    via a `statics=`, a dict keyed by `/`-separated field paths, or from
    defaults defined in the struct.
    
-   <!--pytest-codeblocks:cont-->
    ```python
    # instance-free restore: data fields rebuilt from the file, static fields
    # from statics= (or their defaults)
@@ -636,7 +622,6 @@ You can inspect a saved struct without any template obligations using
 `strux.describe`. This function inspects a saved file and renders its recorded
 leaf data and structural information without constructing the actual structs.
 
-<!--pytest-codeblocks:cont-->
 ```python
 strux.describe(path)
 ```
@@ -677,7 +662,6 @@ Strux natively supports checkpointing with
   [orbax](https://orbax.readthedocs.io/),
 since structs are just pytrees:
 
-<!--pytest-codeblocks:cont-->
 ```python
 import orbax.checkpoint as ocp # pip install orbax-checkpoint
 
@@ -705,7 +689,6 @@ Type checking (TODO: And structure serialisation) is supported internally by a
 schema inferred from annotations. Inspect the inferred schema with
 `strux.schema`:
 
-<!--pytest-codeblocks:cont-->
 ```python
 print(strux.schema(Level))
 ```
