@@ -193,13 +193,9 @@ things that can be traced. The most important supported annotations are as
 follows.
 
 * **Jaxtyping annotations** (e.g., `Float[Array, "n 2"]`): dtype kind and
-  element dims as written. Dims may be concrete (`"5 5"`, checked exactly),
-  symbolic (`"h w"` — each name must take one consistent size across the
-  fields of the class, checked at construction; use the anonymous `"_"` for
-  a dim that shouldn't bind), or unknown (`Float[Array, "..."]`, any element
-  rank). Names are scoped per class: a nested struct's names bind at its own
-  construction, so e.g. two layers of the same class may have different
-  widths. See jaxtyping documentation for more information.
+  element dims as written. Dims may be concrete (e.g., `"5 5"`), symbolic
+  (e.g., `"h w"`, `"*batch"`), or anonymous (e.g., `"_"`, `"..."`). See
+  jaxtyping documentation for more information.
 * **Plain scalars** (`float`, `int`, `bool`, `complex`): a Python scalar of
   that type, or a scalar array of the matching dtype kind. Equivalent to the
   explicit `Float[ArrayLike, ""]` spelling (`from jax.typing import
@@ -488,20 +484,13 @@ Output:
 rejected!
 ```
 
-`.replace` is validated like direct construction, with one shortcut: a
-replacement whose leaf layout (pytree structure, shapes, dtypes, python
-scalar types) exactly matches the field it replaces cannot change the
-instance's validity, so it skips revalidation — the common case of swapping
-in same-shaped values (e.g. updated parameters each training step) costs no
-solving.
+The check also validates literal and symbolic dimension names. Symbolic
+dimensions are validated for consistency with other fields in the same struct
+(each nested struct has its own symbolic dimension namespace).
 
 The check costs microseconds per construction for simple schemas, and runs only
 on direct construction and `.replace` (JAX's internal tree reconstructions skip
 it).
-
-Symbolic dim names (`"h w"`) are rank-only at construction;
-`strux.tree_dims(obj)` binds them to sizes on demand and checks that shared
-names agree across fields.
 
 ### Runtime type checking
 
