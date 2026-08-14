@@ -43,6 +43,7 @@ from strux.serial import (
     save,
     to_dict,
 )
+from strux.inspector import describe
 
 __all__ = [
     "struct",
@@ -63,4 +64,5 @@ __all__ = [
     "from_dict",
     "save",
     "load",
+    "describe",
 ]

@@ -293,7 +293,8 @@ class TestTemplateFreeRestore:
         with pytest.raises(KeyError, match="statics=\\{'activate'"):
             strux.load(path, template=MLP)
 
-    def test_static_default_used(self, tmp_path):
+    def test_static_recorded_literal_used(self, tmp_path):
+        # literal statics are recorded in the file and win over defaults
         @strux.struct(static_fieldnames=("name",))
         class Tagged:
             x: Float[Array, ""]
@@ -303,8 +304,32 @@ class TestTemplateFreeRestore:
         path = str(tmp_path / "tagged.npz")
         t.save(path)
         restored = strux.load(path, template=Tagged)
-        assert restored.name == "anon"      # default, not the saved instance's
+        assert restored.name == "custom"    # the saved instance's, not the default
         assert jnp.array_equal(restored.x, t.x)
+
+    def test_static_default_used_without_metadata(self):
+        # with no metadata (a file from an earlier strux, or a bare dict),
+        # statics fall back to their defaults
+        @strux.struct(static_fieldnames=("name",))
+        class Tagged:
+            x: Float[Array, ""]
+            name: str = "anon"
+
+        t = Tagged(x=jnp.float32(1.0), name="custom")
+        restored = strux.from_dict(strux.to_dict(t), template=Tagged)
+        assert restored.name == "anon"
+
+    def test_statics_param_overrides_recorded_literal(self, tmp_path):
+        @strux.struct(static_fieldnames=("name",))
+        class Tagged:
+            x: Float[Array, ""]
+            name: str = "anon"
+
+        t = Tagged(x=jnp.float32(1.0), name="custom")
+        path = str(tmp_path / "tagged.npz")
+        t.save(path)
+        restored = strux.load(path, template=Tagged, statics={"name": "mine"})
+        assert restored.name == "mine"
 
     def test_optional_field_roundtrip(self, tmp_path):
         @strux.struct
@@ -337,7 +362,9 @@ class TestTemplateFreeRestore:
         assert isinstance(restored.layers, tuple)
         assert set(restored.table) == {"a", "b"}
 
-    def test_polymorphic_field_needs_instance_template(self, tmp_path):
+    def test_polymorphic_field_restored_from_class_tag(self, tmp_path):
+        # a base-annotated field holding a subclass instance: the saved
+        # class tag resolves the subclass (among imported classes)
         class RewardFn:
             pass
 
@@ -352,11 +379,29 @@ class TestTemplateFreeRestore:
         h = Holder(fn=Constant(value=jnp.float32(1.0)))
         path = str(tmp_path / "holder.npz")
         h.save(path)
-        with pytest.raises((KeyError, TypeError), match="instance template"):
-            strux.load(path, template=Holder)
-        # while the instance template still works
+        restored = strux.load(path, template=Holder)
+        assert type(restored.fn) is Constant
+        assert jnp.array_equal(restored.fn.value, h.fn.value)
+        # and the instance template also works
         restored = strux.load(path, template=h)
         assert jnp.array_equal(restored.fn.value, h.fn.value)
+
+    def test_polymorphic_field_refused_without_metadata(self):
+        # with no metadata the subclass is unknowable: refuse
+        class RewardFn:
+            pass
+
+        @strux.struct
+        class Constant(RewardFn):
+            value: Float[Array, ""]
+
+        @strux.struct
+        class Holder:
+            fn: RewardFn
+
+        h = Holder(fn=Constant(value=jnp.float32(1.0)))
+        with pytest.raises((KeyError, TypeError), match="instance template"):
+            strux.from_dict(strux.to_dict(h), template=Holder)
 
     def test_restored_batched_checkpoint(self, tmp_path):
         # a batched struct restores with its batch dims (and validation)
@@ -394,9 +439,9 @@ class _Pos:  # distinguishable from both by key layout
 
 
 class TestUnionArmInference:
-    def test_isomorphic_arms_raise(self, tmp_path):
-        # two arms with identical key layouts are indistinguishable in
-        # the saved file: refuse rather than silently pick one
+    def test_isomorphic_arms_resolved_by_recorded_tag(self, tmp_path):
+        # two arms with identical key layouts: the saved class tag records
+        # which arm was in play, so template-free restore picks correctly
         @strux.struct
         class Holder:
             item: _Metric | _Score
@@ -404,8 +449,19 @@ class TestUnionArmInference:
         h = Holder(item=_Score(value=jnp.float32(3.0)))
         path = str(tmp_path / "h.npz")
         h.save(path)
+        restored = strux.load(path, template=Holder)
+        assert type(restored.item) is _Score
+
+    def test_isomorphic_arms_raise_without_metadata(self):
+        # with no metadata the arms are indistinguishable in the saved
+        # arrays: refuse rather than silently pick one
+        @strux.struct
+        class Holder:
+            item: _Metric | _Score
+
+        h = Holder(item=_Score(value=jnp.float32(3.0)))
         with pytest.raises(KeyError, match="more than one arm"):
-            strux.load(path, template=Holder)
+            strux.from_dict(strux.to_dict(h), template=Holder)
 
     def test_isomorphic_arms_instance_template_ok(self, tmp_path):
         @strux.struct
@@ -449,3 +505,183 @@ class TestUnionArmInference:
         h.save(path)
         restored = strux.load(path, template=Holder)
         assert type(restored.item) is Both
+
+
+# # #
+# Recorded dtypes: ml_dtypes leaves survive npz
+
+
+class TestRecordedDtypes:
+    @pytest.mark.parametrize("dtype_name", ["bfloat16", "float8_e4m3fn"])
+    def test_mldtype_npz_roundtrip(self, tmp_path, dtype_name):
+        # npz stores ml_dtypes as raw bytes; the recorded dtype views them
+        # back on load
+        @strux.struct
+        class Weights:
+            w: Float[Array, "n"]
+
+        original = Weights(w=jnp.ones(3, dtype=jnp.dtype(dtype_name)))
+        path = str(tmp_path / "w.npz")
+        original.save(path)
+        for template in (original, Weights):
+            restored = strux.load(path, template=template)
+            assert restored.w.dtype == jnp.dtype(dtype_name)
+            assert jnp.array_equal(restored.w, original.w)
+
+    def test_bfloat16_safetensors_roundtrip(self, tmp_path):
+        # safetensors records ml_dtypes natively: no view needed
+        @strux.struct
+        class Weights:
+            w: Float[Array, "n"]
+
+        original = Weights(w=jnp.ones(3, dtype=jnp.bfloat16))
+        path = str(tmp_path / "w.safetensors")
+        original.save(path)
+        restored = strux.load(path, template=original)
+        assert restored.w.dtype == jnp.bfloat16
+
+
+# # #
+# Strict restore: instance templates refuse mismatched leaves
+
+
+@strux.struct
+class _Linear:
+    weights: Float[Array, "n_in n_out"]
+    biases: Float[Array, "n_out"]
+
+
+class TestStrictRestore:
+    def test_shape_mismatch_raises(self, tmp_path):
+        saved = _Linear(weights=jnp.ones((4, 8)), biases=jnp.zeros(8))
+        path = str(tmp_path / "lin.npz")
+        saved.save(path)
+        template = _Linear(weights=jnp.ones((4, 16)), biases=jnp.zeros(16))
+        with pytest.raises(ValueError, match="strict restore"):
+            strux.load(path, template=template)
+
+    def test_dtype_mismatch_raises(self, tmp_path):
+        saved = _Linear(weights=jnp.ones((4, 8)), biases=jnp.zeros(8))
+        path = str(tmp_path / "lin.npz")
+        saved.save(path)
+        template = _Linear(
+            weights=jnp.ones((4, 8), dtype=jnp.bfloat16),
+            biases=jnp.zeros(8, dtype=jnp.bfloat16),
+        )
+        with pytest.raises(ValueError, match="bfloat16"):
+            strux.load(path, template=template)
+
+    def test_all_mismatches_reported(self, tmp_path):
+        saved = _Linear(weights=jnp.ones((4, 8)), biases=jnp.zeros(8))
+        path = str(tmp_path / "lin.npz")
+        saved.save(path)
+        template = _Linear(weights=jnp.ones((4, 16)), biases=jnp.zeros(16))
+        with pytest.raises(ValueError) as err:
+            strux.load(path, template=template)
+        assert "'weights'" in str(err.value)
+        assert "'biases'" in str(err.value)
+
+    def test_matching_template_restores(self, tmp_path):
+        saved = _Linear(weights=jnp.ones((4, 8)), biases=jnp.zeros(8))
+        path = str(tmp_path / "lin.npz")
+        saved.save(path)
+        template = _Linear(weights=jnp.zeros((4, 8)), biases=jnp.ones(8))
+        restored = strux.load(path, template=template)
+        assert jax.tree.all(jax.tree.map(jnp.array_equal, saved, restored))
+
+    def test_python_scalar_leaf_keeps_its_type(self, tmp_path):
+        @strux.struct
+        class Config:
+            x: Float[Array, ""]
+            rate: float
+
+        saved = Config(x=jnp.float32(1.0), rate=0.5)
+        path = str(tmp_path / "c.npz")
+        saved.save(path)
+        restored = strux.load(path, template=saved)
+        assert type(restored.rate) is float
+        assert restored.rate == 0.5
+
+    def test_isomorphic_arm_template_mismatch_raises(self, tmp_path):
+        # the checkpoint records which arm was saved, so restoring into a
+        # template holding the *other*, key-layout-identical arm is caught
+        @strux.struct
+        class Holder:
+            item: _Metric | _Score
+
+        saved = Holder(item=_Score(value=jnp.float32(3.0)))
+        path = str(tmp_path / "h.npz")
+        saved.save(path)
+        template = Holder(item=_Metric(value=jnp.float32(0.0)))
+        with pytest.raises(TypeError, match="recorded structure disagrees"):
+            strux.load(path, template=template)
+
+
+# # #
+# Structure tags: recorded classes and arms
+
+
+class TestStructureTags:
+    def test_root_subclass_restored(self, tmp_path):
+        @strux.struct
+        class Base:
+            x: Float[Array, ""]
+
+        @strux.struct
+        class Extended(Base):
+            y: Float[Array, ""]
+
+        saved = Extended(x=jnp.float32(1.0), y=jnp.float32(2.0))
+        path = str(tmp_path / "e.npz")
+        saved.save(path)
+        restored = strux.load(path, template=Base)
+        assert type(restored) is Extended
+        assert jnp.array_equal(restored.y, saved.y)
+
+    def test_unresolvable_class_tag_raises(self):
+        @strux.struct
+        class Alone:
+            x: Float[Array, ""]
+
+        d = strux.to_dict(Alone(x=jnp.float32(1.0)))
+        meta = {"strux": "2", "class": "ghost_module.GhostClass"}
+        with pytest.raises(TypeError, match="import the module"):
+            strux.from_dict(d, template=Alone, meta=meta)
+
+    def test_recorded_arm_missing_from_schema_raises(self):
+        @strux.struct
+        class Opt:
+            momentum: Float[Array, "n"] | None
+
+        o = Opt(momentum=None)
+        d = strux.to_dict(o)
+        meta = {"strux": "2", "arm momentum": "dict"}
+        with pytest.raises(TypeError, match="no matching arm"):
+            strux.from_dict(d, template=Opt, meta=meta)
+
+    def test_none_arm_tag_roundtrip(self, tmp_path):
+        # a None field leaves no arrays behind; the arm tag records it
+        @strux.struct
+        class Opt:
+            momentum: Float[Array, "n"] | None
+            count: Int[Array, ""]
+
+        o = Opt(momentum=None, count=jnp.int32(7))
+        path = str(tmp_path / "o.npz")
+        o.save(path)
+        restored = strux.load(path, template=Opt)
+        assert restored.momentum is None
+
+    def test_npz_reserved_key_collision_raises(self, tmp_path):
+        # a field named __strux__ collides with the reserved npz metadata
+        # entry (dict keys are repr-quoted in paths, so they never do)
+        @strux.struct
+        class Clash:
+            __strux__: Float[Array, ""]
+
+        c = Clash(__strux__=jnp.float32(1.0))
+        path = str(tmp_path / "clash.npz")
+        with pytest.raises(ValueError, match="reserved"):
+            strux.save(path, c)
+        # the safetensors header is separate from the arrays: no collision
+        c.save(str(tmp_path / "clash.safetensors"))

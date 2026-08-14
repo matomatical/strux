@@ -564,8 +564,11 @@ template instance, or with `strux.load`.
 Restoration requires a template to determine the pytree structure.
 
 1. One option is to supply an instance of the struct. The struct instance
-   provides the static field values, and the data leaves are read from the file
-   (including overwriting the shapes/dtypes of the template struct).
+   provides the pytree structure and the static field values, and the data
+   leaves are read from the file. Restore is strict: every saved leaf must
+   match the template leaf's shape and dtype, and the error names every
+   mismatched path (a template with the wrong architecture refuses to load,
+   rather than silently adopting the saved shapes).
 
    <!--pytest-codeblocks:cont-->
    ```python
@@ -582,11 +585,11 @@ Restoration requires a template to determine the pytree structure.
    True
    ```
    
-2. Alternatively, one can provide the struct class as a template. If there are
-   static fields, their values should be provided via `statics=` (a dict keyed
-   by `/`-separated field paths). If a static value is not provided, the field
-   is populated with its default value, or an error is raised if there is no
-   default.
+2. Alternatively, one can provide the struct class as a template. Static
+   fields take their values from `statics=` (a dict keyed by `/`-separated
+   field paths), else from literal values recorded in the file (see below),
+   else from their defaults; a static resolvable by none of these raises an
+   error naming the path to pass.
    
    <!--pytest-codeblocks:cont-->
    ```python
@@ -607,15 +610,59 @@ Restoration requires a template to determine the pytree structure.
    True
    ```
 
-Template-free restore isn't always available. For example, if a field is
-annotated with a base class but populated with a subclass, we can't know the
-subclass at restore time without an instance template. Likewise, if the field
-is annotated with a union, we might not be able to tell which arm was in play.
-In these cases, use an instance-template. (We might improve this situation in
-the future.)
-
 By default the format of the file is inferred from the file extension (use
 `fmt=` to override).
+
+### What saved files record
+
+Alongside the arrays, saved files carry a small string-to-string metadata
+mapping (the safetensors metadata header, or a reserved npz entry named
+`__strux__`) recording what the arrays alone cannot:
+
+* **Structure tags**: the class saved at each struct position and the arm
+  saved at each union-annotated field. Template-free restore uses these to
+  rebuild fields whose type would otherwise be ambiguous: a field annotated
+  with a base class but holding a subclass restores as the subclass
+  (resolved by name among imported classes — a name lookup, never an import
+  or code execution), and recorded union arms are rebuilt directly, even
+  when several arms would leave identical arrays behind.
+* **Literal statics**: static field values that are python literals, stored
+  via `repr` and restored with `ast.literal_eval` — literal parsing only,
+  keeping npz/safetensors' security level. Non-literal statics (callables,
+  arrays) are not recorded and still need `statics=`, an instance template,
+  or a default.
+* **Recorded dtypes**: true dtypes for leaves that npz stores as raw bytes
+  (ml_dtypes such as `bfloat16`), restored by view-casting. Safetensors
+  stores these natively.
+
+The metadata also guards instance-template restore: a checkpoint saved with
+one union arm or class refuses to restore into a template carrying another,
+even when the array layouts coincide.
+
+Files without metadata (saved by other tools, or by strux before 0.1.0)
+restore only where the structure is unambiguous from the saved keys and the
+schema: ambiguous unions and subclass-holding fields refuse rather than
+guess, and need an instance template.
+
+### Inspecting saved files
+
+`strux.describe(path)` renders a saved file's arrays, recorded classes, and
+literal statics without constructing any structs (so inspecting a checkpoint
+never requires the code that saved it). It works on any npz or safetensors
+file of named arrays. The same description is available from the command
+line:
+
+```console
+$ python -m strux mlp.npz
+mlp.npz (savez_compressed, strux format 2): 4 arrays, 49 elements, 196 B
+__main__.MLP
+  linear1: __main__.AffineTransform
+    weights: float32[4 8]
+    biases: float32[8]
+  linear2: __main__.AffineTransform
+    weights: float32[8 1]
+    biases: float32[1]
+```
 
 ### Other serialisation options
 
@@ -701,7 +748,13 @@ Reserved field names: fields named `replace`, `size`, `shape`, `save`, or
 `restore` shadow the corresponding convenience member (strux warns and skips
 adding it); the module-level equivalents (`dataclasses.replace`,
 `strux.tree_size`, `strux.tree_shape`, `strux.save`, `strux.load`) always
-remain available.
+remain available. In npz files the entry `__strux__` is reserved for strux
+metadata, so a tree with a field of that name refuses to save as npz
+(safetensors keeps metadata out of the array namespace and is unaffected).
+
+### Versioning
+
+From 0.1.0, versions and breaking changes are tracked in `CHANGELOG.md`.
 
 ### Testing
 
@@ -732,20 +785,17 @@ Advanced serialisation:
 
 - [x] Template-free restore: load from a struct class, no template instance
       (`strux.load(path, template=Cls, statics=...)`)
-- [ ] Serialise literal static fields where possible.
-  * Literals, standard python collections. `repr`/`ast.literal_eval`
-    round-trip. No code execution on load (literal parsing only, keeping
-    npz/safetensors' security level).
-  * However don't attempt to serialise callables etc.
-- [ ] Serialise instance-level structure aside from shapes/dtypes (e.g.,
-      subclasses? tags for unions).
-  * Stored in the safetensors metadata header / a reserved npz entry?
-  * This will increase the amount of structs that are amenable to
-    instance-free restoration.
-  * And it will help with checkpoint archaeology.
-- [ ] Consider making it an error to load a leaf with a different shape/dtype
-      from the template? In analogy with if there were spare/missing leaves,
-      which should result in an error.
+- [x] Serialise literal static fields where possible (`repr` /
+      `ast.literal_eval` round-trip; no code execution on load; callables
+      etc. are not attempted and still need `statics=` or a template)
+- [x] Serialise instance-level structure aside from shapes/dtypes
+      (subclass and union-arm tags in the safetensors metadata header / a
+      reserved npz entry; more structs amenable to instance-free
+      restoration; helps with checkpoint archaeology)
+- [x] Error on loading a leaf with a different shape/dtype from the
+      template (in analogy with spare/missing leaves, which error)
+- [x] Checkpoint inspection without constructing structs
+      (`strux.describe` / `python -m strux <checkpoint>`)
 
 Advanced typing:
 
