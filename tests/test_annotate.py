@@ -513,3 +513,44 @@ class TestJaxtypedIntegration:
         )
         with pytest.raises(Exception):
             step(env)
+
+
+# # #
+# Cross-field batch consistency in the plain batched form
+
+
+class TestBatchConsistency:
+    def test_frankenstein_batches_rejected(self):
+        # each field individually matches "b", but no single batch shape
+        # is consistent across fields — the solver-backed check refuses
+        import jax
+        consistent = Point(x=jnp.ones(4), y=jnp.ones(4))
+        _, treedef = jax.tree.flatten(consistent)
+        frankenstein = jax.tree.unflatten(treedef, [jnp.ones(4), jnp.ones(5)])
+        assert isinstance(consistent, strux.Struct[Point, "b"])
+        assert not isinstance(frankenstein, strux.Struct[Point, "b"])
+
+    def test_fixed_batch_tokens_checked(self):
+        batched = Point(x=jnp.ones(4), y=jnp.ones(4))
+        assert isinstance(batched, strux.Struct[Point, "4"])
+        assert not isinstance(batched, strux.Struct[Point, "5"])
+
+    def test_repeated_batch_names_bind_within_pattern(self):
+        square = Point(x=jnp.ones((3, 3)), y=jnp.ones((3, 3)))
+        oblong = Point(x=jnp.ones((3, 4)), y=jnp.ones((3, 4)))
+        assert isinstance(square, strux.Struct[Point, "n n"])
+        assert not isinstance(oblong, strux.Struct[Point, "n n"])
+
+    def test_variadic_batch_pattern(self):
+        batched = Point(x=jnp.ones((2, 3)), y=jnp.ones((2, 3)))
+        assert isinstance(batched, strux.Struct[Point, "..."])
+        assert isinstance(batched, strux.Struct[Point, "2 ..."])
+        assert not isinstance(batched, strux.Struct[Point, "5 ..."])
+
+    def test_functor_images_keep_per_field_checking(self):
+        # images deliberately differ from the schema, so the solver-backed
+        # consistency check does not apply to them
+        import jax
+        batched = Point(x=jnp.ones(4), y=jnp.ones(4))
+        mask = jax.tree.map(lambda a: a > 0, batched)
+        assert isinstance(mask, strux.Struct[Point, strux.mapped(bool), "b"])

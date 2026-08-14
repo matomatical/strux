@@ -141,6 +141,9 @@ class Schema:
     # precompiled validation plan for the common all-simple-fields case
     # (None when any field needs the general solver); see _fast_plan
     fast_plan: tuple | None = None
+    # whether any field annotation mentions symbolic dim names (classes
+    # without names skip the name-binding pass entirely)
+    has_names: bool = False
 
     def __str__(self):
         lines = [f"schema {self.cls.__name__}:"]
@@ -181,9 +184,25 @@ def schema(cls) -> Schema:
         context = f"{cls.__name__}.{name}"
         hint = _resolve_hint(hint, owner=owner, cls=cls, context=context)
         fields[name] = _parse_hint(hint, context=context)
-    result = Schema(cls=cls, fields=fields, fast_plan=_fast_plan(fields))
+    result = Schema(
+        cls=cls,
+        fields=fields,
+        fast_plan=_fast_plan(fields),
+        has_names=any(_spec_has_names(spec) for spec in fields.values()),
+    )
     cls._strux_schema = result
     return result
+
+
+def _spec_has_names(spec):
+    """Does this spec (not counting nested dataclasses, whose names are
+    their own class's scope) mention any symbolic dim names?"""
+    if isinstance(spec, _ArraySpec):
+        return bool(spec.names)
+    if isinstance(spec, (_ContainerSpec, _UnionSpec)):
+        children = spec.elems if isinstance(spec, _ContainerSpec) else spec.arms
+        return any(_spec_has_names(child) for child in children)
+    return False
 
 
 def _fast_plan(fields):

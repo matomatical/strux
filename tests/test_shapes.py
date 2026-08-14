@@ -296,15 +296,39 @@ class TestTreeDims:
         with pytest.raises(strux.ValidationError, match="inconsistent dim 'n_out'"):
             strux.tree_dims(broken)
 
-    def test_construction_does_not_enforce_names(self):
-        # documented v1 semantics: symbolic dims are rank-only at
-        # construction; tree_dims is the stricter (on-demand) check
+    def test_construction_enforces_names(self):
+        # a name takes one consistent size across the class's fields,
+        # checked at construction
         @strux.struct
         class Affine:
             weights: Float[Array, "n_in n_out"]
             biases: Float[Array, "n_out"]
 
-        Affine(weights=jnp.ones((4, 8)), biases=jnp.zeros(3))    # accepted
+        Affine(weights=jnp.ones((4, 8)), biases=jnp.zeros(8))
+        with pytest.raises(strux.ValidationError, match="inconsistent dim 'n_out'"):
+            Affine(weights=jnp.ones((4, 8)), biases=jnp.zeros(3))
+
+    def test_batched_construction_binds_element_dims(self):
+        # names are trailing element dims: leading batch dims don't
+        # interfere with the binding
+        @strux.struct
+        class Affine:
+            weights: Float[Array, "n_in n_out"]
+            biases: Float[Array, "n_out"]
+
+        Affine(weights=jnp.ones((10, 4, 8)), biases=jnp.zeros((10, 8)))
+        with pytest.raises(strux.ValidationError, match="inconsistent dim"):
+            Affine(weights=jnp.ones((10, 4, 8)), biases=jnp.zeros((10, 3)))
+
+    def test_anonymous_dims_do_not_bind(self):
+        # "_" is jaxtyping's anonymous dim: it never binds, so ragged
+        # sizes across fields (or container elements) are expressible
+        @strux.struct
+        class Ragged:
+            a: Float[Array, "_"]
+            b: Float[Array, "_"]
+
+        Ragged(a=jnp.ones(3), b=jnp.ones(5))
 
     def test_batched_instances_bind_element_dims(self):
         e = Environment(
@@ -314,7 +338,11 @@ class TestTreeDims:
         )
         assert strux.tree_dims(e) == {"h": 5, "w": 6}
 
-    def test_nested_and_container_binding(self):
+    def test_names_scoped_per_class(self):
+        # a name's scope is the class whose annotations mention it: nested
+        # structs bind their own names at their own construction, so two
+        # Layer fields (or elements) may take different sizes — the MLP
+        # case (layer widths differ) constructs fine
         @strux.struct
         class Layer:
             w: Float[Array, "n n"]
@@ -323,8 +351,24 @@ class TestTreeDims:
         class Stack:
             layers: tuple[Layer, ...]
 
-        stack = Stack(layers=(Layer(w=jnp.ones((3, 3))), Layer(w=jnp.zeros((3, 3)))))
-        assert strux.tree_dims(stack) == {"n": 3}
-        broken = Stack(layers=(Layer(w=jnp.ones((3, 3))), Layer(w=jnp.zeros((4, 4)))))
+        stack = Stack(
+            layers=(Layer(w=jnp.ones((3, 3))), Layer(w=jnp.zeros((4, 4)))),
+        )
+        assert strux.tree_dims(stack) == {}     # Stack mentions no names
+        assert strux.tree_dims(stack.layers[1]) == {"n": 4}
+        # within one Layer, its own names still bind
         with pytest.raises(strux.ValidationError, match="inconsistent dim 'n'"):
-            strux.tree_dims(broken)
+            Layer(w=jnp.ones((3, 4)))
+
+    def test_container_elements_share_the_class_namespace(self):
+        # container elements are part of this class's annotation: a named
+        # dim unifies across elements and with sibling fields (use "_"
+        # for ragged elements)
+        @strux.struct
+        class Bank:
+            layers: tuple[Float[Array, "n"], ...]
+            bias: Float[Array, "n"]
+
+        Bank(layers=(jnp.ones(3), jnp.zeros(3)), bias=jnp.ones(3))
+        with pytest.raises(strux.ValidationError, match="inconsistent dim 'n'"):
+            Bank(layers=(jnp.ones(3), jnp.zeros(5)), bias=jnp.ones(3))

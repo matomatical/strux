@@ -271,7 +271,7 @@ class TestSchemaSolver:
     def test_container_fields(self):
         @strux.struct
         class Bank:
-            layers: tuple[Float[Array, "n"], ...]
+            layers: tuple[Float[Array, "_"], ...]   # "_": ragged elements allowed
             table: dict[str, Float[Array, "2"]]
 
         bank = Bank(

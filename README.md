@@ -194,8 +194,12 @@ follows.
 
 * **Jaxtyping annotations** (e.g., `Float[Array, "n 2"]`): dtype kind and
   element dims as written. Dims may be concrete (`"5 5"`, checked exactly),
-  symbolic (`"h w"`, checked by rank), or unknown (`Float[Array, "..."]`, any
-  element rank). See jaxtyping documentation for more information.
+  symbolic (`"h w"` — each name must take one consistent size across the
+  fields of the class, checked at construction; use the anonymous `"_"` for
+  a dim that shouldn't bind), or unknown (`Float[Array, "..."]`, any element
+  rank). Names are scoped per class: a nested struct's names bind at its own
+  construction, so e.g. two layers of the same class may have different
+  widths. See jaxtyping documentation for more information.
 * **Plain scalars** (`float`, `int`, `bool`, `complex`): a Python scalar of
   that type, or a scalar array of the matching dtype kind. Equivalent to the
   explicit `Float[ArrayLike, ""]` spelling (`from jax.typing import
@@ -804,9 +808,10 @@ Advanced typing:
 - [ ] More functors as needs arise: `reduced(*names)` (drop named element
       axes) and `promoted()` (sum-semantics dtype promotion) are designed
       in the meta-repo journal
-- [ ] Bind symbolic dim names across fields (prototype: `strux.tree_dims`;
-      constructor enforcement pending; also wanted for `Struct`-form
-      isinstance checks, which currently check fields independently)
+- [x] Bind symbolic dim names across fields (enforced at construction,
+      scoped per class, `"_"` anonymous dims exempt; `strux.tree_dims`
+      queries the bindings; `Struct`-form isinstance checks additionally
+      require a consistent cross-field batch solution)
 
 Project:
 

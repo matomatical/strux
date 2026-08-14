@@ -3,6 +3,35 @@
 Versions and breaking changes are tracked here from 0.1.0 onward. Earlier
 development (0.0.x) is untracked; see the git history.
 
+## 0.3.0 (2026-08-14)
+
+Solver v2: symbolic dim names mean something.
+
+### Added
+
+* `Struct`-form isinstance on plain batched annotations (dim strings only)
+  now additionally requires a single batch solution consistent across all
+  fields, closing the gap where a tree-unflattened struct with e.g.
+  leading dims 4 and 5 passed `Struct[Env, "b"]` (each field was checked
+  independently). Integer tokens, repeated names, and one `...` variadic
+  are matched against the solved candidates; functor-image forms are
+  unaffected (their leaves deliberately differ from the schema).
+
+### Changed (breaking)
+
+* Symbolic dim names in field annotations are enforced at construction:
+  each name must take one consistent size across the fields of the class
+  (previously names were rank-only documentation). Names are scoped per
+  class — nested structs bind their own names at their own construction,
+  so sibling substructs of the same class may take different sizes (an
+  MLP's layers may differ in width) — and container elements share the
+  class's namespace. The anonymous `"_"` never binds; use it for
+  deliberately ragged dims.
+* `strux.tree_dims` follows the same per-class scoping: it no longer
+  recurses into nested structs (which made it reject valid models whose
+  same-class substructs differed in size), returning only the bindings of
+  the queried class's own annotations.
+
 ## 0.2.0 (2026-08-14)
 
 The batch view becomes a first-class, safe API: bounds-aware indexing,

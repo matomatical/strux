@@ -348,7 +348,7 @@ class TestTemplateFreeRestore:
     def test_container_fields_roundtrip(self, tmp_path):
         @strux.struct
         class Bank:
-            layers: tuple[Float[Array, "n"], ...]
+            layers: tuple[Float[Array, "_"], ...]   # "_": ragged elements allowed
             table: dict[str, Float[Array, "2"]]
 
         bank = Bank(

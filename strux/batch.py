@@ -255,11 +255,77 @@ def _candidates(value, spec, path):
         raise AssertionError(f"unknown spec {spec!r}")
 
 
+def _bind_dims(value, spec, batch, bindings, path):
+    """
+    Bind the symbolic dim names in a spec to their sizes in this value,
+    raising ValidationError if a name binds two different sizes. Names are
+    scoped to the class whose annotations mention them: nested dataclasses
+    are not entered (their names bind at their own construction).
+    """
+    if isinstance(spec, _ArraySpec):
+        if not spec.names or not _is_arraylike_value(value):
+            return
+        shape = tuple(value.shape)
+        for offset, dim_name in spec.names:
+            size = shape[len(shape) + offset]
+            if dim_name in bindings:
+                previous_size, previous_path = bindings[dim_name]
+                if previous_size != size:
+                    raise ValidationError(
+                        f"inconsistent dim '{dim_name}': {previous_size} at "
+                        f"{previous_path}, but {size} at {path}"
+                    )
+            else:
+                bindings[dim_name] = (size, path)
+    elif isinstance(spec, _ContainerSpec):
+        if isinstance(value, dict):
+            for k, v in value.items():
+                _bind_dims(v, spec.elems[0], batch, bindings, f"{path}[{k!r}]")
+        elif isinstance(value, (list, tuple)):
+            if spec.kind == "tuple" and len(value) == len(spec.elems):
+                elem_specs = spec.elems
+            else:
+                elem_specs = (spec.elems[0],) * len(value)
+            for i, (v, e) in enumerate(zip(value, elem_specs)):
+                _bind_dims(v, e, batch, bindings, f"{path}[{i}]")
+    elif isinstance(spec, _UnionSpec):
+        # bind through the arm this value inhabits, when determinable
+        matching = []
+        for arm in spec.arms:
+            try:
+                candidates = _candidates(value, arm, path)
+            except ValidationError:
+                continue
+            if candidates is _TOP or batch is None or batch in candidates:
+                matching.append(arm)
+        if len(matching) == 1:
+            _bind_dims(value, matching[0], batch, bindings, path)
+    # scalar and None specs carry no named dims; nested dataclasses and
+    # other class-typed fields are their own scope
+
+
+def _bind_names(instance, sch, batch):
+    """
+    Bind and check the symbolic dim names across a struct's fields (one
+    namespace per class). `batch` is the solved batch shape when unique
+    (used only to disambiguate union arms), else None.
+    """
+    bindings = {}
+    cls_name = sch.cls.__name__
+    for name, spec in sch.fields.items():
+        _bind_dims(
+            getattr(instance, name), spec, batch, bindings,
+            f"{cls_name}.{name}",
+        )
+    return bindings
+
+
 def _validate_struct(instance):
     """
     Check a freshly-constructed struct against its schema: array kinds and
-    element dims as annotated, and a consistent leading batch shape across
-    all data fields. Raises ValidationError (or SchemaError if the
+    element dims as annotated, a consistent leading batch shape across all
+    data fields, and one consistent size per symbolic dim name across the
+    class's fields. Raises ValidationError (or SchemaError if the
     annotations themselves cannot be compiled).
     """
     cls = type(instance)
@@ -275,12 +341,22 @@ def _validate_struct(instance):
             _cache_solution(
                 instance, _TOP if batch is None else frozenset((batch,)),
             )
+            if sch.has_names:
+                _bind_names(instance, sch, batch)
             return
     meet = _BatchMeet()
     for name, spec in sch.fields.items():
         path = f"{cls.__name__}.{name}"
         meet.add(path, _candidates(getattr(instance, name), spec, path))
     _cache_solution(instance, meet.candidates)
+    if sch.has_names:
+        candidates = meet.candidates
+        batch = (
+            next(iter(candidates))
+            if candidates is not _TOP and len(candidates) == 1
+            else None
+        )
+        _bind_names(instance, sch, batch)
 
 
 def _fast_validate(instance, plan):

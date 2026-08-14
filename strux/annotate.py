@@ -20,6 +20,7 @@ import numpy as np
 from strux.schema import (
     schema,
     SchemaError,
+    ValidationError,
     _ArraySpec,
     _PyScalarSpec,
     _NoneSpec,
@@ -28,6 +29,7 @@ from strux.schema import (
     _UnionSpec,
     _scalar_spec,
 )
+from strux.batch import _TOP, _solved_candidates
 
 
 # # #
@@ -374,4 +376,66 @@ class _StructAnnotationMeta(type):
         for field_name, expected_type in cls._field_hints.items():
             if not isinstance(getattr(instance, field_name), expected_type):
                 return False
+        # the per-field checks above are independent, so alone they accept
+        # instances whose fields carry *different* batch shapes (e.g. a
+        # tree-unflattened struct with leading dims 4 and 5 both passing
+        # "b"). For plain batched forms (dim strings only), additionally
+        # require a single cross-field batch solution matching the
+        # prepended dims. Functor images deliberately differ from the
+        # schema, so the solver does not apply to them.
+        if all(isinstance(f, str) for f in cls._functors):
+            return _batch_consistent(instance, cls._functors)
         return True
+
+
+def _batch_consistent(instance, dim_strs):
+    try:
+        candidates = _solved_candidates(instance)
+    except ValidationError:
+        return False       # fields individually fine, jointly inconsistent
+    except SchemaError:
+        return True        # no solvable schema: per-field checks stand
+    if candidates is _TOP:
+        return True
+    # each functor prepends its dims in front of the previous, so the
+    # leading tokens read right-to-left across the functor strings
+    tokens = [
+        token
+        for dim_str in reversed(dim_strs)
+        for token in dim_str.split()
+    ]
+    return any(_match_batch(tokens, shape) for shape in candidates)
+
+
+def _match_batch(tokens, shape):
+    """
+    Does this batch shape match the dims pattern? Supports integer
+    literals, symbolic names (bound consistently within the pattern), and
+    one "..." variadic. Patterns using other jaxtyping token forms are not
+    refuted here (the per-field checks remain authoritative for them).
+    """
+    for token in tokens:
+        if token != "..." and not (token.isdigit() or token.isidentifier()):
+            return True
+    if tokens.count("...") > 1:
+        return True
+    if "..." in tokens:
+        i = tokens.index("...")
+        head, tail = tokens[:i], tokens[i + 1:]
+        if len(head) + len(tail) > len(shape):
+            return False
+        pairs = list(zip(head, shape)) + list(
+            zip(reversed(tail), reversed(shape))
+        )
+    else:
+        if len(tokens) != len(shape):
+            return False
+        pairs = list(zip(tokens, shape))
+    bound = {}
+    for token, size in pairs:
+        if token.isdigit():
+            if int(token) != size:
+                return False
+        elif bound.setdefault(token, size) != size:
+            return False
+    return True
