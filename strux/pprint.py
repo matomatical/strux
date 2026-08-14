@@ -42,9 +42,15 @@ def to_str(
                 _put(f"{prefix}{type(tree).__name__}(...){suffix}", depth=depth)
             else:
                 _put(f"{prefix}{type(tree).__name__}(", depth=depth)
-                state = vars(tree)
-                for field, value in state.items():
-                    _walk(value, prefix=f"{field}=", suffix=",", depth=depth+1)
+                # declared fields only (instance __dict__ may carry cached
+                # solver state that is not part of the struct's data)
+                for field in dataclasses.fields(tree):
+                    _walk(
+                        getattr(tree, field.name),
+                        prefix=f"{field.name}=",
+                        suffix=",",
+                        depth=depth+1,
+                    )
                 _put(f"){suffix}", depth=depth)
         elif isinstance(tree, tuple) and hasattr(tree, '_fields'):
             # namedtuple

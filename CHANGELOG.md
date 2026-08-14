@@ -28,6 +28,8 @@ length and iteration, no scalar broadcasting, and cached batch solving.
   warning (previously a user `__getitem__` was silently overwritten).
 * `strux.metadata(tree)` — the metadata mapping `save` records, publicly
   available as the companion of `to_dict`/`from_dict`.
+* Pretty printing renders declared dataclass fields only, so the cached
+  solver state (in the instance `__dict__`) never appears in renders.
 
 ### Changed (breaking)
 

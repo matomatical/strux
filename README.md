@@ -641,7 +641,8 @@ leaf data and structural information without constructing the actual structs.
 strux.describe(path)
 ```
 
-Output:
+Output (the header shows the path as given):
+<!--output:illustrative-->
 ```console
 mlp.npz (savez_compressed, strux format 2): 4 arrays, 49 elements, 196 B
 __main__.MLP
@@ -681,12 +682,14 @@ since structs are just pytrees:
 import orbax.checkpoint as ocp # pip install orbax-checkpoint
 
 orbax_path = os.path.join(tempfile.mkdtemp(), "mlp_orbax")
+checkpointer = ocp.StandardCheckpointer()
 
-# save
-ocp.StandardCheckpointer().save(orbax_path, net)
+# save (asynchronous: wait before handing the checkpoint to a reader)
+checkpointer.save(orbax_path, net)
+checkpointer.wait_until_finished()
 
 # restore
-restored = ocp.StandardCheckpointer().restore(orbax_path, target=template)
+restored = checkpointer.restore(orbax_path, target=template)
 
 print(jax.tree.all(jax.tree.map(jnp.array_equal, net, restored)))
 ```
@@ -762,6 +765,12 @@ From 0.1.0, versions and breaking changes are tracked in `CHANGELOG.md`.
 
 Run tests with `pytest`. Make sure this passes before committing, or at least
 before merging to main.
+
+The README's python blocks are executed in order and each `Output:` block is
+compared against what the code actually prints (`tests/test_readme.py`).
+Mark an output block with `<!--output:illustrative-->` to exempt it from the
+comparison (used for outputs that cannot be deterministic, such as ones
+containing temporary paths).
 
 ### Roadmap
 

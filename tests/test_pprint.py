@@ -191,3 +191,19 @@ class TestToStr:
             lambda _, children: DeepNode(*children),
         )
         assert strux.to_str(DeepNode(1.0), max_depth=0) == "DeepNode(...)"
+
+
+def test_render_shows_declared_fields_only():
+    # the instance __dict__ carries cached solver state (set at checked
+    # construction, or lazily by .shape); rendering must not show it
+    import strux
+    from jaxtyping import Array, Float
+
+    @strux.struct
+    class Pair:
+        x: Float[Array, ""]
+        y: Float[Array, ""]
+
+    p = Pair(x=jnp.ones(3), y=jnp.zeros(3))
+    assert p.shape == (3,)      # populates the cache on this instance
+    assert str(p) == "Pair(\n  x=jnp.float32[3],\n  y=jnp.float32[3],\n)"
