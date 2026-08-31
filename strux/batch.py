@@ -19,6 +19,8 @@ from strux.schema import (
     _ClassSpec,
     _ContainerSpec,
     _UnionSpec,
+    _struct_annotation_dims,
+    _struct_annotation_target,
 )
 
 
@@ -174,6 +176,22 @@ def _candidates(value, spec, path):
             f"{path}: expected None, got {type(value).__name__}"
         )
     elif isinstance(spec, _ClassSpec):
+        # a Struct[Cls, dims] annotation declares that this field is
+        # stacked: its leaves carry the declared dims on top of whatever
+        # batch the enclosing struct has. Check against the target class
+        # and discount the declared dims, so a stacked field agrees with
+        # unstacked siblings on the enclosing struct's batch shape.
+        declared_dims = _struct_annotation_dims(spec.cls)
+        if declared_dims is not None:
+            target = _struct_annotation_target(spec.cls)
+            if not isinstance(value, target):
+                raise ValidationError(
+                    f"{path}: expected an instance of {target.__name__}, "
+                    f"got {type(value).__name__}"
+                )
+            return _discount_dims(
+                _solved_candidates(value), declared_dims, spec, path,
+            )
         if not isinstance(value, spec.cls):
             raise ValidationError(
                 f"{path}: expected an instance of {spec.cls.__name__}, got "
@@ -253,6 +271,84 @@ def _candidates(value, spec, path):
         return frozenset().union(*arm_candidates)
     else:
         raise AssertionError(f"unknown spec {spec!r}")
+
+
+def _discount_dims(candidates, tokens, spec, path):
+    """
+    Discount the dims a `Struct[Cls, dims]` field annotation declares.
+
+    The field's leaves carry `enclosing_batch ++ declared_dims ++
+    element_dims`, so the child's own solution is `enclosing_batch ++
+    declared_dims` and the enclosing struct's contribution is what remains
+    once the declared dims are taken off the trailing end.
+
+    Raises ValidationError if the declared dims fit no solution the child
+    admits. Dim tokens this cannot reason about (jaxtyping forms beyond
+    integer literals, plain names, and one variadic) yield _TOP: the field
+    simply constrains nothing, rather than constraining it wrongly.
+    """
+    if candidates is _TOP:
+        return _TOP
+    for token in tokens:
+        if token != "..." and not (token.isdigit() or token.isidentifier()):
+            return _TOP
+    if tokens.count("...") > 1:
+        return _TOP
+    fixed_width = len([t for t in tokens if t != "..."])
+    variadic = "..." in tokens
+    residuals = set()
+    for shape in candidates:
+        widths = (
+            range(fixed_width, len(shape) + 1)
+            if variadic
+            else (fixed_width,)
+        )
+        for width in widths:
+            if width > len(shape):
+                continue
+            cut = len(shape) - width
+            if _match_batch(tokens, shape[cut:]):
+                residuals.add(shape[:cut])
+    if not residuals:
+        raise ValidationError(
+            f"{path}: declared dims {spec.cls.__name__} do not fit the "
+            f"batch shapes the value admits {_format_candidates(candidates)}"
+        )
+    return frozenset(residuals)
+
+
+def _match_batch(tokens, shape):
+    """
+    Does this batch shape match the dims pattern? Supports integer
+    literals, symbolic names (bound consistently within the pattern), and
+    one "..." variadic. Patterns using other jaxtyping token forms are not
+    refuted here (per-field checks remain authoritative for them).
+    """
+    for token in tokens:
+        if token != "..." and not (token.isdigit() or token.isidentifier()):
+            return True
+    if tokens.count("...") > 1:
+        return True
+    if "..." in tokens:
+        i = tokens.index("...")
+        head, tail = tokens[:i], tokens[i + 1:]
+        if len(head) + len(tail) > len(shape):
+            return False
+        pairs = list(zip(head, shape)) + list(
+            zip(reversed(tail), reversed(shape))
+        )
+    else:
+        if len(tokens) != len(shape):
+            return False
+        pairs = list(zip(tokens, shape))
+    bound = {}
+    for token, size in pairs:
+        if token.isdigit():
+            if int(token) != size:
+                return False
+        elif bound.setdefault(token, size) != size:
+            return False
+    return True
 
 
 def _bind_dims(value, spec, batch, bindings, path):

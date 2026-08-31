@@ -394,3 +394,127 @@ class TestSchemaSolver:
             p.annotation is inspect.Parameter.empty
             for p in signature.parameters.values()
         )
+
+
+# # #
+# Stacked sub-struct fields
+
+
+class TestStackedFields:
+    """
+    A `Struct[Cls, dims]` field annotation declares that a nested struct is
+    stacked: its leaves carry the declared dims on top of whatever batch
+    the enclosing struct has. The solver discounts the declared dims, so a
+    stacked field agrees with unstacked siblings.
+    """
+
+    def test_stacked_beside_unstacked(self):
+        @strux.struct
+        class Linear:
+            weights: Float[Array, "i o"]
+
+        @strux.struct
+        class Attention:
+            QKV: strux.Struct[Linear, "3"]
+            output: Linear
+
+        attention = Attention(
+            QKV=Linear(weights=jnp.zeros((3, 8, 8))),
+            output=Linear(weights=jnp.zeros((8, 8))),
+        )
+        assert attention.shape == ()
+        with pytest.raises(TypeError):
+            len(attention)
+
+    def test_stacked_field_under_a_batched_parent(self):
+        @strux.struct
+        class Linear:
+            weights: Float[Array, "i o"]
+
+        @strux.struct
+        class Attention:
+            QKV: strux.Struct[Linear, "3"]
+            output: Linear
+
+        batched = jax.vmap(
+            lambda _: Attention(
+                QKV=Linear(weights=jnp.zeros((3, 8, 8))),
+                output=Linear(weights=jnp.zeros((8, 8))),
+            )
+        )(jnp.arange(4))
+        assert batched.shape == (4,)
+        assert len(batched) == 4
+        assert batched[0].shape == ()
+
+    def test_declared_dims_forms(self):
+        @strux.struct
+        class Linear:
+            weights: Float[Array, "i o"]
+
+        @strux.struct
+        class Symbolic:
+            stack: strux.Struct[Linear, "n"]
+            plain: Linear
+
+        @strux.struct
+        class TwoTokens:
+            stack: strux.Struct[Linear, "a b"]
+            plain: Linear
+
+        @strux.struct
+        class Variadic:
+            stack: strux.Struct[Linear, "..."]
+            plain: Linear
+
+        plain = Linear(weights=jnp.zeros((8, 8)))
+        assert Symbolic(
+            stack=Linear(weights=jnp.zeros((5, 8, 8))), plain=plain
+        ).shape == ()
+        assert TwoTokens(
+            stack=Linear(weights=jnp.zeros((2, 5, 8, 8))), plain=plain
+        ).shape == ()
+        assert Variadic(
+            stack=Linear(weights=jnp.zeros((2, 5, 8, 8))), plain=plain
+        ).shape == ()
+
+    def test_declared_dims_that_do_not_fit_are_rejected(self):
+        @strux.struct
+        class Linear:
+            weights: Float[Array, "i o"]
+
+        @strux.struct
+        class Attention:
+            QKV: strux.Struct[Linear, "3"]
+            output: Linear
+
+        with pytest.raises(strux.ValidationError, match="declared dims"):
+            Attention(
+                QKV=Linear(weights=jnp.zeros((5, 8, 8))),
+                output=Linear(weights=jnp.zeros((8, 8))),
+            )
+
+    def test_scan_over_a_stacked_depth_field(self):
+        # the motivating case: per-layer parameters stacked for lax.scan,
+        # held alongside unstacked embeddings
+        @strux.struct
+        class Block:
+            scale: Float[Array, "embed"]
+
+        @strux.struct
+        class Network:
+            embedding: Float[Array, "embed"]
+            blocks: strux.Struct[Block, "depth"]
+
+        network = Network(
+            embedding=jnp.ones(4),
+            blocks=jax.vmap(lambda i: Block(scale=jnp.full(4, i)))(
+                jnp.arange(3, dtype=jnp.float32)
+            ),
+        )
+        assert network.shape == ()
+        out, _ = jax.lax.scan(
+            lambda x, block: (x * block.scale, None),
+            network.embedding,
+            network.blocks,
+        )
+        assert out.shape == (4,)

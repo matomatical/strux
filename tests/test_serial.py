@@ -705,3 +705,60 @@ class TestPublicMetadata:
         restored = strux.from_dict(d, template=Tagged, meta=meta)
         assert restored.name == "custom"
         assert jnp.array_equal(restored.x, t.x)
+
+
+class TestStackedFields:
+    """
+    Fields annotated `Struct[Cls, dims]` save and restore like any nested
+    struct: the recorded class tag names the concrete struct, so a
+    template-free restore resolves through the annotation form.
+    """
+
+    def _classes(self):
+        @strux.struct
+        class Linear:
+            weights: Float[Array, "i o"]
+
+        @strux.struct
+        class Attention:
+            QKV: strux.Struct[Linear, "3"]
+            output: Linear
+
+        return Linear, Attention
+
+    def test_roundtrip_with_instance_template(self, tmp_path):
+        Linear, Attention = self._classes()
+        attention = Attention(
+            QKV=Linear(weights=jnp.arange(3 * 2 * 2, dtype=jnp.float32).reshape(3, 2, 2)),
+            output=Linear(weights=jnp.ones((2, 2))),
+        )
+        path = tmp_path / "attention.npz"
+        strux.save(path, attention)
+        restored = strux.load(path, template=attention)
+        _assert_equal(restored.QKV.weights, attention.QKV.weights)
+        _assert_equal(restored.output.weights, attention.output.weights)
+        assert restored.shape == ()
+
+    def test_roundtrip_template_free(self, tmp_path):
+        Linear, Attention = self._classes()
+        attention = Attention(
+            QKV=Linear(weights=jnp.zeros((3, 2, 2))),
+            output=Linear(weights=jnp.ones((2, 2))),
+        )
+        path = tmp_path / "attention.npz"
+        strux.save(path, attention)
+        restored = strux.load(path, template=Attention)
+        assert isinstance(restored.QKV, Linear)
+        assert restored.QKV.weights.shape == (3, 2, 2)
+        _assert_equal(restored.output.weights, attention.output.weights)
+
+    def test_to_dict_paths(self):
+        Linear, Attention = self._classes()
+        attention = Attention(
+            QKV=Linear(weights=jnp.zeros((3, 2, 2))),
+            output=Linear(weights=jnp.zeros((2, 2))),
+        )
+        assert set(strux.to_dict(attention)) == {
+            "QKV/weights",
+            "output/weights",
+        }

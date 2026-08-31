@@ -29,7 +29,7 @@ from strux.schema import (
     _UnionSpec,
     _scalar_spec,
 )
-from strux.batch import _TOP, _solved_candidates
+from strux.batch import _TOP, _match_batch, _solved_candidates
 
 
 # # #
@@ -405,37 +405,3 @@ def _batch_consistent(instance, dim_strs):
         for token in dim_str.split()
     ]
     return any(_match_batch(tokens, shape) for shape in candidates)
-
-
-def _match_batch(tokens, shape):
-    """
-    Does this batch shape match the dims pattern? Supports integer
-    literals, symbolic names (bound consistently within the pattern), and
-    one "..." variadic. Patterns using other jaxtyping token forms are not
-    refuted here (the per-field checks remain authoritative for them).
-    """
-    for token in tokens:
-        if token != "..." and not (token.isdigit() or token.isidentifier()):
-            return True
-    if tokens.count("...") > 1:
-        return True
-    if "..." in tokens:
-        i = tokens.index("...")
-        head, tail = tokens[:i], tokens[i + 1:]
-        if len(head) + len(tail) > len(shape):
-            return False
-        pairs = list(zip(head, shape)) + list(
-            zip(reversed(tail), reversed(shape))
-        )
-    else:
-        if len(tokens) != len(shape):
-            return False
-        pairs = list(zip(tokens, shape))
-    bound = {}
-    for token, size in pairs:
-        if token.isdigit():
-            if int(token) != size:
-                return False
-        elif bound.setdefault(token, size) != size:
-            return False
-    return True

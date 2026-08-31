@@ -3,6 +3,37 @@
 Versions and breaking changes are tracked here from 0.1.0 onward. Earlier
 development (0.0.x) is untracked; see the git history.
 
+## Unreleased
+
+Stacked sub-struct fields: `Struct[Cls, dims]` means something in field
+position.
+
+### Added
+
+* A `Struct[Cls, dims]` **field** annotation now declares that a nested
+  struct is *stacked* — its leaves carrying the declared dims on top of
+  whatever batch the enclosing struct has — and the batch solver discounts
+  those dims. Previously the form was only meaningful in signatures: as a
+  field annotation its dims were validated but never discounted, so a
+  stacked field reported the declared dims as its own batch shape and
+  collided with unstacked siblings ("inconsistent batch shapes"). This
+  makes the depth-wise stack of layer parameters the README advertises for
+  `jax.lax.scan` expressible as a field alongside unstacked ones. Declared
+  dims that fit no shape the value admits raise `ValidationError`; dim
+  tokens the solver cannot reason about leave the field unconstrained.
+* Template-free restore resolves through the form: a saved class tag names
+  the concrete struct, so `strux.load(path, template=Cls)` no longer
+  refuses a `Struct[...]`-annotated field.
+
+### Changed (breaking)
+
+* A struct whose fields are *all* `Struct[Cls, dims]`-annotated previously
+  solved to the declared dims as its own batch shape (the one arrangement
+  in which the missing discount raised no error). It now solves to the
+  enclosing batch, so such a struct reads as unbatched and refuses
+  indexing, `len`, and iteration. Annotate the field with the plain class
+  to restore the old reading.
+
 ## 0.3.0 (2026-08-14)
 
 Solver v2: symbolic dim names mean something.

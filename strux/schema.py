@@ -485,3 +485,42 @@ def _scalar_spec(scalar_cls):
         for arm in typing.get_args(hint)
     )
     return _UnionSpec(arms=arms)
+
+
+# # #
+# Struct-form annotations
+#
+# `Struct[Cls, ...]` (strux.annotate) lowers to a synthetic class carrying
+# the target struct type and the functor pipeline. Field annotations may
+# use the form to declare that a nested struct is *stacked* — carrying
+# extra leading dims relative to the enclosing struct — so the batch
+# solver and the deserialiser both need to see through the synthetic class
+# to the struct it stands for. Both read it via the accessors below rather
+# than importing annotate (which imports this module).
+
+
+def _struct_annotation_target(cls):
+    """
+    The struct class a `Struct[...]` annotation stands for, or None if
+    `cls` is not one.
+    """
+    return getattr(cls, "_struct_type", None)
+
+
+def _struct_annotation_dims(cls):
+    """
+    The batch dims a `Struct[...]` annotation declares, as a flat tuple of
+    jaxtyping dim tokens, or None if `cls` is not a dims-only form.
+
+    Functors apply left to right and each prepends its dims in front of
+    the previous, so the leading tokens read right-to-left across the
+    functor strings. Forms carrying `astype`/`mapped` functors describe an
+    image that deliberately differs from the schema, and are excluded:
+    the annotation's own isinstance check remains authoritative for them.
+    """
+    functors = getattr(cls, "_functors", None)
+    if functors is None or not all(isinstance(f, str) for f in functors):
+        return None
+    return tuple(
+        token for dim_str in reversed(functors) for token in dim_str.split()
+    )
