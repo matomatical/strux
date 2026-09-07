@@ -245,3 +245,67 @@ class TestGenericStructs:
         ref = Ref(env=batched_env)
         assert ref.shape == (4,)
         assert isinstance(ref, strux.Struct[Ref, "batch"])
+
+
+# # #
+# The Struct form in field position
+
+
+class TestStructFormFields:
+    """
+    `Struct[Cls, dims]` is recognised when the field annotation is
+    compiled, so the spec names the concrete struct and carries the
+    declared dims as data; the functor variants describe images that
+    depart from the schema and are refused here.
+    """
+
+    def test_dims_form_compiles_to_the_target_class_and_dims(self):
+        @strux.struct
+        class Block:
+            scale: Float[Array, "embed"]
+
+        @strux.struct
+        class Network:
+            blocks: strux.Struct[Block, "depth"]
+
+        spec = strux.schema(Network).fields["blocks"]
+        assert spec.cls is Block
+        assert spec.dims == ("depth",)
+
+    def test_dims_across_several_functors_read_right_to_left(self):
+        @strux.struct
+        class Block:
+            scale: Float[Array, "embed"]
+
+        @strux.struct
+        class Network:
+            blocks: strux.Struct[Block, "depth", "heads"]
+
+        spec = strux.schema(Network).fields["blocks"]
+        assert spec.dims == ("heads", "depth")
+
+    def test_plain_class_field_declares_no_dims(self):
+        @strux.struct
+        class Block:
+            scale: Float[Array, "embed"]
+
+        @strux.struct
+        class Network:
+            blocks: Block
+
+        assert strux.schema(Network).fields["blocks"].dims == ()
+
+    @pytest.mark.parametrize(
+        "functor", [strux.astype(bool), strux.mapped(int)]
+    )
+    def test_functor_form_is_refused_as_a_field(self, functor):
+        @strux.struct
+        class Block:
+            scale: Float[Array, "embed"]
+
+        @strux.struct
+        class Network:
+            blocks: strux.Struct[Block, functor]
+
+        with pytest.raises(strux.SchemaError, match="dims variants"):
+            strux.schema(Network)

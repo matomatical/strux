@@ -60,7 +60,10 @@ class ValidationError(TypeError):
 #                            recursed via the *value's* dynamic type (a
 #                            nested struct/dataclass recurses its own
 #                            schema; any other pytree constrains the batch
-#                            as a prefix of every leaf's shape)
+#                            as a prefix of every leaf's shape); a
+#                            `Struct[cls, dims]` annotation additionally
+#                            declares dims the nested struct carries
+#                            *inside* the enclosing batch
 #          | _ContainerSpec  dict[k, v], list[t], tuple[t, ...], tuple[...]
 #          | _UnionSpec      any union: the arm is decided by the value
 #
@@ -101,8 +104,11 @@ class _NoneSpec:
 @dataclasses.dataclass(frozen=True)
 class _ClassSpec:
     cls: type
+    dims: tuple = ()    # dims declared by a `Struct[cls, dims]` annotation
 
     def __str__(self):
+        if self.dims:
+            return f'Struct[{self.cls.__name__}, "{" ".join(self.dims)}"]'
         return self.cls.__name__
 
 
@@ -403,6 +409,22 @@ def _parse_hint(hint, context):
         hint, (bool, int, float, complex, np.generic)
     ):
         return _PyScalarSpec(cls=hint)
+    # the Struct form: `Struct[Cls, dims]` declares that this field is
+    # *stacked*, its leaves carrying the declared dims between the
+    # enclosing batch and the element — the nested-struct analogue of
+    # writing those dims into a jaxtyping annotation
+    form = _struct_form(hint)
+    if form is not None:
+        target, functors = form
+        if not all(isinstance(functor, str) for functor in functors):
+            raise SchemaError(
+                f"{context}: only the dims variants of the Struct form are "
+                f"meaningful as field annotations, but {hint.__name__} "
+                "carries a functor, describing an image whose leaves "
+                "deliberately depart from the schema; annotate the field "
+                "with the struct class itself"
+            )
+        return _ClassSpec(cls=target, dims=_form_dims(functors))
     # any other class: an instance-checked pytree (nested struct, foreign
     # dataclass, abstract base of structs, or registered container); its
     # constraints are derived from the value's dynamic type
@@ -488,39 +510,36 @@ def _scalar_spec(scalar_cls):
 
 
 # # #
-# Struct-form annotations
+# The Struct form as a field annotation
 #
 # `Struct[Cls, ...]` (strux.annotate) lowers to a synthetic class carrying
-# the target struct type and the functor pipeline. Field annotations may
-# use the form to declare that a nested struct is *stacked* — carrying
-# extra leading dims relative to the enclosing struct — so the batch
-# solver and the deserialiser both need to see through the synthetic class
-# to the struct it stands for. Both read it via the accessors below rather
-# than importing annotate (which imports this module).
+# the target struct type and the functor pipeline. In field position the
+# dims variants declare that a nested struct is *stacked*, which the
+# parser reads off here rather than by importing annotate (which imports
+# this module).
 
 
-def _struct_annotation_target(cls):
+def _struct_form(hint):
     """
-    The struct class a `Struct[...]` annotation stands for, or None if
-    `cls` is not one.
+    The `(target, functors)` a `Struct[...]` annotation stands for, or
+    None if `hint` is not one.
     """
-    return getattr(cls, "_struct_type", None)
-
-
-def _struct_annotation_dims(cls):
-    """
-    The batch dims a `Struct[...]` annotation declares, as a flat tuple of
-    jaxtyping dim tokens, or None if `cls` is not a dims-only form.
-
-    Functors apply left to right and each prepends its dims in front of
-    the previous, so the leading tokens read right-to-left across the
-    functor strings. Forms carrying `astype`/`mapped` functors describe an
-    image that deliberately differs from the schema, and are excluded:
-    the annotation's own isinstance check remains authoritative for them.
-    """
-    functors = getattr(cls, "_functors", None)
-    if functors is None or not all(isinstance(f, str) for f in functors):
+    if not isinstance(hint, type):
         return None
+    target = getattr(hint, "_struct_type", None)
+    functors = getattr(hint, "_functors", None)
+    if target is None or functors is None:
+        return None
+    return target, functors
+
+
+def _form_dims(functors):
+    """
+    The dims a pipeline of dims-string functors declares, as a flat tuple
+    of jaxtyping dim tokens. Functors apply left to right and each
+    prepends its dims in front of the previous, so the tokens read
+    right-to-left across the strings.
+    """
     return tuple(
         token for dim_str in reversed(functors) for token in dim_str.split()
     )

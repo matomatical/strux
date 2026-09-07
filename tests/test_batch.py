@@ -487,7 +487,9 @@ class TestStackedFields:
             QKV: strux.Struct[Linear, "3"]
             output: Linear
 
-        with pytest.raises(strux.ValidationError, match="declared dims"):
+        with pytest.raises(
+            strux.ValidationError, match="expected element dims matching"
+        ):
             Attention(
                 QKV=Linear(weights=jnp.zeros((5, 8, 8))),
                 output=Linear(weights=jnp.zeros((8, 8))),

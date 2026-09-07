@@ -3,7 +3,7 @@
 Versions and breaking changes are tracked here from 0.1.0 onward. Earlier
 development (0.0.x) is untracked; see the git history.
 
-## Unreleased
+## 0.4.0 (2026-09-07)
 
 Stacked sub-struct fields: `Struct[Cls, dims]` means something in field
 position.
@@ -21,12 +21,24 @@ position.
   `jax.lax.scan` expressible as a field alongside unstacked ones. Declared
   dims that fit no shape the value admits raise `ValidationError`; dim
   tokens the solver cannot reason about leave the field unconstrained.
+* Struct-form images compose with stacked fields: `Struct[Network, "batch"]`
+  describes a `Network` that itself declares `Struct[Block, "depth"]`
+  fields, prepending its own dims in front of the declared ones.
+  Previously such a struct satisfied no form of itself at all — even
+  `Struct[Network, ""]` was `False` — because the image checked the inner
+  field's declared dims against the whole batch.
 * Template-free restore resolves through the form: a saved class tag names
   the concrete struct, so `strux.load(path, template=Cls)` no longer
   refuses a `Struct[...]`-annotated field.
 
 ### Changed (breaking)
 
+* Field annotations using the *functor* variants of the form
+  (`Struct[Cls, astype(kind)]`, `Struct[Cls, mapped(kind)]`) raise
+  `SchemaError` when the schema is compiled. Such a form describes an
+  image whose leaves deliberately depart from the schema — a claim about a
+  value, not about a field — and previously failed at construction with a
+  confusing dtype error naming an annotation the user never wrote.
 * A struct whose fields are *all* `Struct[Cls, dims]`-annotated previously
   solved to the declared dims as its own batch shape (the one arrangement
   in which the missing discount raised no error). It now solves to the

@@ -554,3 +554,66 @@ class TestBatchConsistency:
         batched = Point(x=jnp.ones(4), y=jnp.ones(4))
         mask = jax.tree.map(lambda a: a > 0, batched)
         assert isinstance(mask, strux.Struct[Point, strux.mapped(bool), "b"])
+
+
+# # #
+# Stacked fields under the form
+
+
+class TestStackedFieldImages:
+    """
+    A `Struct[Cls, dims]` *field* declares dims that sit inside whatever
+    batch the enclosing struct carries, so the form applied to the
+    enclosing struct prepends its own dims in front of the declared ones.
+    """
+
+    def _classes(self):
+        @strux.struct
+        class Block:
+            scale: Float[Array, "embed"]
+
+        @strux.struct
+        class Network:
+            embedding: Float[Array, "embed"]
+            blocks: strux.Struct[Block, "depth"]
+
+        return Block, Network
+
+    def _network(self, Block, Network, batch=()):
+        return Network(
+            embedding=jnp.ones((*batch, 4)),
+            blocks=Block(scale=jnp.ones((*batch, 3, 4))),
+        )
+
+    def test_declared_dims_appear_in_the_expansion(self):
+        Block, Network = self._classes()
+        hints = strux.Struct[Network, "members"]._field_hints
+        assert hints["embedding"].dim_str == "members embed"
+        assert hints["blocks"]._field_hints["scale"].dim_str == (
+            "members depth embed"
+        )
+
+    def test_rank_exact_form_accepts_the_unbatched_network(self):
+        Block, Network = self._classes()
+        network = self._network(Block, Network)
+        assert isinstance(network, strux.Struct[Network, ""])
+
+    def test_form_accepts_the_batched_image(self):
+        Block, Network = self._classes()
+        batched = self._network(Block, Network, batch=(2,))
+        assert isinstance(batched, strux.Struct[Network, "members"])
+        assert not isinstance(batched, strux.Struct[Network, ""])
+
+    def test_form_refuses_the_wrong_number_of_prepended_dims(self):
+        Block, Network = self._classes()
+        batched = self._network(Block, Network, batch=(2,))
+        assert not isinstance(batched, strux.Struct[Network, "a b"])
+
+    def test_declared_dims_missing_from_the_value_are_refused(self):
+        # the declared dims are a promise about the field's leaves, so a
+        # network whose blocks lack them does not construct at all
+        Block, Network = self._classes()
+        with pytest.raises(
+            strux.ValidationError, match="expected element dims matching"
+        ):
+            Network(embedding=jnp.ones(4), blocks=Block(scale=jnp.ones(4)))

@@ -245,7 +245,11 @@ def _expand_spec(spec, functors, context):
         return type(None)
     elif isinstance(spec, _ClassSpec):
         if dataclasses.is_dataclass(spec.cls):
-            return _make_struct_annotation(spec.cls, functors)
+            # a stacked field already carries dims of its own, which sit
+            # between the element and whatever these functors prepend, so
+            # they apply first
+            own = (" ".join(spec.dims),) if spec.dims else ()
+            return _make_struct_annotation(spec.cls, own + functors)
         # abstract base classes and other registered pytrees: check the
         # class and require every array leaf to satisfy the functor image
         # (python scalar leaves are batch-agnostic, as in the solver)

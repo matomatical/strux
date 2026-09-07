@@ -449,6 +449,11 @@ net2 = net.replace(
 `strux.Struct` takes a list of strings or the above functors and applies them
 to the type of each leaf, left to right.
 
+Unlike dims strings, these functor forms are not valid as field annotations: a
+field annotated `strux.astype` or `strux.mapped` would describe leaves
+departing from the very schema that field is meant to declare, and raises
+`SchemaError`.
+
 
 ### Type validation on construction
 
@@ -801,6 +806,9 @@ Advanced typing:
       scoped per class, `"_"` anonymous dims exempt; `strux.tree_dims`
       queries the bindings; `Struct`-form isinstance checks additionally
       require a consistent cross-field batch solution)
+- [ ] Dims declared by a `Struct[Cls, dims]` field annotation bind within
+      that annotation only; they are outside the enclosing class's dim
+      namespace, so a sibling naming the same dim is not cross-checked
 
 Project:
 

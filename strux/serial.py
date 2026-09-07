@@ -30,7 +30,6 @@ from strux.schema import (
     _ClassSpec,
     _ContainerSpec,
     _UnionSpec,
-    _struct_annotation_target,
 )
 
 # optional safetensors[numpy]
@@ -317,12 +316,7 @@ def _resolve_class(base, meta, path):
     """
     The class to rebuild at this path: the recorded class if metadata names
     an (imported) subclass of `base`, otherwise `base` itself.
-
-    A `Struct[Cls, dims]` annotation stands for `Cls` (the saved tag names
-    the concrete struct, never the annotation form), so resolve against
-    the struct it targets.
     """
-    base = _struct_annotation_target(base) or base
     recorded = meta.get(_meta_key("class", path))
     if recorded is None or recorded == _fullname(base):
         return base
@@ -345,23 +339,14 @@ def _narrow_class_arms(arms, recorded):
     """
     if recorded is None:
         return arms
-    exact = [
-        arm for arm in arms
-        if _fullname(_struct_annotation_target(arm.cls) or arm.cls) == recorded
-    ]
+    exact = [arm for arm in arms if _fullname(arm.cls) == recorded]
     if exact:
         return exact
-    targets = {
-        arm: _struct_annotation_target(arm.cls) or arm.cls for arm in arms
-    }
     resolving = [
-        arm for arm in arms
-        if _find_subclass(targets[arm], recorded) is not None
+        arm for arm in arms if _find_subclass(arm.cls, recorded) is not None
     ]
     for arm in resolving:
-        if all(
-            issubclass(targets[arm], targets[other]) for other in resolving
-        ):
+        if all(issubclass(arm.cls, other.cls) for other in resolving):
             return [arm]
     return resolving
 

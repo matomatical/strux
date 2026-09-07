@@ -19,8 +19,6 @@ from strux.schema import (
     _ClassSpec,
     _ContainerSpec,
     _UnionSpec,
-    _struct_annotation_dims,
-    _struct_annotation_target,
 )
 
 
@@ -176,22 +174,6 @@ def _candidates(value, spec, path):
             f"{path}: expected None, got {type(value).__name__}"
         )
     elif isinstance(spec, _ClassSpec):
-        # a Struct[Cls, dims] annotation declares that this field is
-        # stacked: its leaves carry the declared dims on top of whatever
-        # batch the enclosing struct has. Check against the target class
-        # and discount the declared dims, so a stacked field agrees with
-        # unstacked siblings on the enclosing struct's batch shape.
-        declared_dims = _struct_annotation_dims(spec.cls)
-        if declared_dims is not None:
-            target = _struct_annotation_target(spec.cls)
-            if not isinstance(value, target):
-                raise ValidationError(
-                    f"{path}: expected an instance of {target.__name__}, "
-                    f"got {type(value).__name__}"
-                )
-            return _discount_dims(
-                _solved_candidates(value), declared_dims, spec, path,
-            )
         if not isinstance(value, spec.cls):
             raise ValidationError(
                 f"{path}: expected an instance of {spec.cls.__name__}, got "
@@ -204,7 +186,7 @@ def _candidates(value, spec, path):
             # the instance cache (populated when the child was validated
             # at its construction) rather than re-solving its subtree;
             # solving here also covers subclasses of the annotated class
-            return _solved_candidates(value)
+            return _discount_dims(_solved_candidates(value), spec, path)
         # any other pytree: every array leaf constrains the batch as a
         # prefix of its shape; a scalar leaf admits batch () only
         meet = _BatchMeet()
@@ -224,7 +206,7 @@ def _candidates(value, spec, path):
                     "inside a data field is not an array; restructure, or "
                     "mark the field static"
                 )
-        return meet.candidates
+        return _discount_dims(meet.candidates, spec, path)
     elif isinstance(spec, _ContainerSpec):
         expected_cls = dict if spec.kind == "dict" else (
             list if spec.kind == "list" else tuple
@@ -273,11 +255,11 @@ def _candidates(value, spec, path):
         raise AssertionError(f"unknown spec {spec!r}")
 
 
-def _discount_dims(candidates, tokens, spec, path):
+def _discount_dims(candidates, spec, path):
     """
     Discount the dims a `Struct[Cls, dims]` field annotation declares.
 
-    The field's leaves carry `enclosing_batch ++ declared_dims ++
+    A stacked field's leaves carry `enclosing_batch ++ declared_dims ++
     element_dims`, so the child's own solution is `enclosing_batch ++
     declared_dims` and the enclosing struct's contribution is what remains
     once the declared dims are taken off the trailing end.
@@ -287,8 +269,9 @@ def _discount_dims(candidates, tokens, spec, path):
     integer literals, plain names, and one variadic) yield _TOP: the field
     simply constrains nothing, rather than constraining it wrongly.
     """
-    if candidates is _TOP:
-        return _TOP
+    tokens = spec.dims
+    if not tokens or candidates is _TOP:
+        return candidates
     for token in tokens:
         if token != "..." and not (token.isdigit() or token.isidentifier()):
             return _TOP
@@ -311,8 +294,8 @@ def _discount_dims(candidates, tokens, spec, path):
                 residuals.add(shape[:cut])
     if not residuals:
         raise ValidationError(
-            f"{path}: declared dims {spec.cls.__name__} do not fit the "
-            f"batch shapes the value admits {_format_candidates(candidates)}"
+            f"{path}: expected element dims matching {spec}, but the value "
+            f"admits batch shapes {_format_candidates(candidates)}"
         )
     return frozenset(residuals)
 
