@@ -12,6 +12,12 @@ development (0.0.x) is untracked; see the git history.
   This supports batching an existing transformed description while keeping
   the original value classes and the written transformation order.
 
+### Fixed
+
+* README tests have a bounded execution time and report original source
+  locations, earlier output mismatches, and tracebacks when examples fail
+  or hang.
+
 ## 0.4.0 (2026-09-07)
 
 Stacked sub-struct fields: `Struct[Cls, dims]` means something in field
