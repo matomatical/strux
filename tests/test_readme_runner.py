@@ -17,6 +17,19 @@ def test_shared_namespace_and_illustrative_output(tmp_path):
     _check_readme(readme)
 
 
+def test_adjacent_console_blocks_are_checked_without_output_label(tmp_path):
+    readme = tmp_path / "README.md"
+    readme.write_text(
+        "```console\npip install example\n```\n"
+        "```python\nprint('actual')\n```\n\n"
+        "```console\nexpected\n```\n"
+    )
+    with pytest.raises(AssertionError, match="output mismatch"):
+        _check_readme(readme)
+    readme.write_text(readme.read_text().replace("expected", "actual"))
+    _check_readme(readme)
+
+
 @pytest.mark.parametrize("later_exception", [False, True])
 def test_mismatch_reports_failure_and_source_location(tmp_path, later_exception):
     readme = tmp_path / "README.md"

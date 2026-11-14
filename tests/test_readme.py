@@ -1,6 +1,7 @@
 """
 Execute the README's Python blocks in order, in one shared namespace, and
-compare their stdout with the console blocks beneath ``Output:`` lines.
+compare their stdout with adjacent console blocks or blocks introduced by
+``Output:`` lines.
 Run the examples in a subprocess with a time limit so an integration hang
 fails with block locations and a traceback instead of stalling pytest.
 
@@ -17,7 +18,8 @@ import re
 import subprocess
 import sys
 
-README = pathlib.Path(__file__).parent.parent / "README.md"
+# The working API specification lives in the independent draft during the rebuild.
+README = pathlib.Path(__file__).parent.parent / "README-draft.md"
 
 _FENCE = re.compile(r"(\s*)(`{3,})(\w*)\s*$")
 _ILLUSTRATIVE = "<!--output:illustrative-->"
@@ -33,6 +35,7 @@ def _parse(lines):
     """
     events = []
     prose = []
+    pending_code = False
     i = 0
     while i < len(lines):
         fence = _FENCE.match(lines[i])
@@ -51,10 +54,14 @@ def _parse(lines):
         text = "\n".join(content)
         if syntax == "python":
             events.append(("code", start_line, text))
-        elif any("Output:" in line for line in prose) and not any(
-            _ILLUSTRATIVE in line for line in prose
-        ):
-            events.append(("output", start_line, text))
+            pending_code = True
+        else:
+            labelled = any("Output:" in line for line in prose)
+            adjacent = syntax == "console" and not "".join(prose).strip()
+            illustrative = any(_ILLUSTRATIVE in line for line in prose)
+            if pending_code and (labelled or adjacent) and not illustrative:
+                events.append(("output", start_line, text))
+            pending_code = False
         prose = []
     return events
 
