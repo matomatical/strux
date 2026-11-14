@@ -1,12 +1,11 @@
-"""
-Solving for the batch shape: given a struct instance and its schema, which
-leading batch shapes are consistent with every data field? Construction
-validation asks whether any shape is; the shape queries ask for the unique
-one.
+"""Infer shared leading batch shapes from default element annotations.
+
+Inference uses structure and shape, not dtype validation. Explicit batch
+hints can supply the indexing interpretation for transformed values.
 """
 
 import dataclasses
-import re
+import numbers
 
 import jax
 
@@ -21,48 +20,24 @@ from strux.schema import (
     _UnionSpec,
 )
 
-
 # The candidate-set lattice: each (value, spec) pair yields the set of
 # leading batch shapes B consistent with it — a finite frozenset of tuples,
 # or _TOP (represented as None) meaning "unconstrained". Only pytree
 # *structure* is unconstrained (None arms, empty containers): every leaf
 # constrains the batch, and in particular a python scalar admits exactly
 # batch () — batching produces arrays, never scalars, and strux does not
-# broadcast. Validation asks whether the intersection across all fields is
-# non-empty; .shape asks for its unique element.
+# broadcast. Shape queries require a unique shared prefix.
 _TOP = None
-
-# solved candidates are cached on instances under this attribute (structs
-# are immutable, so a computed solution never goes stale); _UNSOLVED marks
-# its absence, since _TOP itself is a cacheable solution
-_CACHED_SOLUTION = "_strux_candidates"
-_UNSOLVED = object()
 
 
 def _solved_candidates(tree):
-    """
-    The tree's batch-shape candidate set, from the instance cache when
-    present (validation populates it at construction; unflattened and
-    unchecked instances are solved on first query), else freshly solved
-    and cached.
-    """
-    cached = getattr(tree, _CACHED_SOLUTION, _UNSOLVED)
-    if cached is not _UNSOLVED:
-        return cached
+    """Compute candidates from current fields, including mutable containers."""
     cls = type(tree)
     meet = _BatchMeet()
     for name, spec in schema(cls).fields.items():
         path = f"{cls.__name__}.{name}"
         meet.add(path, _candidates(getattr(tree, name), spec, path))
-    _cache_solution(tree, meet.candidates)
     return meet.candidates
-
-
-def _cache_solution(tree, candidates):
-    try:
-        object.__setattr__(tree, _CACHED_SOLUTION, candidates)
-    except AttributeError:
-        pass    # e.g. a foreign dataclass with __slots__; solve per query
 
 
 class _BatchMeet:
@@ -102,42 +77,24 @@ def _is_arraylike_value(value):
     return hasattr(value, "shape") and hasattr(value, "dtype")
 
 
-def _dtype_matches(dtype, patterns):
-    if patterns is None:
-        return True
-    name = dtype.name
-    if name in patterns:
-        return True
-    # zero-tangent dtype produced by autodiff for non-differentiable
-    # (integer/bool) leaves; accept anywhere so gradients of structs with
-    # such fields remain constructible
-    if dtype == jax.dtypes.float0:
-        return True
-    for pattern in patterns:
-        if pattern == "prng_key":
-            if jax.dtypes.issubdtype(dtype, jax.dtypes.prng_key):
-                return True
-        elif re.fullmatch(pattern, name):
-            return True
-    return False
-
-
 def _candidates(value, spec, path):
     """
     The set of batch shapes consistent with this value under this spec
     (frozenset of tuples, or _TOP for "unconstrained"). Raises
     ValidationError if no batch shape is consistent.
     """
+    from strux.annotate import _BatchSpec
+
+    if isinstance(spec, _BatchSpec):
+        return _discount_dims(
+            _candidates(value, spec.element, path),
+            _ClassSpec(object, dims=tuple(spec.dims.split())),
+            path,
+        )
     if isinstance(spec, _ArraySpec):
         if not _is_arraylike_value(value):
             raise ValidationError(
-                f"{path}: expected an array ({spec}), got "
-                f"{type(value).__name__}"
-            )
-        if not _dtype_matches(value.dtype, spec.dtypes):
-            raise ValidationError(
-                f"{path}: expected dtype kind {spec} but got dtype "
-                f"{value.dtype.name}"
+                f"{path}: expected an array ({spec}), got " f"{type(value).__name__}"
             )
         shape = tuple(value.shape)
         if len(shape) < spec.min_ndim:
@@ -153,26 +110,21 @@ def _candidates(value, spec, path):
                     f"{size})"
                 )
         if spec.ndim is None:
-            return frozenset(
-                shape[:k] for k in range(len(shape) - spec.min_ndim + 1)
-            )
-        return frozenset((shape[:len(shape) - spec.ndim],))
+            return frozenset(shape[:k] for k in range(len(shape) - spec.min_ndim + 1))
+        return frozenset((shape[: len(shape) - spec.ndim],))
     elif isinstance(spec, _PyScalarSpec):
-        if isinstance(value, spec.cls):
+        if isinstance(value, numbers.Number) or getattr(value, "shape", None) == ():
             # a python scalar is one element's worth of data: batch ()
             # exactly (batched structs carry arrays; strux never
             # broadcasts a scalar across a batch)
             return frozenset(((),))
         raise ValidationError(
-            f"{path}: expected {spec.cls.__name__}, got "
-            f"{type(value).__name__}"
+            f"{path}: expected {spec.cls.__name__}, got " f"{type(value).__name__}"
         )
     elif isinstance(spec, _NoneSpec):
         if value is None:
             return _TOP
-        raise ValidationError(
-            f"{path}: expected None, got {type(value).__name__}"
-        )
+        raise ValidationError(f"{path}: expected None, got {type(value).__name__}")
     elif isinstance(spec, _ClassSpec):
         if not isinstance(value, spec.cls):
             raise ValidationError(
@@ -181,11 +133,17 @@ def _candidates(value, spec, path):
             )
         value_cls = type(value)
         if dataclasses.is_dataclass(value_cls):
-            # an annotated dataclass (nested struct or foreign): its own
-            # candidate set is exactly this field's contribution, so use
-            # the instance cache (populated when the child was validated
-            # at its construction) rather than re-solving its subtree;
-            # solving here also covers subclasses of the annotated class
+            if spec.transforms:
+                from strux.annotate import _fields
+
+                fields = _fields(value_cls, spec.transforms)
+                meet = _BatchMeet()
+                for name, childspec in fields.items():
+                    meet.add(
+                        path + "." + name,
+                        _candidates(getattr(value, name), childspec, path + "." + name),
+                    )
+                return _discount_dims(meet.candidates, spec, path)
             return _discount_dims(_solved_candidates(value), spec, path)
         # any other pytree: every array leaf constrains the batch as a
         # prefix of its shape; a scalar leaf admits batch () only
@@ -208,8 +166,8 @@ def _candidates(value, spec, path):
                 )
         return _discount_dims(meet.candidates, spec, path)
     elif isinstance(spec, _ContainerSpec):
-        expected_cls = dict if spec.kind == "dict" else (
-            list if spec.kind == "list" else tuple
+        expected_cls = (
+            dict if spec.kind == "dict" else (list if spec.kind == "list" else tuple)
         )
         if not isinstance(value, expected_cls):
             raise ValidationError(
@@ -218,9 +176,7 @@ def _candidates(value, spec, path):
         if spec.kind == "dict":
             children = [(f"{path}[{k!r}]", v, spec.elems[0]) for k, v in value.items()]
         elif spec.kind in ("list", "tuple_variadic"):
-            children = [
-                (f"{path}[{i}]", v, spec.elems[0]) for i, v in enumerate(value)
-            ]
+            children = [(f"{path}[{i}]", v, spec.elems[0]) for i, v in enumerate(value)]
         else:
             if len(value) != len(spec.elems):
                 raise ValidationError(
@@ -245,8 +201,7 @@ def _candidates(value, spec, path):
                 arm_failures.append(f"as {arm}: {e}")
         if not arm_candidates:
             raise ValidationError(
-                f"{path}: value matches no arm of {spec}: "
-                + "; ".join(arm_failures)
+                f"{path}: value matches no arm of {spec}: " + "; ".join(arm_failures)
             )
         if any(c is _TOP for c in arm_candidates):
             return _TOP
@@ -281,11 +236,7 @@ def _discount_dims(candidates, spec, path):
     variadic = "..." in tokens
     residuals = set()
     for shape in candidates:
-        widths = (
-            range(fixed_width, len(shape) + 1)
-            if variadic
-            else (fixed_width,)
-        )
+        widths = range(fixed_width, len(shape) + 1) if variadic else (fixed_width,)
         for width in widths:
             if width > len(shape):
                 continue
@@ -314,12 +265,10 @@ def _match_batch(tokens, shape):
         return True
     if "..." in tokens:
         i = tokens.index("...")
-        head, tail = tokens[:i], tokens[i + 1:]
+        head, tail = tokens[:i], tokens[i + 1 :]
         if len(head) + len(tail) > len(shape):
             return False
-        pairs = list(zip(head, shape)) + list(
-            zip(reversed(tail), reversed(shape))
-        )
+        pairs = list(zip(head, shape)) + list(zip(reversed(tail), reversed(shape)))
     else:
         if len(tokens) != len(shape):
             return False
@@ -339,7 +288,7 @@ def _bind_dims(value, spec, batch, bindings, path):
     Bind the symbolic dim names in a spec to their sizes in this value,
     raising ValidationError if a name binds two different sizes. Names are
     scoped to the class whose annotations mention them: nested dataclasses
-    are not entered (their names bind at their own construction).
+    are not entered (their names belong to their own occurrence).
     """
     if isinstance(spec, _ArraySpec):
         if not spec.names or not _is_arraylike_value(value):
@@ -393,85 +342,10 @@ def _bind_names(instance, sch, batch):
     cls_name = sch.cls.__name__
     for name, spec in sch.fields.items():
         _bind_dims(
-            getattr(instance, name), spec, batch, bindings,
+            getattr(instance, name),
+            spec,
+            batch,
+            bindings,
             f"{cls_name}.{name}",
         )
     return bindings
-
-
-def _validate_struct(instance):
-    """
-    Check a freshly-constructed struct against its schema: array kinds and
-    element dims as annotated, a consistent leading batch shape across all
-    data fields, and one consistent size per symbolic dim name across the
-    class's fields. Raises ValidationError (or SchemaError if the
-    annotations themselves cannot be compiled).
-    """
-    cls = type(instance)
-    sch = schema(cls)
-    # fast path: simple fields validated with plain tuple arithmetic; any
-    # anomaly (including acceptable oddities like float0 cotangents and
-    # prng-key dtypes) falls through to the general solver, which either
-    # accepts them or raises with a precise message
-    plan = sch.fast_plan
-    if plan is not None:
-        batch = _fast_validate(instance, plan)
-        if batch is not _UNSOLVED:
-            _cache_solution(
-                instance, _TOP if batch is None else frozenset((batch,)),
-            )
-            if sch.has_names:
-                _bind_names(instance, sch, batch)
-            return
-    meet = _BatchMeet()
-    for name, spec in sch.fields.items():
-        path = f"{cls.__name__}.{name}"
-        meet.add(path, _candidates(getattr(instance, name), spec, path))
-    _cache_solution(instance, meet.candidates)
-    if sch.has_names:
-        candidates = meet.candidates
-        batch = (
-            next(iter(candidates))
-            if candidates is not _TOP and len(candidates) == 1
-            else None
-        )
-        _bind_names(instance, sch, batch)
-
-
-def _fast_validate(instance, plan):
-    """
-    Validate against a precompiled plan. Returns the batch shape (or None
-    for an empty plan), or _UNSOLVED to fall through to the general solver.
-    """
-    batch = None
-    for name, dtype_set, ndim, fixed in plan:
-        value = getattr(instance, name)
-        if ndim is None and isinstance(value, (bool, int, float, complex)):
-            value_batch = ()    # scalar-ish slot with a python scalar
-            if batch is None:
-                batch = value_batch
-            elif value_batch != batch:
-                return _UNSOLVED
-            continue
-        try:
-            shape = value.shape
-            dtype = value.dtype
-        except AttributeError:
-            return _UNSOLVED
-        if dtype_set is not None and dtype not in dtype_set:
-            return _UNSOLVED
-        if ndim is None:
-            value_batch = tuple(shape)
-        else:
-            cut = len(shape) - ndim
-            if cut < 0:
-                return _UNSOLVED
-            for offset, size in fixed:
-                if shape[len(shape) + offset] != size:
-                    return _UNSOLVED
-            value_batch = tuple(shape[:cut])
-        if batch is None:
-            batch = value_batch
-        elif value_batch != batch:
-            return _UNSOLVED
-    return batch

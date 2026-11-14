@@ -11,6 +11,38 @@ development (0.0.x) is untracked; see the git history.
   `Struct[Struct[Cls, A], B]` is the same annotation as `Struct[Cls, A, B]`.
   This supports batching an existing transformed description while keeping
   the original value classes and the written transformation order.
+* `Replace` changes named field annotations; `Map` transforms numerical
+  leaf annotations through nested structs and containers. A map may insert
+  a struct at a leaf, and subsequent maps traverse its fields.
+* `Batch[annotation, dims]` describes leading batch axes. Mapping it over
+  leaves is equivalent to batch-string shorthand; consecutive strings
+  combine in prepend order.
+* `.check(annotation)` checks a value without changing it. `.check()` uses
+  the exact default element description. Explicit `Struct` annotations
+  also work with jaxtyping/beartype function-boundary checking.
+* `.as_batch(shape=...)` provides an explicit indexing interpretation for
+  values whose element shapes have changed. Views keep the value classes
+  and share arrays. Indexing updates hints, while replacement and generic
+  JAX reconstruction discard them.
+
+### Changed (breaking)
+
+* Constructors and `.replace` assign values without validation. The
+  decorator's `check=` option is removed. Use explicit checks or checked
+  function boundaries to enforce an annotation.
+* `astype` and `mapped` annotation helpers are removed in favour of
+  `Replace` and `Map`.
+* Numerical array fields require jaxtyping annotations. Bare `jax.Array`
+  and `numpy.ndarray` annotations are rejected when descriptions are
+  compiled; explicitly variadic annotations remain available.
+* Transformed descriptions are supported in fields, including checkpoint
+  restoration through those declared descriptions.
+* Default batch inference uses shape and structure independently of dtype
+  checking. It reads current fields rather than caching a result on a
+  potentially mutable nested container.
+* Element dimension names are local to each struct occurrence. Outer batch
+  names can connect function arguments and returns, and failed checks and
+  union alternatives do not leave dimension bindings behind.
 
 ### Fixed
 

@@ -37,11 +37,14 @@ try:
     from safetensors import numpy as safetensors_numpy
     from safetensors import safe_open
 except ImportError:
+
     @dataclasses.dataclass
     class _MissingDependency:
         message: str
+
         def __getattr__(self, name: str):
             raise ImportError(self.message)
+
         def __call__(self, *args, **kwargs):
             raise ImportError(self.message)
 
@@ -66,16 +69,14 @@ def _keypath_to_str(keypath) -> str:
     """
     parts = []
     for key in keypath:
-        if hasattr(key, 'name'):       # GetAttrKey (dataclass field)
+        if hasattr(key, "name"):  # GetAttrKey (dataclass field)
             parts.append(key.name)
-        elif hasattr(key, 'key'):       # DictKey
+        elif hasattr(key, "key"):  # DictKey
             parts.append(repr(key.key))
-        elif hasattr(key, 'idx'):       # SequenceKey (list/tuple)
+        elif hasattr(key, "idx"):  # SequenceKey (list/tuple)
             parts.append(repr(key.idx))
         else:
-            raise TypeError(
-                f"Unsupported key type {type(key).__name__} in path"
-            )
+            raise TypeError(f"Unsupported key type {type(key).__name__} in path")
     return "/".join(parts)
 
 
@@ -94,9 +95,7 @@ def to_dict(tree) -> dict[str, np.ndarray]:
     for path, leaf in paths_and_leaves:
         key = _keypath_to_str(path)
         if key in d:
-            raise ValueError(
-                f"Key clash in to_dict: {key!r} appears more than once"
-            )
+            raise ValueError(f"Key clash in to_dict: {key!r} appears more than once")
         d[key] = np.asarray(leaf)
     return d
 
@@ -170,7 +169,7 @@ def _collect_metadata(tree, d, record_dtypes):
     return meta
 
 
-def _collect_class_meta(obj, path, meta):
+def _collect_class_meta(obj, path, meta, fields=None):
     """
     Record a dataclass node's identity, its literal statics, and structure
     tags beneath it. Walks the *value's* dynamic type, mirroring how
@@ -178,7 +177,7 @@ def _collect_class_meta(obj, path, meta):
     """
     cls = type(obj)
     meta[_meta_key("class", path)] = _fullname(cls)
-    field_specs = schema(cls).fields
+    field_specs = schema(cls).fields if fields is None else fields
     for field in dataclasses.fields(cls):
         field_path = f"{path}/{field.name}" if path else field.name
         value = getattr(obj, field.name)
@@ -191,10 +190,27 @@ def _collect_class_meta(obj, path, meta):
 
 
 def _collect_value_meta(value, spec, path, meta):
+    from strux.annotate import _BatchSpec, _fields
+
+    if isinstance(spec, _BatchSpec):
+        _collect_value_meta(value, spec.element, path, meta)
+        return
+    if (
+        not isinstance(spec, _UnionSpec)
+        and dataclasses.is_dataclass(value)
+        and not isinstance(value, type)
+    ):
+        fields = (
+            _fields(type(value), spec.transforms)
+            if isinstance(spec, _ClassSpec) and spec.transforms
+            else None
+        )
+        _collect_class_meta(value, path, meta, fields=fields)
+        return
     if isinstance(spec, _UnionSpec):
         arm = _match_arm(value, spec)
         if arm is None:
-            return  # validated values always match an arm; stay silent
+            return  # No union arm describes this transformed value.
         meta[_meta_key("arm", path)] = _arm_token(arm)
         _collect_value_meta(value, arm, path, meta)
     elif isinstance(spec, _ClassSpec):
@@ -204,25 +220,30 @@ def _collect_value_meta(value, spec, path, meta):
         if spec.kind == "dict":
             for key, item in value.items():
                 _collect_value_meta(
-                    item, spec.elems[0], f"{path}/{key!r}", meta,
+                    item,
+                    spec.elems[0],
+                    f"{path}/{key!r}",
+                    meta,
                 )
         elif spec.kind == "tuple":
             for i, (item, elem_spec) in enumerate(zip(value, spec.elems)):
                 _collect_value_meta(item, elem_spec, f"{path}/{i}", meta)
-        else:   # list, tuple_variadic
+        else:  # list, tuple_variadic
             for i, item in enumerate(value):
                 _collect_value_meta(item, spec.elems[0], f"{path}/{i}", meta)
     # array, scalar, and None leaves carry no structure
 
 
 def _match_arm(value, spec):
-    """The arm of a union spec that this value was validated under."""
+    """Choose a structural union arm for checkpoint metadata."""
     if value is None:
         return next(
-            (arm for arm in spec.arms if isinstance(arm, _NoneSpec)), None,
+            (arm for arm in spec.arms if isinstance(arm, _NoneSpec)),
+            None,
         )
     class_arms = [
-        arm for arm in spec.arms
+        arm
+        for arm in spec.arms
         if isinstance(arm, _ClassSpec) and isinstance(value, arm.cls)
     ]
     if class_arms:
@@ -244,14 +265,16 @@ def _match_arm(value, spec):
             None,
         )
         array_arm = next(
-            (arm for arm in spec.arms if isinstance(arm, _ArraySpec)), None,
+            (arm for arm in spec.arms if isinstance(arm, _ArraySpec)),
+            None,
         )
         if isinstance(value, (bool, int, float, complex)) and scalar_arm:
             return scalar_arm
         return array_arm or scalar_arm
     return next(
         (
-            arm for arm in spec.arms
+            arm
+            for arm in spec.arms
             if isinstance(arm, _ContainerSpec) and arm.kind in kinds
         ),
         None,
@@ -342,9 +365,7 @@ def _narrow_class_arms(arms, recorded):
     exact = [arm for arm in arms if _fullname(arm.cls) == recorded]
     if exact:
         return exact
-    resolving = [
-        arm for arm in arms if _find_subclass(arm.cls, recorded) is not None
-    ]
+    resolving = [arm for arm in arms if _find_subclass(arm.cls, recorded) is not None]
     for arm in resolving:
         if all(issubclass(arm.cls, other.cls) for other in resolving):
             return [arm]
@@ -405,9 +426,7 @@ def from_dict(d: dict, *, template, statics=None, meta=None):
         built, consumed = _build_from_dict(cls, d, statics or {}, "", meta)
         extra = d.keys() - consumed
         if extra:
-            raise KeyError(
-                f"Key mismatch in from_dict: extra keys: {sorted(extra)}"
-            )
+            raise KeyError(f"Key mismatch in from_dict: extra keys: {sorted(extra)}")
         return built
     if statics is not None:
         raise TypeError(
@@ -442,10 +461,9 @@ def from_dict(d: dict, *, template, statics=None, meta=None):
                 )
                 leaves.append(leaf)
         elif hasattr(leaf, "shape") and hasattr(leaf, "dtype"):
-            if (
-                tuple(saved.shape) != tuple(leaf.shape)
-                or np.dtype(saved.dtype) != np.dtype(leaf.dtype)
-            ):
+            if tuple(saved.shape) != tuple(leaf.shape) or np.dtype(
+                saved.dtype
+            ) != np.dtype(leaf.dtype):
                 mismatches.append(
                     f"{key!r}: template expects "
                     f"{np.dtype(leaf.dtype).name}{list(leaf.shape)}, saved "
@@ -496,16 +514,14 @@ def _check_template_structure(template, meta):
         )
 
 
-def _build_from_dict(cls, d, statics, prefix, meta):
+def _build_from_dict(cls, d, statics, prefix, meta, fields=None):
     """
     Build an instance of a struct class from saved leaves, guided by its
     schema. Returns (instance, set of consumed keys).
     """
     if not dataclasses.is_dataclass(cls):
-        raise TypeError(
-            f"template class {cls.__name__} is not a struct/dataclass"
-        )
-    field_specs = schema(cls).fields
+        raise TypeError(f"template class {cls.__name__} is not a struct/dataclass")
+    field_specs = schema(cls).fields if fields is None else fields
     values = {}
     consumed = set()
     for field in dataclasses.fields(cls):
@@ -536,6 +552,10 @@ def _build_from_dict(cls, d, statics, prefix, meta):
 
 
 def _build_value(spec, d, statics, path, meta):
+    from strux.annotate import _BatchSpec, _fields
+
+    if isinstance(spec, _BatchSpec):
+        return _build_value(spec.element, d, statics, path, meta)
     if isinstance(spec, _ArraySpec):
         if path not in d:
             raise KeyError(f"missing saved array for {path!r}")
@@ -556,7 +576,8 @@ def _build_value(spec, d, statics, path, meta):
         matching = [arm for arm in spec.arms if _arm_token(arm) == token]
         if token == "class":
             matching = _narrow_class_arms(
-                matching, meta.get(_meta_key("class", path)),
+                matching,
+                meta.get(_meta_key("class", path)),
             )
         if not matching:
             raise TypeError(
@@ -572,7 +593,14 @@ def _build_value(spec, d, statics, path, meta):
     elif isinstance(spec, _ClassSpec):
         cls = _resolve_class(spec.cls, meta, path)
         if dataclasses.is_dataclass(cls):
-            return _build_from_dict(cls, d, statics, f"{path}/", meta)
+            return _build_from_dict(
+                cls,
+                d,
+                statics,
+                f"{path}/",
+                meta,
+                fields=_fields(cls, spec.transforms) if spec.transforms else None,
+            )
         raise TypeError(
             f"{path!r}: cannot reconstruct a {cls.__name__} from a "
             "class template (the saved value's concrete type is unknown); "
@@ -585,7 +613,7 @@ def _build_value(spec, d, statics, path, meta):
         segments = []
         for key in d:
             if key.startswith(child_prefix):
-                segment = key[len(child_prefix):].split("/", 1)[0]
+                segment = key[len(child_prefix) :].split("/", 1)[0]
                 if segment not in segments:
                     segments.append(segment)
         consumed = set()
@@ -594,16 +622,18 @@ def _build_value(spec, d, statics, path, meta):
             for segment in segments:
                 dict_key = _ast_literal(segment, path)
                 value, keys = _build_value(
-                    spec.elems[0], d, statics, f"{path}/{segment}", meta,
+                    spec.elems[0],
+                    d,
+                    statics,
+                    f"{path}/{segment}",
+                    meta,
                 )
                 out[dict_key] = value
                 consumed |= keys
             return out, consumed
         indices = sorted(int(segment) for segment in segments)
         if indices != list(range(len(indices))):
-            raise KeyError(
-                f"{path!r}: saved indices {indices} are not contiguous"
-            )
+            raise KeyError(f"{path!r}: saved indices {indices} are not contiguous")
         if spec.kind == "tuple":
             if len(indices) != len(spec.elems):
                 raise KeyError(
@@ -655,9 +685,7 @@ def _infer_union_arm(spec, arms, d, statics, path, meta):
                     f"as {arm}: does not explain saved keys "
                     f"{sorted(keys_below - consumed)}"
                 )
-    if not keys_below and any(
-        isinstance(arm, _NoneSpec) for arm in arms
-    ):
+    if not keys_below and any(isinstance(arm, _NoneSpec) for arm in arms):
         candidates.append(("None", None, set()))
     if len(candidates) > 1:
         arm_names = ", ".join(name for name, _, _ in candidates)
@@ -668,7 +696,7 @@ def _infer_union_arm(spec, arms, d, statics, path, meta):
             "saved — restore with an instance template"
         )
     if candidates:
-        (_, value, consumed), = candidates
+        ((_, value, consumed),) = candidates
         return value, consumed
     if failures:
         raise KeyError(
@@ -682,9 +710,7 @@ def _ast_literal(segment, path):
     try:
         return ast.literal_eval(segment)
     except (ValueError, SyntaxError):
-        raise KeyError(
-            f"{path!r}: cannot parse saved dict key segment {segment!r}"
-        )
+        raise KeyError(f"{path!r}: cannot parse saved dict key segment {segment!r}")
 
 
 # # #
@@ -762,8 +788,7 @@ def save(path, tree, *, fmt=None, overwrite=False):
     # check for existing file to prevent silent data loss
     if not overwrite and os.path.exists(dest):
         raise FileExistsError(
-            f"File already exists: {dest!r}. "
-            f"Pass overwrite=True to replace it."
+            f"File already exists: {dest!r}. " f"Pass overwrite=True to replace it."
         )
     d = to_dict(tree)
     is_npz = fmt in ("savez", "savez_compressed")
@@ -784,7 +809,9 @@ def save(path, tree, *, fmt=None, overwrite=False):
         if fmt == "savez_compressed":
             with os.fdopen(fd, "wb") as f:
                 np.savez_compressed(
-                    f, **d, **{_NPZ_METADATA_KEY: np.array(repr(meta))},
+                    f,
+                    **d,
+                    **{_NPZ_METADATA_KEY: np.array(repr(meta))},
                 )
         elif fmt == "savez":
             with os.fdopen(fd, "wb") as f:

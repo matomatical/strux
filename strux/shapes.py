@@ -3,6 +3,9 @@ Shapes and indexing for (batched) structs: the batch shape, symbolic dim
 binding, batch indexing, and total leaf count.
 """
 
+import numbers
+import operator
+
 import jax
 import jax.numpy as jnp
 
@@ -20,19 +23,15 @@ def tree_shape(tree) -> tuple[int, ...]:
     Return the batch shape of a struct: the leading dimensions beyond each
     field's element annotation.
 
-    The batch shape is solved from the schema (see `strux.schema`): each
-    field constrains the possible batch shapes, and all data fields must
-    agree. Fields whose element rank is unknown (leading-variadic
-    annotations, bare array classes, abstract pytree classes) and
-    batch-agnostic values (python scalars, None) are consistent with many
-    batch shapes; if the fields that *do* determine ranks don't pin the
-    batch down to a single shape, this raises ValueError listing the
-    consistent candidates — annotate element dims on at least one field to
-    resolve it. A struct with only batch-agnostic values has batch shape ().
-
-    The solved candidates are cached on the instance (structs are
-    immutable), so repeated queries cost one attribute lookup.
+    Explicit hints take precedence. Otherwise every data field contributes
+    a shape constraint; dtype changes do not prevent batch access. If
+    variadic annotations leave more than one possible batch shape, supply
+    .as_batch(shape=...) to choose the intended prefix. Empty trees default
+    to shape (). Inference reads current fields without storing a cache.
     """
+    hint = getattr(tree, "_strux_batch_shape", None)
+    if hint is not None:
+        return hint
     candidates = _solved_candidates(tree)
     if candidates is _TOP:
         return ()
@@ -41,7 +40,7 @@ def tree_shape(tree) -> tuple[int, ...]:
     raise ValueError(
         f"{type(tree).__name__}: batch shape under-determined: consistent "
         f"candidates {_format_candidates(candidates)}; annotate "
-        "element dims on at least one field to determine the batch shape"
+        "element dims or use .as_batch(shape=...) to choose the batch shape"
     )
 
 
@@ -52,8 +51,8 @@ def tree_dims(tree) -> dict:
     "n_in n_out"]` and `biases: Float[Array, "n_out"]` and `tree_dims(net)`
     returns `{"n_in": ..., "n_out": ...}`.
 
-    Names are scoped to the class whose annotations mention them (checked
-    at construction): nested struct fields bind their own names at their
+    Names are scoped to each occurrence of the declaring class:
+    nested struct fields bind their own names at their
     own level, so this query returns only the names in `type(tree)`'s own
     annotations — call it on a nested struct to read that struct's names.
     """
@@ -84,24 +83,91 @@ def tree_getitem(tree, index):
             f"{type(tree).__name__} is not batched (batch shape ()): "
             "there are no batch dimensions to index into"
         )
-    if isinstance(index, tuple):
-        if len(index) > len(batch):
+    indices = index if isinstance(index, tuple) else (index,)
+    if sum(item is Ellipsis for item in indices) > 1:
+        raise IndexError("only one ellipsis is allowed")
+    consumed = sum(_index_axes(item) for item in indices)
+    if consumed > len(batch):
+        raise IndexError(f"too many indices for batch shape {batch}")
+    expanded = []
+    for item in indices:
+        if item is Ellipsis:
+            expanded.extend([slice(None)] * (len(batch) - consumed))
+        else:
+            expanded.append(item)
+    if not any(item is Ellipsis for item in indices):
+        expanded.extend([slice(None)] * (len(batch) - consumed))
+    axis = 0
+    for item in expanded:
+        consumed_axes = _index_axes(item)
+        if consumed_axes == 0:
+            continue
+        if (
+            isinstance(item, numbers.Integral)
+            and not -batch[axis] <= item < batch[axis]
+        ):
             raise IndexError(
-                f"too many indices for batch shape {batch}: {index!r}"
+                f"index {item} out of bounds for batch axis {axis} of {type(tree).__name__} with batch shape {batch}"
             )
-        for axis, subindex in enumerate(index):
-            _check_bounds(tree, subindex, batch, axis)
-    else:
-        _check_bounds(tree, index, batch, axis=0)
-    return jax.tree.map(lambda x: x[index], tree)
+        axis += consumed_axes
+    prefix_index = tuple(expanded)
+    # Shape-only tracing avoids allocating an array the size of the batch.
+    result_shape = jax.eval_shape(
+        lambda placeholder: placeholder[prefix_index],
+        jax.ShapeDtypeStruct(batch, jnp.int8),
+    ).shape
+    result = jax.tree.map(lambda leaf: leaf[prefix_index], tree)
+    if getattr(tree, "_strux_batch_shape", None) is not None:
+        result = as_batch(result, shape=result_shape)
+    return result
 
 
-def _check_bounds(tree, index, batch, axis):
-    if isinstance(index, int) and not -batch[axis] <= index < batch[axis]:
-        raise IndexError(
-            f"index {index} out of bounds for batch axis {axis} of "
-            f"{type(tree).__name__} with batch shape {batch}"
+def _index_axes(index):
+    if index is None or index is Ellipsis:
+        return 0
+    if isinstance(index, bool) or getattr(index, "dtype", None) == jnp.bool_:
+        return getattr(index, "ndim", 0)
+    return 1
+
+
+def as_batch(tree, *, shape):
+    """Return a same-class copy with an explicit leading batch shape.
+
+    Array data is shared. Hints govern batch access, do not validate an
+    annotation, and are discarded by generic JAX tree reconstruction and
+    dataclass replacement. Nested structs receive the same prefix hint.
+    """
+    if not hasattr(type(tree), "_data_fields"):
+        raise TypeError("as_batch expects a strux struct")
+    shape = tuple(shape)
+    if any(isinstance(size, bool) for size in shape):
+        raise TypeError("batch sizes must be integers, not booleans")
+    try:
+        shape = tuple(operator.index(size) for size in shape)
+    except TypeError:
+        raise TypeError("batch shape must contain concrete integer sizes") from None
+    if any(size < 0 for size in shape):
+        raise ValueError("batch dimensions must be nonnegative")
+    for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]:
+        leaf_shape = getattr(leaf, "shape", ())
+        if tuple(leaf_shape[: len(shape)]) != shape:
+            raise ValueError(
+                f"{jax.tree_util.keystr(path)}: shape {leaf_shape} does not have batch prefix {shape}"
+            )
+
+    def clone(node):
+        children, definition = jax.tree_util.tree_flatten(
+            node,
+            is_leaf=lambda child: child is not node,
         )
+        if definition.num_nodes == 1 and definition.num_leaves == 1:
+            return node
+        copied = jax.tree.unflatten(definition, [clone(child) for child in children])
+        if hasattr(type(copied), "_data_fields"):
+            object.__setattr__(copied, "_strux_batch_shape", shape)
+        return copied
+
+    return clone(tree)
 
 
 def tree_len(tree) -> int:

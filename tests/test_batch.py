@@ -1,7 +1,4 @@
-"""
-Tests for the batch-shape solver: batch-tolerant constructor checking and
-schema-driven construction and batch inference.
-"""
+"""Batch shape inference, explicit validation and JAX interoperability."""
 
 import jax
 import jax.numpy as jnp
@@ -13,20 +10,15 @@ import strux
 
 from example_structs import Environment
 
-
 # # #
-# Batch-tolerant constructor checking
+# Polymorphic construction and explicit checking
 
 
-class TestCheckedConstruction:
-    """
-    Construction validates against the schema: dtype kind and trailing
-    (element) dims are enforced, leading batch dims are free but must
-    agree across fields. The checking is strux's own — the @jaxtyped
-    wrapper left on some tests here documents that external checkers
-    wrapping the constructor (as jaxtyping's import hook does to every
-    class in a checked module) find nothing to enforce and do not
-    interfere with batched construction.
+class TestConstructionAndChecking:
+    """Construction is polymorphic; explicit checks enforce descriptions.
+
+    Class-level jaxtyped wrappers must not turn generated constructors into
+    element-only validators. Native JAX transformations remain ordinary.
     """
 
     def test_element_construction_passes(self):
@@ -44,7 +36,7 @@ class TestCheckedConstruction:
             weight: Float[Array, ""]
 
         with pytest.raises(Exception):
-            Goal(weight=jnp.int32(1))
+            Goal(weight=jnp.int32(1)).check(strux.Struct[Goal, "..."])
 
     def test_batched_leaves_pass(self):
         # for a rank-0 field every shape is a legal batch shape
@@ -61,12 +53,14 @@ class TestCheckedConstruction:
         class Path:
             points: Float[Array, "n 2"]
 
-        Path(points=jnp.ones((5, 2)))        # element
-        Path(points=jnp.ones((7, 5, 2)))     # batch of 7
+        Path(points=jnp.ones((5, 2)))  # element
+        Path(points=jnp.ones((7, 5, 2)))  # batch of 7
         with pytest.raises(Exception):
-            Path(points=jnp.ones((5,)))      # rank too low
+            Path(points=jnp.ones((5,))).check(strux.Struct[Path, "..."])  # rank too low
         with pytest.raises(Exception):
-            Path(points=jnp.ones((7, 5, 3))) # trailing dim mismatch
+            Path(points=jnp.ones((7, 5, 3))).check(
+                strux.Struct[Path, "..."]
+            )  # trailing dim mismatch
 
     def test_vmap_construction_passes(self):
         @jaxtyped(typechecker=beartype)
@@ -122,9 +116,11 @@ class TestCheckedConstruction:
 
         Pair(u=jnp.ones(3), v=jnp.ones(3))
         with pytest.raises(Exception):
-            Pair(u=jnp.ones(3), v=jnp.ones(4))
+            Pair(u=jnp.ones(3), v=jnp.ones(4)).check(strux.Struct[Pair, "..."])
         with pytest.raises(Exception):
-            Pair(u=jnp.ones(3), v=jnp.float32(1.0))  # partially batched
+            Pair(u=jnp.ones(3), v=jnp.float32(1.0)).check(
+                strux.Struct[Pair, "..."]
+            )  # partially batched
 
     def test_user_dim_named_batch_no_collision(self):
         # a regular dim that the user names "batch" is independent of the
@@ -150,7 +146,9 @@ class TestCheckedConstruction:
         Config(coeff=0.5)
         Config(coeff=jnp.ones(3))
         with pytest.raises(Exception):
-            Config(coeff=jnp.ones(3, dtype=jnp.int32))
+            Config(coeff=jnp.ones(3, dtype=jnp.int32)).check(
+                strux.Struct[Config, "..."]
+            )
 
     def test_scalar_field_batch_constraints(self):
         # a python scalar is one element's worth of data (batch () only);
@@ -165,9 +163,9 @@ class TestCheckedConstruction:
         Config(coeff=0.5, u=jnp.float32(1.0))
         Config(coeff=jnp.ones(3), u=jnp.ones(3))
         with pytest.raises(Exception):
-            Config(coeff=0.5, u=jnp.ones(3))
+            Config(coeff=0.5, u=jnp.ones(3)).check(strux.Struct[Config, "..."])
         with pytest.raises(Exception):
-            Config(coeff=jnp.ones(4), u=jnp.ones(3))
+            Config(coeff=jnp.ones(4), u=jnp.ones(3)).check(strux.Struct[Config, "..."])
 
     def test_static_field_not_runtime_checked(self):
         # static fields are metadata: their annotations are for static
@@ -178,7 +176,7 @@ class TestCheckedConstruction:
             label: str
 
         Config(coeff=jnp.float32(1.0), label="ok")
-        Config(coeff=jnp.float32(1.0), label=42)    # not rejected
+        Config(coeff=jnp.float32(1.0), label=42)  # not rejected
 
     def test_variadic_annotation_left_alone(self):
         @jaxtyped(typechecker=beartype)
@@ -188,22 +186,23 @@ class TestCheckedConstruction:
 
         History(values=jnp.ones((2, 3, 4)))
         with pytest.raises(Exception):
-            History(values=jnp.ones((2, 3, 4), dtype=jnp.int32))
+            History(values=jnp.ones((2, 3, 4), dtype=jnp.int32)).check(
+                strux.Struct[History, "..."]
+            )
 
 
 # # #
-# Schema-driven construction and batch inference
+# Default element shapes and batch inference
 
 
 class TestSchemaSolver:
-    def test_unannotated_array_pinned_by_sibling(self):
-        # a bare jax.Array field gives only a prefix constraint; a
-        # rank-determined sibling pins the batch and the bare field
-        # participates fully
+    def test_variadic_array_pinned_by_sibling(self):
+        # A variadic array annotation leaves its rank unspecified; a
+        # rank-determined sibling can pin the common batch prefix.
         @strux.struct
         class WithAux:
             walls: Bool[Array, "h w"]
-            aux: jax.Array
+            aux: Float[Array, "..."]
 
         unbatched = WithAux(walls=jnp.zeros((5, 5), bool), aux=jnp.zeros((7, 3)))
         assert unbatched.shape == ()
@@ -212,8 +211,10 @@ class TestSchemaSolver:
             aux=jnp.zeros((4, 7, 3)),
         )
         assert batched.shape == (4,)
-        with pytest.raises(strux.ValidationError, match="inconsistent batch"):
-            WithAux(walls=jnp.zeros((4, 5, 5), bool), aux=jnp.zeros((3, 7)))
+        with pytest.raises(strux.ValidationError, match="WithAux.aux"):
+            WithAux(walls=jnp.zeros((4, 5, 5), bool), aux=jnp.zeros((3, 7))).check(
+                strux.Struct[WithAux, "..."]
+            )
 
     def test_underdetermined_shape_raises(self):
         @strux.struct
@@ -235,7 +236,7 @@ class TestSchemaSolver:
         batched = Opt(momentum=jnp.zeros((8, 5)), count=jnp.zeros(8, jnp.int32))
         assert batched.shape == (8,)
         with pytest.raises(strux.ValidationError, match="no arm"):
-            Opt(momentum="hello", count=jnp.int32(0))
+            Opt(momentum="hello", count=jnp.int32(0)).check(strux.Struct[Opt, "..."])
 
     def test_rank_ambiguous_union_disambiguated_by_sibling(self):
         @strux.struct
@@ -266,12 +267,14 @@ class TestSchemaSolver:
         assert isinstance(b, strux.Struct[Scaled, "batch"])
         assert not isinstance(s, strux.Struct[Scaled, "batch"])
         with pytest.raises(strux.ValidationError):
-            Scaled(coeff=jnp.zeros(3, dtype=int), walls=jnp.zeros((3, 5, 5)))
+            Scaled(coeff=jnp.zeros(3, dtype=int), walls=jnp.zeros((3, 5, 5))).check(
+                strux.Struct[Scaled, "..."]
+            )
 
     def test_container_fields(self):
         @strux.struct
         class Bank:
-            layers: tuple[Float[Array, "_"], ...]   # "_": ragged elements allowed
+            layers: tuple[Float[Array, "_"], ...]  # "_": ragged elements allowed
             table: dict[str, Float[Array, "2"]]
 
         bank = Bank(
@@ -286,13 +289,15 @@ class TestSchemaSolver:
         assert batched.shape == (4,)
         assert isinstance(batched, strux.Struct[Bank, "batch"])
         assert not isinstance(bank, strux.Struct[Bank, "batch"])
-        with pytest.raises(strux.ValidationError, match="inconsistent batch"):
+        with pytest.raises(strux.ValidationError, match="expected"):
             Bank(
                 layers=(jnp.zeros((4, 3)), jnp.zeros((3, 5))),
                 table={},
-            )
+            ).check(strux.Struct[Bank, "..."])
         with pytest.raises(strux.ValidationError):
-            Bank(layers=(jnp.zeros(3),), table={"a": jnp.zeros(7)})
+            Bank(layers=(jnp.zeros(3),), table={"a": jnp.zeros(7)}).check(
+                strux.Struct[Bank, "..."]
+            )
 
     def test_fixed_tuple_field(self):
         @strux.struct
@@ -300,8 +305,8 @@ class TestSchemaSolver:
             bounds: tuple[Float[Array, ""], Int[Array, "2"]]
 
         Pair(bounds=(jnp.float32(0.0), jnp.zeros(2, jnp.int32)))
-        with pytest.raises(strux.ValidationError, match="length"):
-            Pair(bounds=(jnp.float32(0.0),))
+        with pytest.raises(strux.ValidationError, match="tuple entries"):
+            Pair(bounds=(jnp.float32(0.0),)).check(strux.Struct[Pair, "..."])
 
     def test_polymorphic_class_field(self):
         # an abstract (non-struct) base annotation: instances are checked
@@ -322,8 +327,8 @@ class TestSchemaSolver:
         batched = Sum(terms=(Constant(value=jnp.zeros(4)),))
         assert batched.shape == (4,)
         assert isinstance(batched, strux.Struct[Sum, "batch"])
-        with pytest.raises(strux.ValidationError, match="expected an instance"):
-            Sum(terms=(jnp.zeros(3),))
+        with pytest.raises(strux.ValidationError, match="expected"):
+            Sum(terms=(jnp.zeros(3),)).check(strux.Struct[Sum, "..."])
 
     def test_base_annotation_subclass_value(self):
         # a field annotated with a struct base class holding a subclass
@@ -359,9 +364,9 @@ class TestSchemaSolver:
         # a batched struct holds arrays in its scalar-annotated fields
         assert Config(coeff=jnp.ones(3), u=jnp.ones(3)).shape == (3,)
         with pytest.raises(strux.ValidationError):
-            Config(coeff=0.5, u=jnp.ones(3))
+            Config(coeff=0.5, u=jnp.ones(3)).check(strux.Struct[Config, "..."])
         with pytest.raises(strux.ValidationError):
-            Config(coeff=jnp.ones(4), u=jnp.ones(3))
+            Config(coeff=jnp.ones(4), u=jnp.ones(3)).check(strux.Struct[Config, "..."])
 
     def test_vjp_through_struct_with_int_field(self):
         # autodiff produces float0 cotangents for integer leaves; the
@@ -372,7 +377,7 @@ class TestSchemaSolver:
             count: Int[Array, ""]
 
         def loss(m):
-            return jnp.sum(m.w ** 2)
+            return jnp.sum(m.w**2)
 
         m = Mixed(w=jnp.ones(3), count=jnp.int32(2))
         _, vjp_fn = jax.vjp(loss, m)
@@ -467,15 +472,18 @@ class TestStackedFields:
             plain: Linear
 
         plain = Linear(weights=jnp.zeros((8, 8)))
-        assert Symbolic(
-            stack=Linear(weights=jnp.zeros((5, 8, 8))), plain=plain
-        ).shape == ()
-        assert TwoTokens(
-            stack=Linear(weights=jnp.zeros((2, 5, 8, 8))), plain=plain
-        ).shape == ()
-        assert Variadic(
-            stack=Linear(weights=jnp.zeros((2, 5, 8, 8))), plain=plain
-        ).shape == ()
+        assert (
+            Symbolic(stack=Linear(weights=jnp.zeros((5, 8, 8))), plain=plain).shape
+            == ()
+        )
+        assert (
+            TwoTokens(stack=Linear(weights=jnp.zeros((2, 5, 8, 8))), plain=plain).shape
+            == ()
+        )
+        assert (
+            Variadic(stack=Linear(weights=jnp.zeros((2, 5, 8, 8))), plain=plain).shape
+            == ()
+        )
 
     def test_declared_dims_that_do_not_fit_are_rejected(self):
         @strux.struct
@@ -487,13 +495,11 @@ class TestStackedFields:
             QKV: strux.Struct[Linear, "3"]
             output: Linear
 
-        with pytest.raises(
-            strux.ValidationError, match="expected element dims matching"
-        ):
+        with pytest.raises(strux.ValidationError, match="Attention.QKV.weights"):
             Attention(
                 QKV=Linear(weights=jnp.zeros((5, 8, 8))),
                 output=Linear(weights=jnp.zeros((8, 8))),
-            )
+            ).check(strux.Struct[Attention, "..."])
 
     def test_scan_over_a_stacked_depth_field(self):
         # the motivating case: per-layer parameters stacked for lax.scan,

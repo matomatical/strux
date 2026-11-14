@@ -11,7 +11,6 @@ import strux
 
 from example_structs import Environment, Point, World
 
-
 # # #
 # Batch shape
 
@@ -69,15 +68,18 @@ class TestShape:
         assert world.shape == (4,)
 
     def test_inconsistent_batch_raises(self):
-        # checked construction refuses inconsistent batch shapes outright
+        # Shape queries reject inconsistent batch prefixes.
         with pytest.raises(strux.ValidationError, match="inconsistent batch"):
-            Environment(
-                hero_pos=jnp.ones((3, 2), dtype=jnp.int32),
-                goal_pos=jnp.ones((4, 2), dtype=jnp.int32),
-                walls=jnp.zeros((3, 5, 5), dtype=bool),
+            strux.tree_dims(
+                Environment(
+                    hero_pos=jnp.ones((3, 2), dtype=jnp.int32),
+                    goal_pos=jnp.ones((4, 2), dtype=jnp.int32),
+                    walls=jnp.zeros((3, 5, 5), dtype=bool),
+                )
             )
+
         # .shape raises the same for an unchecked inconsistent struct
-        @strux.struct(check=False)
+        @strux.struct
         class LoosePair:
             u: Float[Array, ""]
             v: Float[Array, ""]
@@ -88,6 +90,7 @@ class TestShape:
 
     def test_shape_field_collision_warns(self):
         with pytest.warns(UserWarning, match="field named 'shape'"):
+
             @strux.struct
             class HasShape:
                 shape: int
@@ -241,25 +244,26 @@ class TestLenIter:
 
 
 # # #
-# Solved-batch caching
+# Shape queries on constructed and transformed values
 
 
-class TestSolutionCache:
-    def test_shape_cached_at_construction(self):
+class TestShapeQueries:
+    def test_shape_query_does_not_mutate_instance(self):
         batched = Point(x=jnp.arange(4.0), y=jnp.ones(4))
         assert batched.shape == (4,)
-        # validation stored the solution: no field access needed to answer
-        assert batched.__dict__["_strux_candidates"] == frozenset({(4,)})
+        # Shape queries leave the object unchanged.
+        assert set(batched.__dict__) == {"x", "y"}
 
-    def test_unflattened_instances_solve_lazily(self):
+    def test_unflattened_instances_compute_current_shape(self):
         import jax
+
         batched = Point(x=jnp.arange(4.0), y=jnp.ones(4))
-        doubled = jax.tree.map(lambda a: a * 2, batched)   # bypasses init
+        doubled = jax.tree.map(lambda a: a * 2, batched)  # bypasses init
         assert "_strux_candidates" not in doubled.__dict__
         assert doubled.shape == (4,)
-        assert "_strux_candidates" in doubled.__dict__
+        assert "_strux_candidates" not in doubled.__dict__
 
-    def test_nested_construction_uses_child_cache(self):
+    def test_nested_values_compute_consistent_shapes(self):
         world = World(
             env=Environment(
                 hero_pos=jnp.ones((4, 2), dtype=jnp.int32),
@@ -287,7 +291,7 @@ class TestTreeDims:
         assert strux.tree_dims(net) == {"n_in": 4, "n_out": 8}
 
     def test_inconsistent_names_raise(self):
-        @strux.struct(check=False)
+        @strux.struct
         class Affine:
             weights: Float[Array, "n_in n_out"]
             biases: Float[Array, "n_out"]
@@ -296,9 +300,9 @@ class TestTreeDims:
         with pytest.raises(strux.ValidationError, match="inconsistent dim 'n_out'"):
             strux.tree_dims(broken)
 
-    def test_construction_enforces_names(self):
+    def test_dimension_query_enforces_names(self):
         # a name takes one consistent size across the class's fields,
-        # checked at construction
+        # checked by an explicit dimension query
         @strux.struct
         class Affine:
             weights: Float[Array, "n_in n_out"]
@@ -306,9 +310,9 @@ class TestTreeDims:
 
         Affine(weights=jnp.ones((4, 8)), biases=jnp.zeros(8))
         with pytest.raises(strux.ValidationError, match="inconsistent dim 'n_out'"):
-            Affine(weights=jnp.ones((4, 8)), biases=jnp.zeros(3))
+            strux.tree_dims(Affine(weights=jnp.ones((4, 8)), biases=jnp.zeros(3)))
 
-    def test_batched_construction_binds_element_dims(self):
+    def test_batched_dimension_query_binds_element_dims(self):
         # names are trailing element dims: leading batch dims don't
         # interfere with the binding
         @strux.struct
@@ -318,7 +322,9 @@ class TestTreeDims:
 
         Affine(weights=jnp.ones((10, 4, 8)), biases=jnp.zeros((10, 8)))
         with pytest.raises(strux.ValidationError, match="inconsistent dim"):
-            Affine(weights=jnp.ones((10, 4, 8)), biases=jnp.zeros((10, 3)))
+            strux.tree_dims(
+                Affine(weights=jnp.ones((10, 4, 8)), biases=jnp.zeros((10, 3)))
+            )
 
     def test_anonymous_dims_do_not_bind(self):
         # "_" is jaxtyping's anonymous dim: it never binds, so ragged
@@ -340,7 +346,7 @@ class TestTreeDims:
 
     def test_names_scoped_per_class(self):
         # a name's scope is the class whose annotations mention it: nested
-        # structs bind their own names at their own construction, so two
+        # structs bind their own names per occurrence, so two
         # Layer fields (or elements) may take different sizes — the MLP
         # case (layer widths differ) constructs fine
         @strux.struct
@@ -354,11 +360,11 @@ class TestTreeDims:
         stack = Stack(
             layers=(Layer(w=jnp.ones((3, 3))), Layer(w=jnp.zeros((4, 4)))),
         )
-        assert strux.tree_dims(stack) == {}     # Stack mentions no names
+        assert strux.tree_dims(stack) == {}  # Stack mentions no names
         assert strux.tree_dims(stack.layers[1]) == {"n": 4}
         # within one Layer, its own names still bind
         with pytest.raises(strux.ValidationError, match="inconsistent dim 'n'"):
-            Layer(w=jnp.ones((3, 4)))
+            strux.tree_dims(Layer(w=jnp.ones((3, 4))))
 
     def test_container_elements_share_the_class_namespace(self):
         # container elements are part of this class's annotation: a named
@@ -371,4 +377,4 @@ class TestTreeDims:
 
         Bank(layers=(jnp.ones(3), jnp.zeros(3)), bias=jnp.ones(3))
         with pytest.raises(strux.ValidationError, match="inconsistent dim 'n'"):
-            Bank(layers=(jnp.ones(3), jnp.zeros(5)), bias=jnp.ones(3))
+            strux.tree_dims(Bank(layers=(jnp.ones(3), jnp.zeros(5)), bias=jnp.ones(3)))

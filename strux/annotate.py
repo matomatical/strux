@@ -1,420 +1,622 @@
-"""
-The Struct type form: `Struct[Cls, ...]` synthetic types whose isinstance
-checks verify a struct as the image of type-level transformations of its
-field annotations — batch dims prepended, dtypes changed, leaves collapsed.
+"""Composable descriptions of struct fields and explicit runtime checking.
 
-To static checkers (under typing.TYPE_CHECKING) `strux.Struct` is
-`typing.Annotated`, so the same expression is legal in annotation position:
-checkers see the underlying struct class and ignore the transformation
-arguments, which are metadata to them and instructions to this module.
+Struct descriptions retain ordinary value classes. Shape names declared by
+an element are local to each occurrence of that element; batch dimensions
+introduced by an outer description can connect checked arguments and returns.
 """
 
+import contextvars
 import dataclasses
 import functools
+import itertools
+import re
 import typing
 
 import jax
 import jaxtyping
-import numpy as np
 
 from strux.schema import (
-    schema,
     SchemaError,
     ValidationError,
+    schema,
+    _parse_hint,
     _ArraySpec,
     _PyScalarSpec,
     _NoneSpec,
     _ClassSpec,
     _ContainerSpec,
     _UnionSpec,
-    _scalar_spec,
 )
-from strux.batch import _TOP, _match_batch, _solved_candidates
 
 
-# # #
-# Functors
-#
-# A functor is the type-level shadow of a leaf-wise value transformation:
-# it says what happens to each field annotation. Two are built in, plus
-# dims strings:
-#
-#   "b t"          prepend these batch dims to every leaf (the image of
-#                  stacking/vmapping); "" asserts the element exactly
-#                  (rank-exact) and "..." allows any batch rank
-#   astype(kind)   every leaf keeps its dims but takes the scalar kind
-#                  (the image of e.g. tree.map(operator.eq, x, y))
-#   mapped(kind)   every leaf becomes a scalar of the kind (the image of
-#                  a full reduction, e.g. tree.map(jnp.array_equal, x, y)
-#                  or tree.map(jnp.count_nonzero, x))
-#
-# Struct[Cls, f1, f2, ...] applies the functors left to right (application
-# order). A constant map (mapped) absorbs everything before it, exactly as
-# the reduction it shadows would.
+@dataclasses.dataclass(frozen=True, init=False)
+class Replace:
+    """Replace named data-field annotations; preserve all other fields."""
 
+    fields: tuple
 
-_KIND_DTYPES = {
-    bool: jaxtyping.Bool,
-    int: jaxtyping.Int,
-    float: jaxtyping.Float,
-    complex: jaxtyping.Complex,
-}
+    def __init__(self, **fields):
+        object.__setattr__(self, "fields", tuple(fields.items()))
 
-
-def _require_scalar_kind(kind, functor_name):
-    if kind not in _KIND_DTYPES:
-        raise TypeError(
-            f"{functor_name} takes a python scalar class "
-            f"(bool, int, float, or complex), got {kind!r}"
-        )
+    def __repr__(self):
+        return "Replace(" + ", ".join(f"{k}={v!r}" for k, v in self.fields) + ")"
 
 
 @dataclasses.dataclass(frozen=True)
-class astype:
-    """
-    Functor: every array leaf keeps its dims but takes on the scalar kind
-    (python scalar leaves become that python scalar). The image of a
-    leaf-wise dtype-changing map, e.g. `tree.map(operator.eq, x, y)` has
-    type `Struct[Cls, astype(bool)]`.
+class Map:
+    """Apply a pure annotation callback once to each current numerical leaf.
+
+    A callback can introduce a subtree. The same Map does not revisit that
+    subtree; subsequent maps descend into it. Static fields and None are
+    not numerical leaves. Callbacks should not depend on invocation count.
     """
 
-    kind: type
+    function: typing.Callable
 
     def __post_init__(self):
-        _require_scalar_kind(self.kind, "astype")
-
-    def __repr__(self):
-        return f"astype({self.kind.__name__})"
+        if not callable(self.function):
+            raise TypeError("Map requires an annotation callable")
 
 
 @dataclasses.dataclass(frozen=True)
-class mapped:
-    """
-    Functor: every leaf becomes a scalar of the kind (a python scalar or a
-    rank-0 array, the same sugar as a plain scalar field annotation). The
-    image of a leaf-wise full reduction, e.g.
-    `tree.map(jnp.array_equal, x, y)` has type `Struct[Cls, mapped(bool)]`
-    and `tree.map(jnp.count_nonzero, x)` has type
-    `Struct[Cls, mapped(int)]`.
-    """
+class Batch:
+    """Prepend batch dimensions to an annotation: Batch[annotation, 'axes']."""
 
-    kind: type
+    annotation: object
+    dims: str
 
     def __post_init__(self):
-        _require_scalar_kind(self.kind, "mapped")
+        if not isinstance(self.dims, str):
+            raise TypeError("Batch dimensions must be a string")
 
-    def __repr__(self):
-        return f"mapped({self.kind.__name__})"
-
-
-def _functors_str(functors):
-    return ", ".join(repr(functor) for functor in functors)
-
-
-# # #
-# The Struct form
+    def __class_getitem__(cls, item):
+        if not isinstance(item, tuple) or len(item) != 2:
+            raise TypeError("Batch takes an annotation and a dimension string")
+        return cls(*item)
 
 
 class Struct:
-    """
-    The type form for structs: `Struct[Cls, functors...]` produces a
-    synthetic type whose isinstance checks verify an instance of `Cls` as
-    the image of the functors (dims strings prepend batch dims; see the
-    functor classes), applied left to right.
-
-    The first argument can also be an existing Struct description:
-    `Struct[Struct[Cls, first], second]` is the same annotation as
-    `Struct[Cls, first, second]`. This permits named intermediate
-    descriptions without changing the underlying value's class.
-
-    For example, given:
-
-        @strux.struct
-        class Env:
-            pos: Int[Array, "2"]
-            walls: Bool[Array, "h w"]
-
-    then `Struct[Env, "batch"]` checks as if against:
-
-        @strux.struct
-        class Envs:
-            pos: Int[Array, "batch 2"]
-            walls: Bool[Array, "batch h w"]
-
-    To static type checkers `strux.Struct` is `typing.Annotated`, so these
-    forms are legal in annotation position, where checkers read them as
-    plain `Env` (batch dims are beyond static checking, like jaxtyping's
-    shape strings) while runtime checkers (isinstance, beartype under
-    `@jaxtyped`) enforce the full form.
-
-    Fields whose element rank is unknown (leading-variadic annotations,
-    bare array classes, abstract pytree classes) are checked for
-    *consistency with* the functor image (where the element ends cannot be
-    known), rather than certainty.
-    """
+    """Struct[Class, transformations...] describes values without wrapping them."""
 
     def __init__(self):
-        raise TypeError(
-            "Struct is a type form: subscript it (Struct[Cls, ...]) "
-            "rather than instantiating it"
-        )
+        raise TypeError("Struct is a type form, not a value constructor")
 
     def __class_getitem__(cls, item):
         if not isinstance(item, tuple) or len(item) < 2:
             raise TypeError(
-                "Struct[...] takes a struct class followed by at least one "
-                "transformation (a dims string or functor); for the element "
-                'type alone use the class itself, or Struct[Cls, ""] for a '
-                "rank-exact check"
+                'Struct takes a class and at least one transformation; use Struct[Class, ""] for an element'
             )
-        target, *functors = item
+        target, *operations = item
         if isinstance(target, _StructAnnotationMeta):
-            functors = [*target._functors, *functors]
+            operations = [*target._functors, *operations]
             target = target._struct_type
-        # a generic alias parameterises the class for static checkers; at
-        # runtime the parameters are erased and the origin is the check
-        origin = typing.get_origin(target)
-        if isinstance(origin, type):
-            target = origin
-        if not (isinstance(target, type) and dataclasses.is_dataclass(target)):
-            raise TypeError(
-                f"Struct[...] expects a struct (or other annotated "
-                f"dataclass pytree) class or a Struct description first, "
-                f"got {target!r}"
-            )
-        for functor in functors:
-            if not isinstance(functor, (str, astype, mapped)):
+        target = typing.get_origin(target) or target
+        if not isinstance(target, type) or not dataclasses.is_dataclass(target):
+            raise TypeError("Struct expects an annotated dataclass class")
+        for operation in operations:
+            if not isinstance(operation, (str, Replace, Map)):
                 raise TypeError(
-                    f"Struct[...] transformations must be dims strings or "
-                    f"functors (strux.astype, strux.mapped), got {functor!r}"
+                    "Struct transformations must be dims strings or functors (Replace or Map)"
                 )
-        return _make_struct_annotation(target, tuple(functors))
+        normalised = []
+        for operation in operations:
+            if isinstance(operation, str):
+                operation = " ".join(operation.split())
+                if normalised and isinstance(normalised[-1], str):
+                    normalised[-1] = f"{operation} {normalised[-1]}".strip()
+                    continue
+            normalised.append(operation)
+        return _make_struct_annotation(target, tuple(normalised))
 
 
 @functools.lru_cache(maxsize=None)
-def _make_struct_annotation(struct_cls, functors):
-    """
-    Build the synthetic type for `Struct[struct_cls, *functors]`: each
-    field's schema spec is lowered to an isinstance-checkable hint for its
-    image under the functor pipeline.
-    """
-    field_hints = {}
-    for name, spec in schema(struct_cls).fields.items():
-        context = f"Struct[{struct_cls.__name__}, {_functors_str(functors)}].{name}"
-        field_hints[name] = _expand_spec(spec, functors, context)
+def _make_struct_annotation(cls, operations):
+    # Check field names and annotation syntax when the description is declared.
+    _fields(cls, operations)
     return _StructAnnotationMeta(
-        f"Struct[{struct_cls.__name__}, {_functors_str(functors)}]",
+        f"Struct[{cls.__name__}, {', '.join(map(repr, operations))}]",
         (),
-        {
-            '_struct_type': struct_cls,
-            '_functors': functors,
-            '_field_hints': field_hints,
-        },
+        {"_struct_type": cls, "_functors": operations},
     )
 
 
-def _expand_spec(spec, functors, context):
-    """
-    Lower a field spec plus a functor pipeline to an isinstance-checkable
-    object (a class, or a flat tuple of classes for unions) representing
-    the field's image. Returns None for images that cannot exist (python
-    scalar arms of a union under nonempty prepended dims).
-    """
-    # a constant map replaces whatever leaf spec came before it (structure
-    # — containers and nested structs — is preserved by tree.map and
-    # handled below); cut at the last one
-    if not isinstance(spec, (_ClassSpec, _ContainerSpec, _NoneSpec)):
-        for i in reversed(range(len(functors))):
-            if isinstance(functors[i], mapped):
-                spec = _scalar_spec(functors[i].kind)
-                functors = functors[i + 1:]
-                break
+def _fields(cls, operations):
+    fields = dict(schema(cls).fields)
+    for operation in operations:
+        if isinstance(operation, _Operation):
+            operation = operation.operation
+        if isinstance(operation, Replace):
+            for name, hint in operation.fields:
+                if name not in fields:
+                    raise SchemaError(f"{cls.__name__}: unknown data field {name!r}")
+                fields[name] = _parse_hint(hint, f"{cls.__name__}.{name}")
+        else:
+            fields = {
+                name: _transform(spec, operation) for name, spec in fields.items()
+            }
+    return fields
+
+
+@dataclasses.dataclass(frozen=True)
+class _BatchSpec:
+    element: object
+    dims: str
+    # None means dimension names have not yet been assigned a runtime scope.
+    scope: object = None
+
+
+@dataclasses.dataclass(frozen=True)
+class _ScopedSpec:
+    element: object
+    scope: str
+
+
+@dataclasses.dataclass(frozen=True)
+class _Operation:
+    operation: object
+    scope: object = None
+
+
+def _transform(spec, operation, batch_scope=None):
+    """Apply one operation, deferring traversal through class references."""
+    spec = _normalise_batch(spec)
+    if isinstance(spec, _ClassSpec):
+        return dataclasses.replace(
+            spec, transforms=spec.transforms + (_Operation(operation, batch_scope),)
+        )
+    if isinstance(spec, _ContainerSpec):
+        return dataclasses.replace(
+            spec, elems=tuple(_transform(e, operation, batch_scope) for e in spec.elems)
+        )
+    if isinstance(spec, _UnionSpec):
+        return _UnionSpec(
+            tuple(_transform(e, operation, batch_scope) for e in spec.arms)
+        )
+    if isinstance(spec, _NoneSpec):
+        return spec
+    if isinstance(operation, str):
+        return _BatchSpec(spec, operation, batch_scope) if operation.strip() else spec
+    if isinstance(spec, _ScopedSpec):
+        result = _transform(spec.element, operation, batch_scope)
+        return _scope_elements(result, spec.scope)
+    if not isinstance(operation, Map):
+        raise SchemaError(
+            "Replace applies to a struct's fields, not an individual leaf"
+        )
+    return _map_result(spec, operation)
+
+
+def _normalise_batch(spec):
+    if not isinstance(spec, _BatchSpec):
+        return spec
+    element = _normalise_batch(spec.element)
+    if isinstance(element, (_ClassSpec, _ContainerSpec, _UnionSpec, _NoneSpec)):
+        return _transform(element, spec.dims, spec.scope)
+    return dataclasses.replace(spec, element=element)
+
+
+def _map_result(spec, operation):
+    hint = _as_hint(spec)
+    result = _call_map(hint, operation)
+    transformed = _result_spec(result, source=spec, source_hint=hint)
+    return _scope_elements(transformed, _element_scope(spec))
+
+
+@functools.lru_cache(maxsize=None)
+def _call_map(hint, operation):
+    return operation.function(hint)
+
+
+def _element_scope(spec):
+    if isinstance(spec, _ScopedSpec):
+        return spec.scope
+    if isinstance(spec, _BatchSpec):
+        return _element_scope(spec.element)
+    return None
+
+
+def _result_spec(hint, *, source=None, source_hint=None):
+    if source is not None and hint == source_hint:
+        return source
+    if isinstance(hint, Batch):
+        return _BatchSpec(
+            _result_spec(hint.annotation, source=source, source_hint=source_hint),
+            hint.dims,
+        )
+    return _parse_hint(hint, "Map result")
+
+
+def _as_hint(spec):
+    if isinstance(spec, _ScopedSpec):
+        return _as_hint(spec.element)
     if isinstance(spec, _ArraySpec):
-        jt = spec.jaxtype
-        dtype_cls = jt.dtype
-        dims = jt.dim_str
-        for functor in functors:
-            if isinstance(functor, str):
-                dims = f"{functor} {dims}".strip()
-            else:  # astype
-                dtype_cls = _KIND_DTYPES[functor.kind]
-        return dtype_cls[jt.array_type, dims]
-    elif isinstance(spec, _PyScalarSpec):
-        cls = spec.cls
-        for functor in functors:
-            if isinstance(functor, str):
-                if functor.strip():
-                    return None  # a python scalar cannot carry batch dims
-            else:  # astype
-                cls = functor.kind
-        return cls
-    elif isinstance(spec, _NoneSpec):
-        # None is an empty subtree: leaf-wise maps never touch it, and a
-        # batch of Nones is still (structurally) None
-        return type(None)
-    elif isinstance(spec, _ClassSpec):
-        if dataclasses.is_dataclass(spec.cls):
-            # a stacked field already carries dims of its own, which sit
-            # between the element and whatever these functors prepend, so
-            # they apply first
-            own = (" ".join(spec.dims),) if spec.dims else ()
-            return _make_struct_annotation(spec.cls, own + functors)
-        # abstract base classes and other registered pytrees: check the
-        # class and require every array leaf to satisfy the functor image
-        # (python scalar leaves are batch-agnostic, as in the solver)
-        leaf_hints = _leaf_hints(functors)
-        def check_node(value, _cls=spec.cls, _leaf_hints=leaf_hints,
-                       _functors=functors):
-            if not isinstance(value, _cls):
-                return False
-            value_cls = type(value)
-            if dataclasses.is_dataclass(value_cls):
-                return isinstance(
-                    value, _make_struct_annotation(value_cls, _functors),
-                )
-            return all(
-                isinstance(leaf, _leaf_hints)
-                for leaf in jax.tree.leaves(value)
+        return spec.jaxtype
+    if isinstance(spec, _PyScalarSpec):
+        return spec.cls
+    if isinstance(spec, _BatchSpec):
+        return Batch[_as_hint(spec.element), spec.dims]
+    raise SchemaError(f"cannot expose {spec!r} as a leaf annotation")
+
+
+def _scope_elements(spec, scope):
+    if scope is None:
+        return spec
+    if isinstance(spec, (_ArraySpec, _PyScalarSpec)):
+        return _ScopedSpec(spec, scope)
+    if isinstance(spec, _BatchSpec):
+        return dataclasses.replace(spec, element=_scope_elements(spec.element, scope))
+    if isinstance(spec, _UnionSpec):
+        return _UnionSpec(tuple(_scope_elements(s, scope) for s in spec.arms))
+    if isinstance(spec, _ContainerSpec):
+        return dataclasses.replace(
+            spec, elems=tuple(_scope_elements(s, scope) for s in spec.elems)
+        )
+    return spec
+
+
+def _scope_batches(spec, scope):
+    if isinstance(spec, _BatchSpec):
+        return dataclasses.replace(
+            spec,
+            scope=spec.scope if spec.scope is not None else scope,
+            element=_scope_batches(spec.element, scope),
+        )
+    if isinstance(spec, _ScopedSpec):
+        return dataclasses.replace(spec, element=_scope_batches(spec.element, scope))
+    if isinstance(spec, _UnionSpec):
+        return _UnionSpec(tuple(_scope_batches(s, scope) for s in spec.arms))
+    return spec
+
+
+_scope_counter = contextvars.ContextVar("strux_scope_counter")
+_EXTERNAL_SCOPE = "struxexternal_"
+
+
+@dataclasses.dataclass(frozen=True)
+class _BatchScope:
+    prefix: str
+    anonymous: str
+
+
+def _qualify(dims, scope):
+    if isinstance(scope, _BatchScope):
+        tokens = []
+        for index, token in enumerate(dims.split()):
+            if token == "...":
+                token = "*" + scope.anonymous + str(index)
+            elif token == "_":
+                token = scope.anonymous + str(index)
+            else:
+                token = _qualify(token, scope.prefix)
+            tokens.append(token)
+        return " ".join(tokens)
+    if not scope:
+        return dims
+
+    def qualify_token(token):
+        if token.lstrip("#*?").startswith("_"):
+            return token
+        parts = re.split(r"(\{[^}]*\})", token)
+        for index in range(0, len(parts), 2):
+            text = parts[index]
+            parts[index] = re.sub(
+                r"\b[A-Za-z_]\w*\b",
+                lambda match: (
+                    match[0]
+                    if text[match.end() :].startswith("(")
+                    else scope + match[0]
+                ),
+                text,
             )
-        return _make_checker(
-            f"{spec.cls.__name__}[{_functors_str(functors)}]", check_node,
+        return "".join(parts)
+
+    return " ".join(qualify_token(token) for token in dims.split())
+
+
+def _leaf_hint(spec, scope):
+    if isinstance(spec, _ScopedSpec):
+        return _leaf_hint(spec.element, spec.scope)
+    if isinstance(spec, _ArraySpec):
+        hint = spec.jaxtype
+        return hint.dtype[hint.array_type, _qualify(hint.dim_str, scope)]
+    if isinstance(spec, _PyScalarSpec):
+        return spec.cls
+    if isinstance(spec, _BatchSpec):
+        hint = _leaf_hint(spec.element, scope)
+        if not hasattr(hint, "dim_str"):
+            return None
+        dims = _qualify(spec.dims, spec.scope if spec.scope is not None else scope)
+        return hint.dtype[hint.array_type, f"{dims} {hint.dim_str}".strip()]
+    raise SchemaError(f"not a leaf description: {spec!r}")
+
+
+# The adapter isolates the private jaxtyping memo API needed to roll back
+# failed union arms and publish only outer batch dimensions to @jaxtyped.
+def _memo():
+    from jaxtyping._storage import get_shape_memo
+
+    return tuple(dict(part) for part in get_shape_memo())
+
+
+def _set_memo(memo):
+    from jaxtyping._storage import set_shape_memo
+
+    set_shape_memo(*memo)
+
+
+def _matches(value, spec, path, inherited=()):
+    spec = _normalise_batch(spec)
+    if isinstance(spec, _ClassSpec):
+        if not isinstance(value, spec.cls):
+            raise ValidationError(
+                f"{path}: expected {spec.cls.__name__}, got {type(value).__name__}"
+            )
+        if not dataclasses.is_dataclass(value):
+            raise SchemaError(
+                f"{path}: checking requires an annotated dataclass pytree"
+            )
+        local = f"struxlocal{next(_scope_counter.get())}_"
+        fields = {
+            k: _scope_elements(s, local) for k, s in schema(type(value)).fields.items()
+        }
+        own = (_Operation(" ".join(spec.dims), local),) if spec.dims else ()
+        operations = own + spec.transforms + inherited
+        for bound in operations:
+            operation = bound.operation
+            scope = bound.scope if bound.scope is not None else local
+            if not isinstance(scope, _BatchScope):
+                scope = _BatchScope(
+                    scope, f"struxbatchlocal{next(_scope_counter.get())}_"
+                )
+            if isinstance(operation, Replace):
+                for name, hint in operation.fields:
+                    if name not in fields:
+                        raise SchemaError(f"{path}: unknown data field {name!r}")
+                    fields[name] = _scope_elements(
+                        _parse_hint(hint, path + "." + name), local
+                    )
+            else:
+                fields = {
+                    k: _scope_batches(_transform(s, operation, scope), scope)
+                    for k, s in fields.items()
+                }
+        yield from _sequence(
+            [
+                (getattr(value, name), field_spec, f"{path}.{name}")
+                for name, field_spec in fields.items()
+            ]
         )
     elif isinstance(spec, _ContainerSpec):
-        elem_hints = tuple(
-            _expand_spec(elem, functors, context) for elem in spec.elems
+        expected = (
+            dict if spec.kind == "dict" else list if spec.kind == "list" else tuple
         )
-        if any(hint is None for hint in elem_hints):
-            raise SchemaError(
-                f"{context}: container elements cannot carry this image"
+        if not isinstance(value, expected):
+            raise ValidationError(
+                f"{path}: expected {expected.__name__}, got {type(value).__name__}"
             )
-        def check_container(value, _spec=spec, _elem_hints=elem_hints):
-            if _spec.kind == "dict":
-                return isinstance(value, dict) and all(
-                    isinstance(v, _elem_hints[0]) for v in value.values()
+        if spec.kind == "tuple":
+            if len(value) != len(spec.elems):
+                raise ValidationError(
+                    f"{path}: expected {len(spec.elems)} tuple entries"
                 )
-            elif _spec.kind == "list":
-                return isinstance(value, list) and all(
-                    isinstance(v, _elem_hints[0]) for v in value
-                )
-            elif _spec.kind == "tuple_variadic":
-                return isinstance(value, tuple) and all(
-                    isinstance(v, _elem_hints[0]) for v in value
-                )
-            else:
-                return (
-                    isinstance(value, tuple)
-                    and len(value) == len(_elem_hints)
-                    and all(
-                        isinstance(v, hint)
-                        for v, hint in zip(value, _elem_hints)
-                    )
-                )
-        return _make_checker(
-            f"{spec}[{_functors_str(functors)}]", check_container,
+            items = [(i, v, s) for i, (v, s) in enumerate(zip(value, spec.elems))]
+        else:
+            if spec.kind == "dict":
+                for key in value:
+                    if not _key_matches(key, spec.keytype):
+                        raise ValidationError(
+                            f"{path}: key {key!r} does not match {spec.keytype!r}"
+                        )
+            entries = value.items() if spec.kind == "dict" else enumerate(value)
+            items = [(k, v, spec.elems[0]) for k, v in entries]
+        yield from _sequence(
+            [(child, childspec, f"{path}[{key!r}]") for key, child, childspec in items]
         )
     elif isinstance(spec, _UnionSpec):
-        arms = []
+        initial = _memo()
+        failures = []
+        matched = False
         for arm in spec.arms:
-            expanded = _expand_spec(arm, functors, context)
-            if expanded is None:
-                continue
-            if isinstance(expanded, tuple):
-                arms.extend(expanded)
-            else:
-                arms.append(expanded)
-        # dedupe (functor images of distinct arms may coincide)
-        arms = list(dict.fromkeys(arms))
-        if not arms:
-            raise SchemaError(
-                f"{context}: no arm of {spec} can carry this image"
-            )
-        if len(arms) == 1:
-            return arms[0]
-        return tuple(arms)
+            _set_memo(tuple(dict(p) for p in initial))
+            try:
+                for _ in _matches(value, arm, path):
+                    matched = True
+                    yield
+            except ValidationError as error:
+                failures.append(str(error))
+        _set_memo(initial)
+        if not matched:
+            raise ValidationError(f"{path}: no arm matches; " + "; ".join(failures))
+    elif isinstance(spec, _NoneSpec):
+        if value is not None:
+            raise ValidationError(f"{path}: expected None")
+        yield
     else:
-        raise AssertionError(f"unknown spec {spec!r}")
+        initial = _memo()
+        try:
+            hint = _leaf_hint(spec, "")
+        except ValueError as error:
+            if "variadic" not in str(error):
+                raise
+            yield from _partitioned_matches(value, spec, path)
+            return
+        if hint is None or not isinstance(value, hint):
+            _set_memo(initial)
+            shape = getattr(value, "shape", None)
+            dtype = getattr(value, "dtype", type(value).__name__)
+            raise ValidationError(
+                f"{path}: expected {_as_hint(spec)!r}, got {dtype} with shape {shape}"
+            )
+        try:
+            yield
+        finally:
+            _set_memo(initial)
 
 
-def _leaf_hints(functors):
-    """
-    The functor image of an unknown leaf (for pytree fields whose element
-    structure the schema cannot see): any array carrying the image dims
-    and dtype, or (batch-agnostic) a python scalar of the image kind.
-    """
-    dtype_cls = jaxtyping.Shaped
-    dims = "..."
-    scalar_arms = (bool, int, float, complex)
-    for functor in functors:
-        if isinstance(functor, str):
-            dims = f"{functor} {dims}".strip()
-        elif isinstance(functor, astype):
-            dtype_cls = _KIND_DTYPES[functor.kind]
-            scalar_arms = (functor.kind,)
-        else:  # mapped
-            dtype_cls = _KIND_DTYPES[functor.kind]
-            dims = ""
-            scalar_arms = (functor.kind,)
-    return (
-        dtype_cls[jax.Array, dims],
-        dtype_cls[np.ndarray, dims],
-        *scalar_arms,
+def _key_matches(value, annotation):
+    if annotation is typing.Any:
+        return True
+    if typing.get_origin(annotation) is tuple:
+        arguments = typing.get_args(annotation)
+        if not isinstance(value, tuple):
+            return False
+        if len(arguments) == 2 and arguments[1] is Ellipsis:
+            return all(_key_matches(item, arguments[0]) for item in value)
+        return len(value) == len(arguments) and all(
+            _key_matches(item, hint) for item, hint in zip(value, arguments)
+        )
+    try:
+        return isinstance(value, annotation)
+    except TypeError as error:
+        raise SchemaError(
+            f"unsupported dictionary key annotation {annotation!r}"
+        ) from error
+
+
+def _sequence(items):
+    """Backtrack over sibling constraints without recursing per list entry."""
+    if not items:
+        yield
+        return
+    stack = []
+    depth = 0
+    matched = False
+    last_error = None
+    try:
+        while depth >= 0:
+            if depth == len(items):
+                matched = True
+                yield
+                depth -= 1
+                continue
+            if len(stack) == depth:
+                stack.append(_matches(*items[depth]))
+            try:
+                next(stack[depth])
+                depth += 1
+            except (StopIteration, ValidationError) as error:
+                if isinstance(error, ValidationError):
+                    last_error = error
+                stack.pop().close()
+                depth -= 1
+        if not matched and last_error is not None:
+            raise last_error
+    finally:
+        for choices in reversed(stack):
+            choices.close()
+
+
+def _shape_parts(spec, scope=""):
+    if isinstance(spec, _ScopedSpec):
+        return _shape_parts(spec.element, spec.scope)
+    if isinstance(spec, _BatchSpec):
+        hint, parts = _shape_parts(spec.element, scope)
+        prefix = _qualify(spec.dims, spec.scope if spec.scope is not None else scope)
+        return hint, [prefix, *parts]
+    hint = spec.jaxtype
+    return hint, [_qualify(hint.dim_str, scope)]
+
+
+def _partitioned_matches(value, spec, path):
+    """Match separate variadic batch/element segments with backtracking."""
+    hint, parts = _shape_parts(spec)
+    if not isinstance(value, hint.dtype[hint.array_type, "..."]):
+        raise ValidationError(f"{path}: expected {_as_hint(spec)!r}")
+
+    def partitions(shape, remaining):
+        if not remaining:
+            if not shape:
+                yield
+            return
+        dims, *rest = remaining
+        tokens = dims.split()
+        variadic = any(token == "..." or token.startswith("*") for token in tokens)
+        minimum = len(tokens) - int(variadic)
+        lengths = range(minimum, len(shape) + 1) if variadic else (minimum,)
+        for length in lengths:
+            if length > len(shape):
+                continue
+            initial = _memo()
+            try:
+                prefix = jax.ShapeDtypeStruct(shape[:length], value.dtype)
+                if isinstance(prefix, jaxtyping.Shaped[jax.ShapeDtypeStruct, dims]):
+                    yield from partitions(shape[length:], rest)
+            finally:
+                _set_memo(initial)
+
+    matched = False
+    for _ in partitions(tuple(value.shape), parts):
+        matched = True
+        yield
+    if not matched:
+        raise ValidationError(
+            f"{path}: shape {value.shape} does not match {_as_hint(spec)!r}"
+        )
+
+
+def _check_description(value, annotation, *, publish):
+    external = _memo() if publish else ({}, {}, {}, {})
+    # Separate public dimension names from implementation-local names. This
+    # also permits users to choose names resembling our internal prefixes.
+    working = (
+        {_EXTERNAL_SCOPE + name: size for name, size in external[0].items()},
+        {_EXTERNAL_SCOPE + name: size for name, size in external[1].items()},
+        dict(external[2]),
+        dict(external[3]),
     )
+    counter_token = _scope_counter.set(itertools.count())
+    try:
+        with jaxtyping.jaxtyped("context"):
+            _set_memo(working)
+            spec = _ClassSpec(annotation._struct_type)
+            operations = tuple(
+                _Operation(op, _EXTERNAL_SCOPE) for op in annotation._functors
+            )
+            matches = _matches(
+                value, spec, annotation._struct_type.__name__, operations
+            )
+            try:
+                next(matches)
+                result = _memo()
+            except StopIteration:
+                raise ValidationError(
+                    f"{annotation.__name__}: fields do not match"
+                ) from None
+            finally:
+                matches.close()
+    finally:
+        _scope_counter.reset(counter_token)
+    if publish:
+        exported = tuple(
+            {
+                name.removeprefix(_EXTERNAL_SCOPE): size
+                for name, size in part.items()
+                if name.startswith(_EXTERNAL_SCOPE)
+            }
+            for part in result[:2]
+        )
+        _set_memo((*exported, result[2], result[3]))
 
 
-class _CheckerMeta(type):
-    """Metaclass giving a synthetic annotation a custom isinstance check."""
-    def __instancecheck__(cls, instance):
-        return cls._check(instance)
+def check(value, annotation=None):
+    """Check a value without changing it. Raise ValidationError on mismatch.
 
-
-def _make_checker(name, check_fn):
-    return _CheckerMeta(name, (), {"_check": staticmethod(check_fn)})
+    With no annotation, require the declared element fields exactly.
+    Explicit checks use a fresh dimension scope and return None.
+    """
+    if annotation is None:
+        annotation = Struct[type(value), ""]
+    elif isinstance(annotation, type) and dataclasses.is_dataclass(annotation):
+        annotation = Struct[annotation, ""]
+    if not isinstance(annotation, _StructAnnotationMeta):
+        raise TypeError("check expects a Struct description or dataclass class")
+    _check_description(value, annotation, publish=False)
 
 
 class _StructAnnotationMeta(type):
-    """Metaclass for Struct-form annotations with isinstance support."""
-    def __instancecheck__(cls, instance):
-        if not isinstance(instance, cls._struct_type):
+    def __instancecheck__(cls, value):
+        try:
+            _check_description(value, cls, publish=True)
+        except ValidationError:
             return False
-        instance_cls = type(instance)
-        if instance_cls is not cls._struct_type and dataclasses.is_dataclass(
-            instance_cls
-        ):
-            # a subclass instance: check against the subclass's own schema
-            # (it may declare more fields than the annotated base)
-            return isinstance(
-                instance,
-                _make_struct_annotation(instance_cls, cls._functors),
-            )
-        for field_name, expected_type in cls._field_hints.items():
-            if not isinstance(getattr(instance, field_name), expected_type):
-                return False
-        # the per-field checks above are independent, so alone they accept
-        # instances whose fields carry *different* batch shapes (e.g. a
-        # tree-unflattened struct with leading dims 4 and 5 both passing
-        # "b"). For plain batched forms (dim strings only), additionally
-        # require a single cross-field batch solution matching the
-        # prepended dims. Functor images deliberately differ from the
-        # schema, so the solver does not apply to them.
-        if all(isinstance(f, str) for f in cls._functors):
-            return _batch_consistent(instance, cls._functors)
         return True
-
-
-def _batch_consistent(instance, dim_strs):
-    try:
-        candidates = _solved_candidates(instance)
-    except ValidationError:
-        return False       # fields individually fine, jointly inconsistent
-    except SchemaError:
-        return True        # no solvable schema: per-field checks stand
-    if candidates is _TOP:
-        return True
-    # each functor prepends its dims in front of the previous, so the
-    # leading tokens read right-to-left across the functor strings
-    tokens = [
-        token
-        for dim_str in reversed(dim_strs)
-        for token in dim_str.split()
-    ]
-    return any(_match_batch(tokens, shape) for shape in candidates)

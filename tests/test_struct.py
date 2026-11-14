@@ -9,7 +9,6 @@ import pytest
 
 import strux
 
-
 # # #
 # Field name collision guards
 
@@ -17,6 +16,7 @@ import strux
 class TestFieldCollisions:
     def test_size_field_warns(self):
         with pytest.warns(UserWarning, match="field named 'size'"):
+
             @strux.struct
             class HasSize:
                 size: int
@@ -25,15 +25,18 @@ class TestFieldCollisions:
     def test_size_field_still_works(self):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
+
             @strux.struct
             class HasSize:
                 size: int
                 x: float
+
         obj = HasSize(size=3, x=1.0)
         assert obj.size == 3
 
     def test_replace_field_warns(self):
         with pytest.warns(UserWarning, match="field named 'replace'"):
+
             @strux.struct
             class HasReplace:
                 replace: int
@@ -42,16 +45,19 @@ class TestFieldCollisions:
     def test_replace_field_still_works(self):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
+
             @strux.struct
             class HasReplace:
                 replace: int
                 x: float
+
         obj = HasReplace(replace=42, x=1.0)
         assert obj.replace == 42
 
     def test_no_warning_without_collision(self):
         with warnings.catch_warnings():
             warnings.simplefilter("error")
+
             @strux.struct
             class Normal:
                 x: float
@@ -75,46 +81,54 @@ class TestMethodResolution:
         @strux.struct
         class S:
             x: int
+
         obj = S(x=1)
         expected = strux.to_str(obj)
         assert str(obj) == expected
-        assert f'{obj}' == expected
-        assert f'{obj:0}' == strux.to_str(obj, max_depth=0)
+        assert f"{obj}" == expected
+        assert f"{obj:0}" == strux.to_str(obj, max_depth=0)
 
     def test_str_overridden(self):
         @strux.struct
         class S:
             x: int
+
             def __str__(self):
                 return "custom_str"
+
         obj = S(x=1)
         assert str(obj) == "custom_str"
-        assert f'{obj}' == "custom_str"
+        assert f"{obj}" == "custom_str"
         # non-empty spec still uses strux tree_format
-        assert f'{obj:0}' == strux.to_str(obj, max_depth=0)
+        assert f"{obj:0}" == strux.to_str(obj, max_depth=0)
 
     def test_format_overridden(self):
         @strux.struct
         class S:
             x: int
+
             def __format__(self, spec):
                 return f"custom_format:{spec}"
+
         obj = S(x=1)
         assert str(obj) == strux.to_str(obj)
-        assert f'{obj}' == "custom_format:"
-        assert f'{obj:2}' == "custom_format:2"
+        assert f"{obj}" == "custom_format:"
+        assert f"{obj:2}" == "custom_format:2"
 
     def test_str_and_format_overridden(self):
         @strux.struct
         class S:
             x: int
+
             def __str__(self):
                 return "custom_str"
+
             def __format__(self, spec):
                 return "custom_format"
+
         obj = S(x=1)
         assert str(obj) == "custom_str"
-        assert f'{obj}' == "custom_format"
+        assert f"{obj}" == "custom_format"
 
 
 # # #
@@ -127,9 +141,11 @@ class TestBatchDunderResolution:
         from jaxtyping import Array, Float
 
         with pytest.warns(UserWarning, match="defines __getitem__"):
+
             @strux.struct
             class Lookup:
                 table: Float[Array, "n"]
+
                 def __getitem__(self, index):
                     return "custom"
 
@@ -137,13 +153,14 @@ class TestBatchDunderResolution:
         assert obj[0] == "custom"
         # the module-level function remains available
         indexed = strux.tree_getitem(
-            Lookup(table=jnp.ones((4, 3))), 0,
+            Lookup(table=jnp.ones((4, 3))),
+            0,
         )
         assert indexed.table.shape == (3,)
 
 
 # # #
-# Replace: revalidation skipped when the leaf layout is unchanged
+# Replacement assigns fields; explicit checks validate the result.
 
 
 class TestReplace:
@@ -160,6 +177,7 @@ class TestReplace:
 
     def test_same_layout_replace(self):
         import jax.numpy as jnp
+
         Point = self._point()
         p = Point(x=jnp.zeros(2), y=jnp.zeros(2))
         q = p.replace(x=jnp.ones(2))
@@ -168,25 +186,28 @@ class TestReplace:
         assert (q.y == 0.0).all()
         assert q.shape == ()
 
-    def test_layout_changing_replace_revalidates(self):
+    def test_layout_changing_replace_can_be_checked(self):
         import jax.numpy as jnp
+
         Point = self._point()
         p = Point(x=jnp.zeros(2), y=jnp.zeros(2))
-        # batch both fields: valid, goes through full construction
+        # Batch both fields together.
         q = p.replace(x=jnp.ones((4, 2)), y=jnp.ones((4, 2)))
         assert q.shape == (4,)
-        # invalid replacement is caught
+        # Explicit checks reject incompatible replacements.
         with pytest.raises(strux.ValidationError):
-            p.replace(x=jnp.ones(3))
+            p.replace(x=jnp.ones(3)).check()
         with pytest.raises(strux.ValidationError):
-            p.replace(x=jnp.ones((4, 2)))   # inconsistent with y
+            p.replace(x=jnp.ones((4, 2))).check()  # inconsistent with y
 
-    def test_replace_propagates_cache(self):
+    def test_replace_recomputes_shape(self):
         import jax.numpy as jnp
+
         Point = self._point()
         p = Point(x=jnp.ones((4, 2)), y=jnp.ones((4, 2)))
         q = p.replace(x=jnp.zeros((4, 2)))
-        assert q.__dict__["_strux_candidates"] == frozenset({(4,)})
+        assert q.shape == (4,)
+        assert q.replace(x=jnp.zeros(2), y=jnp.zeros(2)).shape == ()
 
     def test_replace_static_field(self):
         import jax.numpy as jnp
@@ -202,6 +223,7 @@ class TestReplace:
 
     def test_replace_unknown_field_raises(self):
         import jax.numpy as jnp
+
         Point = self._point()
         p = Point(x=jnp.zeros(2), y=jnp.zeros(2))
         with pytest.raises(TypeError):
@@ -216,6 +238,7 @@ class TestReplace:
         @strux.struct
         class Counted:
             x: Float[Array, "2"]
+
             def __post_init__(self):
                 calls.append(1)
 
@@ -223,7 +246,7 @@ class TestReplace:
         c.replace(x=jnp.ones(2))
         assert len(calls) == 2
 
-    def test_replace_python_scalar_type_change_revalidates(self):
+    def test_replace_python_scalar_type_change_can_be_checked(self):
         import jax.numpy as jnp
         from jaxtyping import Array, Float
 
@@ -234,22 +257,19 @@ class TestReplace:
 
         c = Config(u=jnp.float32(1.0), rate=0.5)
         assert type(c.replace(rate=0.25).rate) is float
-        # int is not float: the fast path must not treat it as same-layout
+        # Explicit checking catches the altered rank.
         with pytest.raises(strux.ValidationError):
-            c.replace(rate=jnp.ones(3))
+            c.replace(rate=jnp.ones(3)).check()
 
     def test_replace_on_transformed_instance(self):
-        # provisional semantics (functor discussion pending): a replacement
-        # with the leaf layout of a tree-transformed instance is allowed,
-        # since it leaves the instance exactly as valid as it was
         import jax
         import jax.numpy as jnp
+
         Point = self._point()
         p = Point(x=jnp.zeros(2), y=jnp.zeros(2))
-        mask = jax.tree.map(lambda a: a > 0, p)     # bool leaves, unvalidated
+        mask = jax.tree.map(lambda a: a > 0, p)  # bool leaves, unvalidated
         replaced = mask.replace(x=jnp.array([True, False]))
         assert replaced.x.dtype == jnp.bool
-        # a layout-changing replace on such an instance still revalidates
-        # (and fails, since bool does not match the float annotation)
-        with pytest.raises(strux.ValidationError):
-            mask.replace(x=jnp.zeros(3, dtype=bool))
+        # Replacement remains possible after arbitrary transformations.
+        changed = mask.replace(x=jnp.zeros(3, dtype=bool))
+        assert changed.x.shape == (3,)

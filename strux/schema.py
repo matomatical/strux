@@ -26,62 +26,32 @@ def _is_jaxtype(hint) -> bool:
 
 
 class SchemaError(TypeError):
-    """
-    A struct's field annotations cannot be compiled into a schema. Raised
-    when the schema is first needed (typically at first construction), not
-    at class decoration.
+    """An annotation cannot describe supported numerical pytree data.
+
+    Compilation is lazy so forward references can resolve after class
+    definition. Annotation construction, checking and shape queries may
+    require compilation; assigning values does not.
     """
 
 
 class ValidationError(TypeError):
-    """
-    A value does not satisfy a struct's schema at construction: wrong type
-    or dtype kind, mismatched element dims, or inconsistent batch dims
-    across fields.
-    """
+    """A value fails an explicit description or batch-shape constraint."""
 
 
-# A struct's field annotations describe one *element*, but instances may
-# carry extra leading batch dims on every leaf (JAX rebuilds structs through
-# the constructor when unflattening, so vmap/scan/tree-stack results all
-# construct with batch-dim'd leaves). The schema machinery below compiles
-# each data field's annotation into a spec of per-leaf shape constraints;
-# batch inference and construction validation are then constraint solving
-# over "which leading batch shape B is consistent with every leaf", and
-# .shape, batched subscripting, and validation are all queries against the
-# same solution. Specs form a small grammar:
-#
-#   spec ::= _ArraySpec      jaxtyping annotations and bare array classes;
-#                            dims may be concrete, symbolic (rank-only), or
-#                            unknown (a leading "..." variadic)
-#          | _PyScalarSpec   python/numpy scalar classes: batch-agnostic
-#          | _NoneSpec       None (as a union arm): batch-agnostic
-#          | _ClassSpec      any other class: isinstance-checked, then
-#                            recursed via the *value's* dynamic type (a
-#                            nested struct/dataclass recurses its own
-#                            schema; any other pytree constrains the batch
-#                            as a prefix of every leaf's shape); a
-#                            `Struct[cls, dims]` annotation additionally
-#                            declares dims the nested struct carries
-#                            *inside* the enclosing batch
-#          | _ContainerSpec  dict[k, v], list[t], tuple[t, ...], tuple[...]
-#          | _UnionSpec      any union: the arm is decided by the value
-#
-# Plain scalar annotations (bool/int/float/complex) are sugar for the
-# corresponding jaxtyping-over-ArrayLike union. Annotations that promise
-# nothing about array leaves (Any, object, str, callables) are rejected:
-# data fields hold array-leaved pytrees by definition (that is what being
-# traced means); anything else belongs in static fields.
+# Specifications preserve annotation structure independently of value
+# validation. Array ranks support batch inference; the original jaxtyping
+# annotation remains available to the checker and Map callbacks. Class
+# references are expanded lazily, including recursive dataclasses.
 
 
 @dataclasses.dataclass(frozen=True)
 class _ArraySpec:
-    jaxtype: type       # the jaxtyping annotation as declared
-    ndim: int | None    # element rank; None if unknown (leading variadic)
-    min_ndim: int       # known trailing dims (== ndim when rank is known)
-    fixed: tuple        # ((negative_offset, size), ...) concrete trailing dims
-    names: tuple        # ((negative_offset, name), ...) symbolic trailing dims
-    dtypes: tuple | None    # acceptable dtype names; None = any dtype
+    jaxtype: type  # the jaxtyping annotation as declared
+    ndim: int | None  # element rank; None if unknown (leading variadic)
+    min_ndim: int  # known trailing dims (== ndim when rank is known)
+    fixed: tuple  # ((negative_offset, size), ...) concrete trailing dims
+    names: tuple  # ((negative_offset, name), ...) symbolic trailing dims
+    dtypes: tuple | None  # acceptable dtype names; None = any dtype
 
     def __str__(self):
         return getattr(self.jaxtype, "__name__", repr(self.jaxtype))
@@ -104,7 +74,8 @@ class _NoneSpec:
 @dataclasses.dataclass(frozen=True)
 class _ClassSpec:
     cls: type
-    dims: tuple = ()    # dims declared by a `Struct[cls, dims]` annotation
+    dims: tuple = ()  # element-level batch dimensions
+    transforms: tuple = ()
 
     def __str__(self):
         if self.dims:
@@ -114,8 +85,9 @@ class _ClassSpec:
 
 @dataclasses.dataclass(frozen=True)
 class _ContainerSpec:
-    kind: str       # "dict" | "list" | "tuple" | "tuple_variadic"
-    elems: tuple    # child specs: one for dict/list/tuple_variadic, n for tuple
+    kind: str  # "dict" | "list" | "tuple" | "tuple_variadic"
+    elems: tuple  # child specs: one for dict/list/tuple_variadic, n for tuple
+    keytype: object = object
 
     def __str__(self):
         if self.kind == "dict":
@@ -142,13 +114,10 @@ class Schema:
     The compiled form of a struct's data field annotations: a mapping from
     field names to shape-constraint specs. Build one with `strux.schema`.
     """
+
     cls: type
     fields: dict
-    # precompiled validation plan for the common all-simple-fields case
-    # (None when any field needs the general solver); see _fast_plan
-    fast_plan: tuple | None = None
-    # whether any field annotation mentions symbolic dim names (classes
-    # without names skip the name-binding pass entirely)
+    # Whether the default fields mention local symbolic dimensions.
     has_names: bool = False
 
     def __str__(self):
@@ -193,7 +162,6 @@ def schema(cls) -> Schema:
     result = Schema(
         cls=cls,
         fields=fields,
-        fast_plan=_fast_plan(fields),
         has_names=any(_spec_has_names(spec) for spec in fields.values()),
     )
     cls._strux_schema = result
@@ -209,66 +177,6 @@ def _spec_has_names(spec):
         children = spec.elems if isinstance(spec, _ContainerSpec) else spec.arms
         return any(_spec_has_names(child) for child in children)
     return False
-
-
-def _fast_plan(fields):
-    """
-    Precompile the validation plan for the common case: every field is a
-    rank-determined array, or a scalar-or-rank-0-array union. Returns None
-    (use the general solver) if any field is more complex. Plan entries:
-    (name, dtype_names_frozenset_or_None, ndim_or_None, fixed) — ndim None
-    marks a scalar-ish slot (python scalars skipped, arrays contribute
-    their full shape as the batch).
-    """
-    plan = []
-    for name, spec in fields.items():
-        if isinstance(spec, _ArraySpec) and spec.ndim is not None:
-            dtype_set = (
-                _concrete_dtypes(spec.dtypes)
-                if spec.dtypes is not None
-                else None
-            )
-            plan.append((name, dtype_set, spec.ndim, spec.fixed))
-        elif isinstance(spec, _UnionSpec) and all(
-            isinstance(arm, _PyScalarSpec)
-            or (
-                isinstance(arm, _ArraySpec)
-                and arm.ndim == 0
-                and arm.dtypes is not None
-            )
-            for arm in spec.arms
-        ):
-            # scalar-ish: python scalar (batch-agnostic) or rank-0 array
-            dtype_set = _concrete_dtypes(
-                frozenset().union(
-                    *(
-                        arm.dtypes
-                        for arm in spec.arms
-                        if isinstance(arm, _ArraySpec)
-                    )
-                )
-            )
-            plan.append((name, dtype_set, None, ()))
-        else:
-            return None
-    return tuple(plan)
-
-
-def _concrete_dtypes(dtype_names):
-    """
-    Resolve dtype names to np.dtype objects for fast membership tests
-    (dtype.name is computed dynamically by numpy and is far slower).
-    Names that don't resolve to concrete dtypes (regex-style patterns,
-    exotic kinds) are dropped: such values fail the fast path and are
-    judged by the general solver instead.
-    """
-    dtypes = set()
-    for dtype_name in dtype_names:
-        try:
-            dtypes.add(np.dtype(dtype_name))
-        except TypeError:
-            pass
-    return frozenset(dtypes)
 
 
 def _field_hint(cls, name):
@@ -330,6 +238,10 @@ def _parse_hint(hint, context):
     Compile one data field annotation into a spec. Raises SchemaError for
     annotations that don't promise an array-leaved pytree.
     """
+    from strux.annotate import Batch, _result_spec
+
+    if isinstance(hint, Batch):
+        return _result_spec(hint)
     # unwrap Annotated[X, ...] to X
     if typing.get_origin(hint) is typing.Annotated:
         hint = typing.get_args(hint)[0]
@@ -342,8 +254,7 @@ def _parse_hint(hint, context):
         )
     if hint in (str, bytes):
         raise SchemaError(
-            f"{context}: {hint.__name__} is not pytree data; mark the "
-            "field static"
+            f"{context}: {hint.__name__} is not pytree data; mark the " "field static"
         )
     origin = typing.get_origin(hint)
     if (
@@ -352,8 +263,7 @@ def _parse_hint(hint, context):
         or origin is collections.abc.Callable
     ):
         raise SchemaError(
-            f"{context}: callables are not pytree data; mark the field "
-            "static"
+            f"{context}: callables are not pytree data; mark the field " "static"
         )
     # None (as a union arm or a bare annotation)
     if hint is None or hint is type(None):
@@ -364,9 +274,11 @@ def _parse_hint(hint, context):
     if origin is typing.Union or isinstance(hint, types.UnionType):
         return _UnionSpec(
             arms=tuple(
-                _PyScalarSpec(cls=arm)
-                if arm in (bool, int, float, complex)
-                else _parse_hint(arm, context)
+                (
+                    _PyScalarSpec(cls=arm)
+                    if arm in (bool, int, float, complex)
+                    else _parse_hint(arm, context)
+                )
                 for arm in typing.get_args(hint)
             ),
         )
@@ -382,6 +294,7 @@ def _parse_hint(hint, context):
         return _ContainerSpec(
             kind="dict",
             elems=(_parse_hint(valtype, context),),
+            keytype=_keytype,
         )
     if origin is list:
         (elemtype,) = typing.get_args(hint)
@@ -400,31 +313,29 @@ def _parse_hint(hint, context):
             kind="tuple",
             elems=tuple(_parse_hint(arg, context) for arg in args),
         )
-    # bare array classes: dtype and rank unknown
+    # Array data needs explicit dtype/shape requirements.
     if hint is jax.Array or hint is np.ndarray:
-        return _parse_jaxtype(jaxtyping.Shaped[hint, "..."], context)
+        raise SchemaError(
+            f"{context}: bare array classes need a jaxtyping dtype and shape "
+            'annotation, such as Float[Array, "features"]'
+        )
     # scalar classes appearing as union arms (e.g. numpy.number inside a
     # jaxtyping-over-ArrayLike expansion)
     if isinstance(hint, type) and issubclass(
         hint, (bool, int, float, complex, np.generic)
     ):
         return _PyScalarSpec(cls=hint)
-    # the Struct form: `Struct[Cls, dims]` declares that this field is
-    # *stacked*, its leaves carrying the declared dims between the
-    # enclosing batch and the element — the nested-struct analogue of
-    # writing those dims into a jaxtyping annotation
     form = _struct_form(hint)
     if form is not None:
-        target, functors = form
-        if not all(isinstance(functor, str) for functor in functors):
-            raise SchemaError(
-                f"{context}: only the dims variants of the Struct form are "
-                f"meaningful as field annotations, but {hint.__name__} "
-                "carries a functor, describing an image whose leaves "
-                "deliberately depart from the schema; annotate the field "
-                "with the struct class itself"
-            )
-        return _ClassSpec(cls=target, dims=_form_dims(functors))
+        from strux.annotate import _Operation
+
+        target, transformations = form
+        if all(isinstance(op, str) for op in transformations):
+            return _ClassSpec(cls=target, dims=_form_dims(transformations))
+        return _ClassSpec(
+            cls=target,
+            transforms=tuple(_Operation(op) for op in transformations),
+        )
     # any other class: an instance-checked pytree (nested struct, foreign
     # dataclass, abstract base of structs, or registered container); its
     # constraints are derived from the value's dynamic type
@@ -445,9 +356,7 @@ def _parse_hint(hint, context):
                 "(class C[T: Bound]) or mark the field static"
             )
         return _parse_hint(hint.__bound__, context)
-    raise SchemaError(
-        f"{context}: unsupported data field annotation {hint!r}"
-    )
+    raise SchemaError(f"{context}: unsupported data field annotation {hint!r}")
 
 
 def _parse_jaxtype(hint, context):
@@ -466,7 +375,7 @@ def _parse_jaxtype(hint, context):
     fixed = []
     names = []
     for i, token in enumerate(tokens):
-        offset = i - len(tokens)    # negative index from the end
+        offset = i - len(tokens)  # negative index from the end
         if token.isdigit():
             fixed.append((offset, int(token)))
         elif token.isidentifier() and token != "_":
@@ -501,22 +410,10 @@ def _scalar_spec(scalar_cls):
     hint = dtype_cls[jax.typing.ArrayLike, ""]
     context = f"scalar {scalar_cls.__name__}"
     arms = tuple(
-        _parse_jaxtype(arm, context)
-        if _is_jaxtype(arm)
-        else _PyScalarSpec(cls=arm)
+        _parse_jaxtype(arm, context) if _is_jaxtype(arm) else _PyScalarSpec(cls=arm)
         for arm in typing.get_args(hint)
     )
     return _UnionSpec(arms=arms)
-
-
-# # #
-# The Struct form as a field annotation
-#
-# `Struct[Cls, ...]` (strux.annotate) lowers to a synthetic class carrying
-# the target struct type and the functor pipeline. In field position the
-# dims variants declare that a nested struct is *stacked*, which the
-# parser reads off here rather than by importing annotate (which imports
-# this module).
 
 
 def _struct_form(hint):
@@ -540,6 +437,4 @@ def _form_dims(functors):
     prepends its dims in front of the previous, so the tokens read
     right-to-left across the strings.
     """
-    return tuple(
-        token for dim_str in reversed(functors) for token in dim_str.split()
-    )
+    return tuple(token for dim_str in reversed(functors) for token in dim_str.split())

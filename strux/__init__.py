@@ -1,8 +1,8 @@
 """
 Jit-able frozen-dataclass pytrees for JAX: declare a class with jaxtyping
-field annotations and @strux.struct derives an immutable, registered,
-schema-checked pytree with batch-aware shapes, indexing, pretty printing,
-annotations, and serialisation.
+field annotations and @strux.struct derives an immutable registered pytree
+with batch-aware shapes, indexing, pretty printing, composable descriptions,
+optional checking, and serialisation.
 """
 
 import typing
@@ -15,8 +15,10 @@ from strux.schema import (
 )
 from strux.struct import struct
 from strux.annotate import (
-    astype,
-    mapped,
+    Map,
+    Replace,
+    Batch,
+    check,
 )
 
 if typing.TYPE_CHECKING:
@@ -28,6 +30,7 @@ if typing.TYPE_CHECKING:
 else:
     from strux.annotate import Struct
 from strux.shapes import (
+    as_batch,
     tree_dims,
     tree_getitem,
     tree_iter,
@@ -50,9 +53,12 @@ from strux.inspector import describe
 
 __all__ = [
     "struct",
+    "Map",
+    "Replace",
+    "Batch",
+    "check",
+    "as_batch",
     "Struct",
-    "astype",
-    "mapped",
     "schema",
     "Schema",
     "SchemaError",

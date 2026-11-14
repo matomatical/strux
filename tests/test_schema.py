@@ -12,7 +12,6 @@ import strux
 
 from example_structs import Environment
 
-
 # # #
 # Schema compilation
 
@@ -40,7 +39,7 @@ class TestSchema:
 
     def test_bad_annotations_raise_lazily(self):
         # decoration succeeds; the schema (and hence the error) is built
-        # at first construction
+        # when an annotation or query first needs it
         from typing import Any
 
         @strux.struct
@@ -48,7 +47,7 @@ class TestSchema:
             x: Any
 
         with pytest.raises(strux.SchemaError, match="array-leaved pytrees"):
-            Bad(x=jnp.zeros(3))
+            Bad(x=jnp.zeros(3)).check(strux.Struct[Bad, "..."])
 
     def test_object_and_callable_rejected(self):
         from typing import Callable
@@ -58,14 +57,14 @@ class TestSchema:
             x: object
 
         with pytest.raises(strux.SchemaError):
-            BadObject(x=jnp.zeros(3))
+            BadObject(x=jnp.zeros(3)).check(strux.Struct[BadObject, "..."])
 
         @strux.struct
         class BadCallable:
             f: Callable
 
         with pytest.raises(strux.SchemaError, match="mark the field static"):
-            BadCallable(f=lambda x: x)
+            BadCallable(f=lambda x: x).check(strux.Struct[BadCallable, "..."])
 
     def test_static_fields_may_be_anything(self):
         from typing import Any, Callable
@@ -84,7 +83,7 @@ class TestSchema:
             x: Float[Array, "n ..."]
 
         with pytest.raises(strux.SchemaError, match="variadic"):
-            Bad(x=jnp.zeros((2, 3)))
+            Bad(x=jnp.zeros((2, 3))).check(strux.Struct[Bad, "..."])
 
     def test_unresolvable_forward_reference_raises_clearly(self):
         @strux.struct
@@ -92,7 +91,7 @@ class TestSchema:
             x: "NotDefinedAnywhere"  # noqa: F821
 
         with pytest.raises(strux.SchemaError, match="cannot resolve"):
-            Bad(x=jnp.zeros(3))
+            Bad(x=jnp.zeros(3)).check(strux.Struct[Bad, "..."])
 
     def test_foreign_registered_dataclass(self):
         # a plain jax.tree_util.register_dataclass dataclass (the hijax
@@ -108,7 +107,7 @@ class TestSchema:
         )
         @dc.dataclass(frozen=True)
         class Foreign:
-            pos: jax.Array
+            pos: Float[Array, "..."]
             name: str = dc.field(metadata=dict(static=True))
 
         sch = strux.schema(Foreign)
@@ -183,7 +182,7 @@ class TestGenericStructs:
         ref = Ref(env=env)
         assert ref.shape == ()
         with pytest.raises(strux.ValidationError):
-            Ref(env="not an environment")
+            Ref(env="not an environment").check(strux.Struct[Ref, "..."])
 
     def test_unbounded_typevar_field_rejected(self):
         @strux.struct
@@ -191,7 +190,7 @@ class TestGenericStructs:
             value: T
 
         with pytest.raises(strux.SchemaError, match="unbounded type variable"):
-            Bad(value=jnp.zeros(()))
+            Bad(value=jnp.zeros(())).check(strux.Struct[Bad, "..."])
 
     def test_generic_alias_field(self):
         # a generic-alias annotation constrains to the origin class (type
@@ -212,7 +211,9 @@ class TestGenericStructs:
         pair = Pair(boxes=(Box(env=env), Box(env=env)))
         assert pair.shape == ()
         with pytest.raises(strux.ValidationError):
-            Pair(boxes=(env,))  # an Environment is not a Box
+            Pair(boxes=(env,)).check(
+                strux.Struct[Pair, "..."]
+            )  # an Environment is not a Box
 
     def test_generic_alias_in_string_annotation(self):
         # under `from __future__ import annotations` the annotation is a
@@ -296,9 +297,10 @@ class TestStructFormFields:
         assert strux.schema(Network).fields["blocks"].dims == ()
 
     @pytest.mark.parametrize(
-        "functor", [strux.astype(bool), strux.mapped(int)]
+        "functor",
+        [strux.Map(lambda a: Bool[a.array_type, a.dim_str]), strux.Map(lambda _: int)],
     )
-    def test_functor_form_is_refused_as_a_field(self, functor):
+    def test_transformed_description_is_supported_as_a_field(self, functor):
         @strux.struct
         class Block:
             scale: Float[Array, "embed"]
@@ -307,5 +309,4 @@ class TestStructFormFields:
         class Network:
             blocks: strux.Struct[Block, functor]
 
-        with pytest.raises(strux.SchemaError, match="dims variants"):
-            strux.schema(Network)
+        assert strux.schema(Network).fields["blocks"].cls is Block

@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 from beartype import beartype
-from jaxtyping import Array, Float, TypeCheckError, jaxtyped
+from jaxtyping import Array, Bool, Float, TypeCheckError, jaxtyped
 
 import strux
 
@@ -29,8 +29,8 @@ def test_nested_batch_descriptions_preserve_prefix_order():
 
 def test_reduction_after_batching_differs_from_batched_reduction():
     batched_points = strux.Struct[Point, "n"]
-    scalar_mask = strux.Struct[batched_points, strux.mapped(bool)]
-    point_mask = strux.Struct[Point, strux.mapped(bool)]
+    scalar_mask = strux.Struct[batched_points, strux.Map(lambda _: bool)]
+    point_mask = strux.Struct[Point, strux.Map(lambda _: bool)]
     batched_mask = strux.Struct[point_mask, "n"]
     points = Point(x=jnp.arange(3.0), y=jnp.ones(3))
 
@@ -51,7 +51,7 @@ def test_named_summary_composes_with_checked_vmap_and_jit():
         values: Float[Array, "2"]
         score: Float[Array, ""]
 
-    summary = strux.Struct[Measurement, strux.mapped(float)]
+    summary = strux.Struct[Measurement, strux.Map(lambda _: float)]
     summaries = strux.Struct[summary, "n"]
 
     @jaxtyped(typechecker=beartype)
@@ -73,7 +73,7 @@ def test_named_summary_composes_with_checked_vmap_and_jit():
 
 
 def test_composed_return_description_checks_shared_batch_dimension():
-    mask = strux.Struct[Point, strux.astype(bool)]
+    mask = strux.Struct[Point, strux.Map(lambda a: Bool[a.array_type, a.dim_str])]
     masks = strux.Struct[mask, "n"]
 
     @jaxtyped(typechecker=beartype)
@@ -109,7 +109,8 @@ def test_composed_generic_description_retains_original_class():
     class Box[T: Point]:
         item: T
 
-    mask = strux.Struct[Box[Point], strux.astype(bool)]
+    to_bool = strux.Map(lambda a: Bool[a.array_type, a.dim_str])
+    mask = strux.Struct[Box[Point], to_bool]
     batched_mask = strux.Struct[mask, "n"]
     boxes = Box(item=Point(x=jnp.ones(3), y=jnp.zeros(3)))
     compared = jax.tree.map(lambda x: x > 0, boxes)
@@ -117,7 +118,7 @@ def test_composed_generic_description_retains_original_class():
     assert type(compared) is Box
     assert type(compared.item) is Point
     assert isinstance(compared, batched_mask)
-    assert batched_mask is strux.Struct[Box[Point], strux.astype(bool), "n"]
+    assert batched_mask is strux.Struct[Box[Point], to_bool, "n"]
 
 
 def test_composition_rejects_unsupported_transformations():
