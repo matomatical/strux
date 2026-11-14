@@ -3,6 +3,14 @@ strux
 
 A JAX utility library for easily creating jit-able dataclasses.
 
+Install:
+
+```console
+pip install git+https://github.com/matomatical/strux.git
+```
+
+Requires Python 3.12+. Depends on `jax`, `numpy`, and `jaxtyping`.
+
 > **Draft for strux 0.5.** Prepared by Codex for Matthew's review, using
 > passages and examples from the existing README. This describes the proposed
 > API, including features that are not implemented yet. In particular,
@@ -11,12 +19,13 @@ A JAX utility library for easily creating jit-able dataclasses.
 > examples are written to run in order once that API exists. Outputs for
 > unimplemented features show intended results, not passing tests.
 
-Contents
---------
+The rest of this document is an example-driven introduction to strux and its
+features.
 
-- [Installation](#installation)
+Contents:
+
 - [Structs](#structs)
-  - [Basic usage](#basic-usage)
+  - [Basic structs](#basic-structs)
   - [Modules with methods](#modules-with-methods)
   - [Submodules](#submodules)
   - [Static fields](#static-fields)
@@ -43,32 +52,20 @@ Contents
   - [Other serialisation tools](#other-serialisation-tools)
   - [Orbax](#orbax)
 
-Installation
-------------
-
-Install:
-
-```console
-pip install git+https://github.com/matomatical/strux.git
-```
-
-Requires python 3.12+. Dependencies: `jax`, `numpy`, `jaxtyping`.
-
-The installation command above installs the current library. The proposed
-features in this draft are being developed on the `rebuild-0.5` branch.
-
 Structs
 -------
 
-### Basic usage
+### Basic structs
 
-At the most basic level a strux struct is just a frozen dataclass registered as
-a JAX pytree. It works with `jax.jit`, `jax.vmap`, `jax.tree.map`, and friends,
-and supports pretty printing by default.
+A struct groups together multiple arrays and scalars that are parts of a single
+entity in our program. We use jaxtyping annotations or Python scalars to
+document the intended types of its numerical fields.
+
+For example, here is the definition of a simple struct that represents a point
+particle.
 
 ```python
 import jax
-import jax.numpy as jnp
 from jaxtyping import Array, Float
 import strux
 
@@ -76,57 +73,71 @@ import strux
 class Particle:
     position: Float[Array, "2"]
     velocity: Float[Array, "2"]
-    mass: Float[Array, ""]
+    mass: float
+```
+
+At the most basic level a strux struct is just a frozen dataclass registered as
+a JAX pytree. Because it is a dataclass, we automatically get a constructor.
+
+```python
+import jax.numpy as jnp
 
 particle = Particle(
     position=jnp.array([0.2, 0.3]),
     velocity=jnp.array([0.1, -0.2]),
-    mass=jnp.array(1.0),
+    mass=1.0,
 )
+```
+
+Structs support pretty printing by default, showing the types and shapes of
+their array contents, and the value of scalars.
+
+```python
 print(particle)
 ```
 
-Output:
 ```console
 Particle(
   position=jnp.float32[2],
   velocity=jnp.float32[2],
-  mass=jnp.float32[],
+  mass=float(1.0),
 )
 ```
 
-The field annotations describe one particle: two vectors and a scalar.
-Numerical array fields use jaxtyping annotations specifying the dtype and
-shape. An empty shape string means a scalar array. Dimension names can also
-be symbolic, as in the next example.
-
-Pytree operations work out of the box:
+Because a struct is also a registered pytree, it automatically works as an
+input to `jax.jit`, `jax.grad`, `jax.tree.map`, and friends. For example, we can compute the gradient of an energy functional with respect to our particle's parameters:
 
 ```python
-doubled = jax.tree.map(lambda x: 2 * x, particle)
-print(doubled.mass)
-```
+def kinetic_energy(p: Particle) -> Float[Array, ""]:
+    return 0.5 * p.mass * jnp.sum(p.velocity**2)
 
-Output:
+gradient = jax.grad(kinetic_energy)(particle)
+print(gradient.position)
+print(gradient.velocity)
+print(gradient.mass)
+```
 ```console
-2.0
+[0. 0.]
+[ 0.1 -0.2]
+0.025000002
 ```
-
-Construction assigns the fields without checking their shapes or dtypes.
-Annotations describe the intended contents; checking them is optional.
 
 ### Modules with methods
 
-Structs can hold arrays and define jit-compiled methods. Among other things,
-you can use this to define neural network modules. For example, here is a
-simple biased linear transformation layer module.
+Structs can do more than just hold data. They can also define methods. And, as
+registered pytrees, these methods are even compatible with JAX's function
+transformations.
+
+Among other things, this leads to an elegant basis for defining neural network
+modules. For example, here is a simple biased linear transformation layer
+module.
 
 ```python
-import jax
-import jax.numpy as jnp
-from jaxtyping import Array, Float, PRNGKeyArray
+# Note: jax, jnp, strux, Array, and Float were already imported above.
+# In general, all examples in this README share one namespace.
+
+from jaxtyping import PRNGKeyArray
 from typing import Self
-import strux
 
 @strux.struct
 class AffineTransform:
@@ -139,7 +150,7 @@ class AffineTransform:
         key: PRNGKeyArray,
         num_inputs: int,
         num_outputs: int,
-    ) -> Self:
+    ) -> "AffineTransform":
         bound = jax.lax.rsqrt(jnp.float32(num_inputs))
         weights=jax.random.uniform(
             key=key,
@@ -156,30 +167,44 @@ class AffineTransform:
         x: Float[Array, "num_inputs"],
     ) -> Float[Array, "num_outputs"]:
         return x @ self.weights + self.biases
+```
 
-# initialisation
+The above struct defines two methods. First, the static method `.init` is a
+custom constructor that takes a PRNG key and randomly initialises a set of
+weights for the network:
+
+```python
 key = jax.random.key(seed=42)
 net = AffineTransform.init(key=key, num_inputs=10, num_outputs=1)
 print(net)
-
-# inference
-out = net.forward(jnp.ones(10))
-print(out)
 ```
-
-Output:
 ```console
 AffineTransform(
   weights=jnp.float32[10,1],
   biases=jnp.float32[1],
 )
+```
+
+Second, `.forward` is a forward pass (or 'inference') method that takes the
+struct's data as the weight and bias parameters of a neural network, applies
+them to an input vector to produce the neural network's output.
+
+```python
+out = net.forward(jnp.ones(10))
+print(out)
+```
+```console
 [0.47424078]
 ```
 
+Note that both methods are decorated with `jax.jit`. As far as JAX is
+concerned, these methods can return structs or take structs as inputs no
+problem, because structs are registered pytrees.
+
 ### Submodules
 
-Structs can be nested arbitrarily, allowing one to easily implement complex
-neural networks (among other things). For example, here is a multi-layer
+Structs can be nested arbitrarily. Among other things, this allows one to
+implement more complex neural networks. For example, here is a multi-layer
 perceptron module that combines two of the previous AffineTransform modules.
 
 ```python
@@ -188,20 +213,40 @@ class MLP:
     linear1: AffineTransform
     linear2: AffineTransform
 
+    @staticmethod
+    @jax.jit(static_argnames=("features", "hidden", "outputs"))
+    def init(
+        key: PRNGKeyArray,
+        features: int,
+        hidden: int,
+        outputs: int,
+    ) -> Self:
+        k1, k2 = jax.random.split(key)
+        return MLP(
+            linear1=AffineTransform.init(k1, features, hidden),
+            linear2=AffineTransform.init(k2, hidden, outputs),
+        )
+
     @jax.jit
     def forward(self, x: Float[Array, "features"]) -> Float[Array, "outputs"]:
-        h = jax.nn.relu(self.linear1.forward(x))
-        return self.linear2.forward(h)
+        y = self.linear1.forward(x)
+        y = jax.nn.relu(y)
+        y = self.linear2.forward(y)
+        return y
 
-k1, k2 = jax.random.split(jax.random.key(0))
-net = MLP(
-    linear1=AffineTransform.init(k1, num_inputs=4, num_outputs=8),
-    linear2=AffineTransform.init(k2, num_inputs=8, num_outputs=1),
+# initialisation
+net = MLP.init(
+    key=jax.random.key(0),
+    features=4,
+    hidden=8,
+    outputs=1,
 )
 print(net)
-```
 
-Output:
+# inference
+out = net.forward(jnp.ones(4))
+print(out)
+```
 ```console
 MLP(
   linear1=AffineTransform(
@@ -213,30 +258,31 @@ MLP(
     biases=jnp.float32[1],
   ),
 )
+[-0.9280369]
 ```
 
-The two layers have different input and output sizes. Dimension names such
-as `num_inputs` and `num_outputs` describe each layer independently.
+The two layers have different input and output sizes. Note that the symbolic
+dimension names `num_inputs` and `num_outputs` are intended to be read as being
+scoped to each submodule.
 
 ### Static fields
 
-You can use the `static_fieldnames` flag for fields that shouldn't be traced
-by JAX (e.g. configuration, shapes). These fields are treated as static by
-`jax.jit` and excluded from `jax.tree.map`. In the below example we use this
-to make the activation function of the MLP configurable.
+You can use the `static_fieldnames` flag for fields that shouldn't be traced by
+JAX (e.g., configuration, shapes). These fields are treated as static by
+`jax.jit` and excluded from `jax.tree.map`. The effect is conceptually similar
+to the use of `static_argnames` in `jax.jit`.
 
-Here is a replacement definition of `MLP`, also adding an initialiser. The
-remaining examples use this version.
+In the below example we use this to make the activation function of the MLP
+configurable.
 
 ```python
 from typing import Callable
 
-# flag 'activate' as a static field when defining the struct
 @strux.struct(static_fieldnames=("activate",))
-class MLP:
-    linear1: AffineTransform # this is the module from the previous example ^
+class ConfigurableMLP:
+    linear1: AffineTransform
     linear2: AffineTransform
-    activate: Callable
+    activate: Callable[[Float[Array, "hidden"]], Float[Array, "hidden"]]
 
     @staticmethod
     @jax.jit(static_argnames=("features", "hidden", "outputs", "activate"))
@@ -245,28 +291,39 @@ class MLP:
         features: int,
         hidden: int,
         outputs: int,
-        activate: Callable = jax.nn.relu,
-    ) -> Self:
+        activate: Callable[[Float[Array, "hidden"]], Float[Array, "hidden"]],
+    ) -> "ConfigurableMLP":
         k1, k2 = jax.random.split(key)
-        return MLP(
+        return ConfigurableMLP(
             linear1=AffineTransform.init(k1, features, hidden),
             linear2=AffineTransform.init(k2, hidden, outputs),
             activate=activate,
         )
 
     @jax.jit
-    def forward(self: Self, x: Float[Array, "features"]) -> Float[Array, "outputs"]:
-        # because activate is static we can use it directly in jit-compiled code
-        h = self.activate(self.linear1.forward(x))
-        return self.linear2.forward(h)
+    def forward(
+        self: Self,
+        x: Float[Array, "features"],
+    ) -> Float[Array, "outputs"]:
+        y = self.linear1.forward(x)
+        y = self.activate(y) # activate is static so we can use it under jit
+        y = self.linear2.forward(y)
+        return y
 
-net = MLP.init(jax.random.key(0), features=4, hidden=8, outputs=1)
-print(net)
+configurable_net = ConfigurableMLP.init(
+    key=jax.random.key(0),
+    features=4,
+    hidden=8,
+    outputs=1,
+    activate=jnp.sin,
+)
+print(configurable_net)
+print(configurable_net.forward(jnp.ones(4)))
 ```
 
 Output:
 ```console
-MLP(
+ConfigurableMLP(
   linear1=AffineTransform(
     weights=jnp.float32[4,8],
     biases=jnp.float32[8],
@@ -275,13 +332,10 @@ MLP(
     weights=jnp.float32[8,1],
     biases=jnp.float32[1],
   ),
-  activate=<fn:relu>,
+  activate=<fn:sin>,
 )
+[-0.18892062]
 ```
-
-Unlike in equinox, the decision of whether a field is static happens at class
-definition time. This removes the need for filters and filtered JAX
-transformations at a slight flexibility cost.
 
 ### Environment states and replacement
 
@@ -446,12 +500,10 @@ MLP(
     weights=jnp.float32[8,1],
     biases=jnp.float32[1],
   ),
-  activate=<fn:relu>,
 )
 ```
 
 The outer batch dimension appears on every array in the nested structure.
-Static fields such as the activation function are shared by the ensemble.
 
 Use `vmap` again to apply each network to the same input:
 
@@ -640,7 +692,6 @@ MLP(
     weights=jnp.float32[2],
     biases=jnp.float32[2],
   ),
-  activate=<fn:relu>,
 )
 True
 ```
@@ -955,13 +1006,14 @@ Serialisation
 ### Saving structs to disk
 
 Structs can be saved to disk to be restored later, using the `save` method.
+Here we save the `ConfigurableMLP` with the sine activation defined earlier.
 
 ```python
 import os, tempfile
 
-# save the MLP to disk
-path = os.path.join(tempfile.mkdtemp(), "mlp.npz")
-net.save(path)
+# save the ConfigurableMLP to disk
+path = os.path.join(tempfile.mkdtemp(), "configurable_mlp.npz")
+configurable_net.save(path)
 ```
 
 Two file formats are supported:
@@ -993,12 +1045,18 @@ Restoration requires a template to determine the pytree structure.
    match the template's shapes and dtypes.
 
    ```python
-   # restore from disk using a fresh MLP as a template
-   template = MLP.init(jax.random.key(999), features=4, hidden=8, outputs=1)
+   # restore from disk using a fresh ConfigurableMLP as a template
+   template = ConfigurableMLP.init(
+       key=jax.random.key(999),
+       features=4,
+       hidden=8,
+       outputs=1,
+       activate=jnp.sin,
+   )
    restored = template.restore(path)
 
    # the restored model matches the original (not the template)
-   print(jax.tree.all(jax.tree.map(jnp.array_equal, net, restored)))
+   print(jax.tree.all(jax.tree.map(jnp.array_equal, configurable_net, restored)))
    ```
 
    Output:
@@ -1018,12 +1076,12 @@ Restoration requires a template to determine the pytree structure.
    # from statics= (or their defaults)
    restored = strux.load(
        path,
-       template=MLP,
-       statics={"activate": jax.nn.relu},
+       template=ConfigurableMLP,
+       statics={"activate": jnp.sin},
    )
 
    # matches
-   print(jax.tree.all(jax.tree.map(jnp.array_equal, net, restored)))
+   print(jax.tree.all(jax.tree.map(jnp.array_equal, configurable_net, restored)))
    ```
 
    Output:
@@ -1047,8 +1105,8 @@ strux.describe(path)
 Output (the header shows the path as given):
 <!--output:illustrative-->
 ```console
-mlp.npz (savez_compressed, strux format 2): 4 arrays, 49 elements, 196 B
-__main__.MLP
+configurable_mlp.npz (savez_compressed, strux format 2): 4 arrays, 49 elements, 196 B
+__main__.ConfigurableMLP
   linear1: __main__.AffineTransform
     weights: float32[4 8]
     biases: float32[8]
@@ -1060,9 +1118,9 @@ __main__.MLP
 The same functionality is available via the command line:
 
 ```console
-$ python -m strux mlp.npz
-mlp.npz (savez_compressed, strux format 2): 4 arrays, 49 elements, 196 B
-__main__.MLP
+$ python -m strux configurable_mlp.npz
+configurable_mlp.npz (savez_compressed, strux format 2): 4 arrays, 49 elements, 196 B
+__main__.ConfigurableMLP
   linear1: __main__.AffineTransform
     weights: float32[4 8]
     biases: float32[8]
@@ -1087,16 +1145,16 @@ since structs are just pytrees:
 ```python
 import orbax.checkpoint as ocp # pip install orbax-checkpoint
 
-orbax_path = os.path.join(tempfile.mkdtemp(), "mlp_orbax")
+orbax_path = os.path.join(tempfile.mkdtemp(), "configurable_mlp_orbax")
 with ocp.StandardCheckpointer() as checkpointer:
     # save (asynchronous: wait before handing the checkpoint to a reader)
-    checkpointer.save(orbax_path, net)
+    checkpointer.save(orbax_path, configurable_net)
     checkpointer.wait_until_finished()
 
     # restore
     restored = checkpointer.restore(orbax_path, target=template)
 
-print(jax.tree.all(jax.tree.map(jnp.array_equal, net, restored)))
+print(jax.tree.all(jax.tree.map(jnp.array_equal, configurable_net, restored)))
 ```
 
 Output:
@@ -1108,14 +1166,14 @@ True
 - The proposed Map examples only need constant annotation replacement and
   Batch. The richer callback interface for inspecting/changing shape and
   dtype remains open; these examples do not select one.
-- Map traversal through newly inserted structs is a proposed concrete rule:
+- Map traversal through newly inserted structs is implemented as shown:
   replacement is once per original leaf within a Map, and subsequent Maps
-  traverse the result. It needs agreement before implementation.
+  traverse the result. This behaviour still awaits Matthew's review.
 - The optional .check() argument, default exact interpretation, exception
   name and no-return-value usage are draft API choices for review.
-- as_batch storage and nested propagation remain open. These examples require
-  explicit prefix indexing and slice updates but no automatic hint inference
-  from successful checks.
+- as_batch currently propagates hints to nested structs. Indexing updates
+  hints; generic JAX reconstruction and replacement discard them. Successful
+  checks do not create hints. These choices still await Matthew's review.
 - Full support for bare-class/Self boundary checking and global import hooks
   is not established by these explicit-Struct examples.
 - Particle/rollout visualisations can be added after the examples are reviewed.
