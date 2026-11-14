@@ -3,6 +3,15 @@
 Versions and breaking changes are tracked here from 0.1.0 onward. Earlier
 development (0.0.x) is untracked; see the git history.
 
+## Unreleased
+
+### Added
+
+* Struct annotations compose through named intermediate descriptions:
+  `Struct[Struct[Cls, A], B]` is the same annotation as `Struct[Cls, A, B]`.
+  This supports batching an existing transformed description while keeping
+  the original value classes and the written transformation order.
+
 ## 0.4.0 (2026-09-07)
 
 Stacked sub-struct fields: `Struct[Cls, dims]` means something in field

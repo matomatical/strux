@@ -122,6 +122,11 @@ class Struct:
     the image of the functors (dims strings prepend batch dims; see the
     functor classes), applied left to right.
 
+    The first argument can also be an existing Struct description:
+    `Struct[Struct[Cls, first], second]` is the same annotation as
+    `Struct[Cls, first, second]`. This permits named intermediate
+    descriptions without changing the underlying value's class.
+
     For example, given:
 
         @strux.struct
@@ -163,6 +168,9 @@ class Struct:
                 "rank-exact check"
             )
         target, *functors = item
+        if isinstance(target, _StructAnnotationMeta):
+            functors = [*target._functors, *functors]
+            target = target._struct_type
         # a generic alias parameterises the class for static checkers; at
         # runtime the parameters are erased and the origin is the check
         origin = typing.get_origin(target)
@@ -171,7 +179,8 @@ class Struct:
         if not (isinstance(target, type) and dataclasses.is_dataclass(target)):
             raise TypeError(
                 f"Struct[...] expects a struct (or other annotated "
-                f"dataclass pytree) class first, got {target!r}"
+                f"dataclass pytree) class or a Struct description first, "
+                f"got {target!r}"
             )
         for functor in functors:
             if not isinstance(functor, (str, astype, mapped)):
