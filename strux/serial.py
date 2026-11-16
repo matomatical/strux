@@ -384,10 +384,11 @@ def from_dict(d: dict, *, template, statics=None, meta=None):
     the pytree structure, field order, and static field values, and only
     the data leaves are replaced from `d`) or a struct *class* (the
     template-free path: the structure is derived from the class's schema,
-    the dict's keys, and the metadata). In the class case, static fields
-    take their values from `statics` — a dict mapping '/'-joined field
-    paths (e.g. "activate", "linear1/activate") to values — then from the
-    metadata's recorded literals, then from their defaults; a static
+    the dict's keys, and the metadata). In the class case, recorded literal
+    statics come from the metadata. Missing statics are supplied by `statics`
+    — a dict mapping '/'-joined field paths (e.g. "linear1/activate") to
+    values — then by class defaults. Supplied values must agree with any
+    recorded literals; they cannot override saved configuration. A static
     resolvable by none of these raises KeyError naming the path to pass.
 
     `meta` is the str -> str metadata mapping written at save time (strux.load
@@ -408,6 +409,8 @@ def from_dict(d: dict, *, template, statics=None, meta=None):
     instance template every saved leaf must match the template leaf's shape
     and dtype (ValueError listing every mismatch) and the recorded
     structure tags must agree with the template's structure (TypeError).
+    Recorded literal statics must agree with the instance template's values
+    (ValueError). Statics absent from the metadata are not compared.
     """
     meta = dict(meta) if meta else {}
     # view raw-bytes leaves back to their recorded dtypes (npz cannot
@@ -427,6 +430,7 @@ def from_dict(d: dict, *, template, statics=None, meta=None):
         extra = d.keys() - consumed
         if extra:
             raise KeyError(f"Key mismatch in from_dict: extra keys: {sorted(extra)}")
+        _check_template_statics(built, meta)
         return built
     if statics is not None:
         raise TypeError(
@@ -434,6 +438,7 @@ def from_dict(d: dict, *, template, statics=None, meta=None):
             "template already carries its static field values"
         )
     _check_template_structure(template, meta)
+    _check_template_statics(template, meta)
     paths_and_leaves, treedef = jax.tree.flatten_with_path(template)
     keys = set(_keypath_to_str(path) for path, _ in paths_and_leaves)
     missing = keys - d.keys()
@@ -514,6 +519,95 @@ def _check_template_structure(template, meta):
         )
 
 
+def _literal_equal(left, right):
+    """Compare parsed literals, preserving types but ignoring mapping/set order."""
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, (list, tuple)):
+        return len(left) == len(right) and all(
+            _literal_equal(a, b) for a, b in zip(left, right)
+        )
+    if isinstance(left, dict):
+        return len(left) == len(right) and all(
+            any(
+                _literal_equal(key, other_key) and _literal_equal(value, other_value)
+                for other_key, other_value in right.items()
+            )
+            for key, value in left.items()
+        )
+    if isinstance(left, set):
+        return len(left) == len(right) and all(
+            any(_literal_equal(value, other) for other in right) for value in left
+        )
+    return left == right
+
+
+def _static_conflict(value, literal, path, source):
+    encoded = _as_literal(value)
+    if encoded is not None and _literal_equal(
+        ast.literal_eval(literal), ast.literal_eval(encoded)
+    ):
+        return None
+    return (
+        f"at {path}: checkpoint has {literal}, "
+        f"{source} has {encoded if encoded is not None else repr(value)}"
+    )
+
+
+def _check_template_statics(template, meta):
+    """Compare saved literal statics with actual values, independent of schemas."""
+    recorded = {
+        key.removeprefix("static "): literal
+        for key, literal in meta.items()
+        if key.startswith("static ")
+    }
+    if not recorded:
+        return
+    conflicts = []
+
+    def visit(node, path):
+        if dataclasses.is_dataclass(node) and not isinstance(node, type):
+            fields = dataclasses.fields(node)
+            data_fields = getattr(type(node), "_data_fields", None)
+            if data_fields is None:
+                data_fields = {
+                    field.name
+                    for field in fields
+                    if field.metadata.get("pytree_node", True)
+                    and not field.metadata.get("static", False)
+                }
+            for field in fields:
+                field_path = f"{path}/{field.name}" if path else field.name
+                if field.name not in data_fields and field_path in recorded:
+                    conflict = _static_conflict(
+                        getattr(node, field.name),
+                        recorded.pop(field_path),
+                        field_path,
+                        "template",
+                    )
+                    if conflict is not None:
+                        conflicts.append(conflict)
+        children, treedef = jax.tree.flatten_with_path(
+            node, is_leaf=lambda child: child is not node
+        )
+        if treedef.num_nodes == 1 and treedef.num_leaves == 1:
+            return
+        for keypath, child in children:
+            suffix = _keypath_to_str(keypath)
+            visit(child, f"{path}/{suffix}" if path else suffix)
+
+    visit(template, "")
+    conflicts.extend(
+        f"at {path}: checkpoint records a static field absent from the template"
+        for path in recorded
+    )
+    if conflicts:
+        raise ValueError(
+            "cannot restore: recorded static values disagree with the template:\n  "
+            + "\n  ".join(conflicts)
+        )
+
+
 def _build_from_dict(cls, d, statics, prefix, meta, fields=None):
     """
     Build an instance of a struct class from saved leaves, guided by its
@@ -532,13 +626,20 @@ def _build_from_dict(cls, d, statics, prefix, meta, fields=None):
             values[name] = value
             consumed |= keys
         else:
-            # static field: from statics, else recorded literal, else the
-            # field's default
+            # Saved literals constrain supplied values. Missing literals
+            # are filled from supplied statics or the field's default.
             literal = meta.get(_meta_key("static", path))
-            if path in statics:
-                values[name] = statics[path]
-            elif literal is not None:
+            if literal is not None:
+                if path in statics:
+                    conflict = _static_conflict(statics[path], literal, path, "statics")
+                    if conflict is not None:
+                        raise ValueError(
+                            "cannot restore: supplied statics disagree with the "
+                            "checkpoint:\n  " + conflict
+                        )
                 values[name] = ast.literal_eval(literal)
+            elif path in statics:
+                values[name] = statics[path]
             elif field.default is not dataclasses.MISSING:
                 values[name] = field.default
             elif field.default_factory is not dataclasses.MISSING:
@@ -864,10 +965,13 @@ def load(path, *, template, fmt=None, statics=None):
     The template is either an instance (which determines the struct type,
     field order, and static field values; only the data leaves are loaded
     from the file, and each must match the template leaf's shape and
-    dtype) or a struct class (template-free restore: the structure is
+    dtype, and recorded literal statics must agree) or a struct class
+    (template-free restore: the structure is
     derived from the class's schema, the saved keys, and the saved
-    metadata, and static fields come from `statics`, recorded literals, or
-    their defaults — see `strux.from_dict`).
+    metadata, and static fields come from recorded literals, with missing
+    values supplied by `statics` or defaults — see `strux.from_dict`).
+    Supplied statics cannot override recorded values. Change configuration
+    after restoration if needed.
 
     Format is inferred from the file extension: '.npz' for numpy npz
     (handles both compressed and uncompressed), '.safetensors' for

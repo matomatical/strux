@@ -319,7 +319,7 @@ class TestTemplateFreeRestore:
         restored = strux.from_dict(strux.to_dict(t), template=Tagged)
         assert restored.name == "anon"
 
-    def test_statics_param_overrides_recorded_literal(self, tmp_path):
+    def test_statics_param_cannot_override_recorded_literal(self, tmp_path):
         @strux.struct(static_fieldnames=("name",))
         class Tagged:
             x: Float[Array, ""]
@@ -328,8 +328,8 @@ class TestTemplateFreeRestore:
         t = Tagged(x=jnp.float32(1.0), name="custom")
         path = str(tmp_path / "tagged.npz")
         t.save(path)
-        restored = strux.load(path, template=Tagged, statics={"name": "mine"})
-        assert restored.name == "mine"
+        with pytest.raises(ValueError, match="supplied statics disagree"):
+            strux.load(path, template=Tagged, statics={"name": "mine"})
 
     def test_optional_field_roundtrip(self, tmp_path):
         @strux.struct
