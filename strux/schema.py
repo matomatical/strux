@@ -238,9 +238,9 @@ def _parse_hint(hint, context):
     Compile one data field annotation into a spec. Raises SchemaError for
     annotations that don't promise an array-leaved pytree.
     """
-    from strux.annotate import Batch, _result_spec
+    from strux.annotate import _BatchAnnotationMeta, _result_spec
 
-    if isinstance(hint, Batch):
+    if isinstance(hint, _BatchAnnotationMeta):
         return _result_spec(hint)
     # unwrap Annotated[X, ...] to X
     if typing.get_origin(hint) is typing.Annotated:

@@ -17,6 +17,11 @@ development (0.0.x) is untracked; see the git history.
 * `Batch[annotation, dims]` describes leading batch axes. Mapping it over
   leaves is equivalent to batch-string shorthand; consecutive strings
   combine in prepend order.
+  `Batch[Class, dims]` and `Struct[Class, dims]` are interchangeable in
+  checking, field annotations and composition. Batch descriptions also
+  support standalone array and scalar-pytree checking, preserving separate
+  batch and element dimension scopes. `Batch` accepts dimension strings;
+  `Map` and `Replace` remain transformations supplied to `Struct`.
 * `.check(annotation)` checks a value without changing it. `.check()` uses
   the exact default element description. Explicit `Struct` annotations
   also work with jaxtyping/beartype function-boundary checking.

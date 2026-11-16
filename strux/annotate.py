@@ -58,21 +58,27 @@ class Map:
             raise TypeError("Map requires an annotation callable")
 
 
-@dataclasses.dataclass(frozen=True)
 class Batch:
-    """Prepend batch dimensions to an annotation: Batch[annotation, 'axes']."""
+    """Prepend scoped batch dimensions to a numerical pytree annotation.
 
-    annotation: object
-    dims: str
+    Batch[Class, dims] has the same meaning as Struct[Class, dims]. Array
+    annotations and scalar shorthand are also supported. The second argument
+    is always a dimension string, not a Map or Replace transformation.
+    """
 
-    def __post_init__(self):
-        if not isinstance(self.dims, str):
-            raise TypeError("Batch dimensions must be a string")
+    def __new__(cls, annotation, dims):
+        return cls[annotation, dims]
 
     def __class_getitem__(cls, item):
         if not isinstance(item, tuple) or len(item) != 2:
             raise TypeError("Batch takes an annotation and a dimension string")
-        return cls(*item)
+        annotation, dims = item
+        if not isinstance(dims, str):
+            raise TypeError("Batch dimensions must be a string")
+        if isinstance(annotation, _BatchAnnotationMeta):
+            dims = f"{dims} {annotation.dims}"
+            annotation = annotation.annotation
+        return _make_batch_annotation(annotation, " ".join(dims.split()))
 
 
 class Struct:
@@ -87,26 +93,58 @@ class Struct:
                 'Struct takes a class and at least one transformation; use Struct[Class, ""] for an element'
             )
         target, *operations = item
-        if isinstance(target, _StructAnnotationMeta):
-            operations = [*target._functors, *operations]
-            target = target._struct_type
-        target = typing.get_origin(target) or target
-        if not isinstance(target, type) or not dataclasses.is_dataclass(target):
+        parts = _struct_parts(target)
+        if parts is None:
             raise TypeError("Struct expects an annotated dataclass class")
-        for operation in operations:
-            if not isinstance(operation, (str, Replace, Map)):
-                raise TypeError(
-                    "Struct transformations must be dims strings or functors (Replace or Map)"
-                )
-        normalised = []
-        for operation in operations:
-            if isinstance(operation, str):
-                operation = " ".join(operation.split())
-                if normalised and isinstance(normalised[-1], str):
-                    normalised[-1] = f"{operation} {normalised[-1]}".strip()
-                    continue
-            normalised.append(operation)
-        return _make_struct_annotation(target, tuple(normalised))
+        target, previous = parts
+        return _make_struct_annotation(
+            target, _normalise_operations((*previous, *operations))
+        )
+
+
+def _struct_parts(annotation):
+    """Resolve a struct description without erasing its transformation order."""
+    if isinstance(annotation, _StructAnnotationMeta):
+        return annotation._struct_type, annotation._functors
+    if isinstance(annotation, _BatchAnnotationMeta):
+        parts = _struct_parts(annotation.annotation)
+        if parts is None:
+            return None
+        cls, operations = parts
+        return cls, _normalise_operations((*operations, annotation.dims))
+    target = typing.get_origin(annotation) or annotation
+    if isinstance(target, type) and dataclasses.is_dataclass(target):
+        return target, ()
+    return None
+
+
+def _normalise_operations(operations):
+    normalised = []
+    for operation in operations:
+        if not isinstance(operation, (str, Replace, Map)):
+            raise TypeError(
+                "Struct transformations must be dims strings or functors (Replace or Map)"
+            )
+        if isinstance(operation, str):
+            operation = " ".join(operation.split())
+            if normalised and isinstance(normalised[-1], str):
+                normalised[-1] = f"{operation} {normalised[-1]}".strip()
+                continue
+        normalised.append(operation)
+    return tuple(normalised)
+
+
+@functools.lru_cache(maxsize=None)
+def _make_batch_annotation(annotation, dims):
+    _parse_hint(annotation, "Batch element")
+    parts = _struct_parts(annotation)
+    if parts is not None:
+        _fields(*parts)
+    return _BatchAnnotationMeta(
+        f"Batch[{getattr(annotation, '__name__', repr(annotation))}, {dims!r}]",
+        (),
+        {"annotation": annotation, "dims": dims},
+    )
 
 
 @functools.lru_cache(maxsize=None)
@@ -157,6 +195,11 @@ class _Operation:
     scope: object = None
 
 
+def _batch_spec(spec, dims, scope=None):
+    """Retain the boundary between new batch axes and the element annotation."""
+    return _BatchSpec(spec, dims, scope) if dims.strip() else spec
+
+
 def _transform(spec, operation, batch_scope=None):
     """Apply one operation, deferring traversal through class references."""
     spec = _normalise_batch(spec)
@@ -175,7 +218,7 @@ def _transform(spec, operation, batch_scope=None):
     if isinstance(spec, _NoneSpec):
         return spec
     if isinstance(operation, str):
-        return _BatchSpec(spec, operation, batch_scope) if operation.strip() else spec
+        return _batch_spec(spec, operation, batch_scope)
     if isinstance(spec, _ScopedSpec):
         result = _transform(spec.element, operation, batch_scope)
         return _scope_elements(result, spec.scope)
@@ -183,7 +226,7 @@ def _transform(spec, operation, batch_scope=None):
         raise SchemaError(
             "Replace applies to a struct's fields, not an individual leaf"
         )
-    return _map_result(spec, operation)
+    return _map_result(spec, operation, batch_scope)
 
 
 def _normalise_batch(spec):
@@ -195,10 +238,12 @@ def _normalise_batch(spec):
     return dataclasses.replace(spec, element=element)
 
 
-def _map_result(spec, operation):
+def _map_result(spec, operation, batch_scope):
     hint = _as_hint(spec)
     result = _call_map(hint, operation)
-    transformed = _result_spec(result, source=spec, source_hint=hint)
+    transformed = _result_spec(
+        result, source=spec, source_hint=hint, batch_scope=batch_scope
+    )
     return _scope_elements(transformed, _element_scope(spec))
 
 
@@ -215,13 +260,25 @@ def _element_scope(spec):
     return None
 
 
-def _result_spec(hint, *, source=None, source_hint=None):
+def _result_spec(hint, *, source=None, source_hint=None, batch_scope=None):
     if source is not None and hint == source_hint:
         return source
-    if isinstance(hint, Batch):
-        return _BatchSpec(
-            _result_spec(hint.annotation, source=source, source_hint=source_hint),
+    if isinstance(hint, _BatchAnnotationMeta):
+        return _batch_spec(
+            _result_spec(
+                hint.annotation,
+                source=source,
+                source_hint=source_hint,
+                batch_scope=batch_scope,
+            ),
             hint.dims,
+        )
+    if isinstance(hint, _StructAnnotationMeta) and batch_scope is not None:
+        # A description introduced by a Map belongs to that transformation's
+        # batch scope, just like an equivalent Batch returned by the callback.
+        return _ClassSpec(
+            hint._struct_type,
+            transforms=tuple(_Operation(op, batch_scope) for op in hint._functors),
         )
     return _parse_hint(hint, "Map result")
 
@@ -265,6 +322,10 @@ def _scope_batches(spec, scope):
         return dataclasses.replace(spec, element=_scope_batches(spec.element, scope))
     if isinstance(spec, _UnionSpec):
         return _UnionSpec(tuple(_scope_batches(s, scope) for s in spec.arms))
+    if isinstance(spec, _ContainerSpec):
+        return dataclasses.replace(
+            spec, elems=tuple(_scope_batches(s, scope) for s in spec.elems)
+        )
     return spec
 
 
@@ -359,11 +420,16 @@ def _matches(value, spec, path, inherited=()):
         fields = {
             k: _scope_elements(s, local) for k, s in schema(type(value)).fields.items()
         }
-        own = (_Operation(" ".join(spec.dims), local),) if spec.dims else ()
+        own = (_Operation(" ".join(spec.dims)),) if spec.dims else ()
         operations = own + spec.transforms + inherited
+        local_batch = None
         for bound in operations:
             operation = bound.operation
-            scope = bound.scope if bound.scope is not None else local
+            scope = bound.scope
+            if scope is None:
+                if local_batch is None:
+                    local_batch = f"struxderived{next(_scope_counter.get())}_"
+                scope = local_batch
             if not isinstance(scope, _BatchScope):
                 scope = _BatchScope(
                     scope, f"struxbatchlocal{next(_scope_counter.get())}_"
@@ -568,13 +634,23 @@ def _check_description(value, annotation, *, publish):
     try:
         with jaxtyping.jaxtyped("context"):
             _set_memo(working)
-            spec = _ClassSpec(annotation._struct_type)
-            operations = tuple(
-                _Operation(op, _EXTERNAL_SCOPE) for op in annotation._functors
-            )
-            matches = _matches(
-                value, spec, annotation._struct_type.__name__, operations
-            )
+            parts = _struct_parts(annotation)
+            if parts is not None:
+                cls, transformations = parts
+                spec = _ClassSpec(cls)
+                operations = tuple(
+                    _Operation(op, _EXTERNAL_SCOPE) for op in transformations
+                )
+                matches = _matches(value, spec, cls.__name__, operations)
+            else:
+                local = f"struxlocal{next(_scope_counter.get())}_"
+                batch_scope = _BatchScope(
+                    _EXTERNAL_SCOPE,
+                    f"struxbatchlocal{next(_scope_counter.get())}_",
+                )
+                spec = _scope_elements(_result_spec(annotation), local)
+                spec = _scope_batches(spec, batch_scope)
+                matches = _matches(value, spec, annotation.__name__)
             try:
                 next(matches)
                 result = _memo()
@@ -602,21 +678,33 @@ def check(value, annotation=None):
     """Check a value without changing it. Raise ValidationError on mismatch.
 
     With no annotation, require the declared element fields exactly.
-    Explicit checks use a fresh dimension scope and return None.
+    Explicit Struct and Batch descriptions use a fresh dimension scope and
+    return None. A Batch description can also check an array or other
+    supported numerical pytree directly.
     """
     if annotation is None:
         annotation = Struct[type(value), ""]
     elif isinstance(annotation, type) and dataclasses.is_dataclass(annotation):
         annotation = Struct[annotation, ""]
-    if not isinstance(annotation, _StructAnnotationMeta):
-        raise TypeError("check expects a Struct description or dataclass class")
+    if not isinstance(annotation, _DescriptionMeta):
+        raise TypeError(
+            "check expects a Struct or Batch description or dataclass class"
+        )
     _check_description(value, annotation, publish=False)
 
 
-class _StructAnnotationMeta(type):
+class _DescriptionMeta(type):
     def __instancecheck__(cls, value):
         try:
             _check_description(value, cls, publish=True)
         except ValidationError:
             return False
         return True
+
+
+class _StructAnnotationMeta(_DescriptionMeta):
+    pass
+
+
+class _BatchAnnotationMeta(_DescriptionMeta):
+    pass

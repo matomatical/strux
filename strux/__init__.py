@@ -17,18 +17,17 @@ from strux.struct import struct
 from strux.annotate import (
     Map,
     Replace,
-    Batch,
     check,
 )
 
 if typing.TYPE_CHECKING:
-    # the Struct form is typing.Annotated to static checkers (an import-as,
-    # since Annotated is a typeform and cannot be assigned): checkers read
-    # Struct[Env, "batch"] as Env with inert metadata, while at runtime the
-    # same expression builds a synthetic isinstance-checkable class
+    # Both forms are typing.Annotated to static checkers (import-as, since
+    # Annotated is a typeform and cannot be assigned). The underlying type
+    # is preserved; runtime descriptions additionally check shapes and dtypes.
     from typing import Annotated as Struct
+    from typing import Annotated as Batch
 else:
-    from strux.annotate import Struct
+    from strux.annotate import Batch, Struct
 from strux.shapes import (
     as_batch,
     tree_dims,
