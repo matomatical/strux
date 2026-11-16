@@ -76,8 +76,11 @@ class _ClassSpec:
     cls: type
     dims: tuple = ()  # element-level batch dimensions
     transforms: tuple = ()
+    check_fields: bool = True
 
     def __str__(self):
+        if not self.check_fields:
+            return f"InstanceOf[{self.cls.__name__}]"
         if self.dims:
             return f'Struct[{self.cls.__name__}, "{" ".join(self.dims)}"]'
         return self.cls.__name__
@@ -325,6 +328,10 @@ def _parse_hint(hint, context):
         hint, (bool, int, float, complex, np.generic)
     ):
         return _PyScalarSpec(cls=hint)
+    from strux.annotate import _InstanceAnnotationMeta
+
+    if isinstance(hint, _InstanceAnnotationMeta):
+        return _ClassSpec(cls=hint._instance_type, check_fields=False)
     form = _struct_form(hint)
     if form is not None:
         from strux.annotate import _Operation

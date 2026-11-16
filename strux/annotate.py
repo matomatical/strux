@@ -59,6 +59,27 @@ class Map:
             raise TypeError("Map requires an annotation callable")
 
 
+class InstanceOf:
+    """Require class membership without checking a value's field annotations."""
+
+    def __class_getitem__(cls, target):
+        if not isinstance(target, type):
+            raise TypeError("InstanceOf takes a Python class")
+        return _make_instance_annotation(target)
+
+
+class _InstanceAnnotationMeta(type):
+    def __instancecheck__(cls, value):
+        return isinstance(value, cls._instance_type)
+
+
+@functools.lru_cache(maxsize=None)
+def _make_instance_annotation(target):
+    return _InstanceAnnotationMeta(
+        f"InstanceOf[{target.__name__}]", (), {"_instance_type": target}
+    )
+
+
 class Batch:
     """Prepend scoped batch dimensions to a numerical pytree annotation.
 
@@ -205,6 +226,13 @@ def _transform(spec, operation, batch_scope=None):
     """Apply one operation, deferring traversal through class references."""
     spec = _normalise_batch(spec)
     if isinstance(spec, _ClassSpec):
+        if not spec.check_fields:
+            if operation == "":
+                return spec
+            raise SchemaError(
+                "InstanceOf exposes no leaf annotations to transform; "
+                "use a class or Struct description instead"
+            )
         return dataclasses.replace(
             spec, transforms=spec.transforms + (_Operation(operation, batch_scope),)
         )
@@ -457,6 +485,9 @@ def _matches(value, spec, path, inherited=()):
             raise _Failure(
                 path, "type", spec.cls.__name__, type(value).__name__
             ).error()
+        if not spec.check_fields:
+            yield
+            return
         if not dataclasses.is_dataclass(value):
             raise SchemaError(
                 f"{path}: checking requires an annotated dataclass pytree"
@@ -717,15 +748,25 @@ def check(value, annotation=None):
     With no annotation, require the declared element fields exactly.
     Explicit Struct and Batch descriptions use a fresh dimension scope and
     return None. A Batch description can also check an array or other
-    supported numerical pytree directly.
+    supported numerical pytree directly. InstanceOf checks class membership
+    without inspecting fields.
     """
+    if isinstance(annotation, _InstanceAnnotationMeta):
+        if not isinstance(value, annotation):
+            raise _Failure(
+                annotation.__name__,
+                "type",
+                annotation._instance_type.__name__,
+                type(value).__name__,
+            ).error()
+        return
     if annotation is None:
         annotation = Struct[type(value), ""]
     elif isinstance(annotation, type) and dataclasses.is_dataclass(annotation):
         annotation = Struct[annotation, ""]
     if not isinstance(annotation, _DescriptionMeta):
         raise TypeError(
-            "check expects a Struct or Batch description or dataclass class"
+            "check expects a Struct, Batch, or InstanceOf description or dataclass class"
         )
     _check_description(value, annotation, publish=False)
 

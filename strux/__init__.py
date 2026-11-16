@@ -19,6 +19,7 @@ from strux.annotate import (
     Replace,
     check,
 )
+from strux.checking import checked
 
 if typing.TYPE_CHECKING:
     # Both forms are typing.Annotated to static checkers (import-as, since
@@ -26,8 +27,10 @@ if typing.TYPE_CHECKING:
     # is preserved; runtime descriptions additionally check shapes and dtypes.
     from typing import Annotated as Struct
     from typing import Annotated as Batch
+
+    type InstanceOf[T] = typing.Annotated[T, "class membership only"]
 else:
-    from strux.annotate import Batch, Struct
+    from strux.annotate import Batch, InstanceOf, Struct
 from strux.shapes import (
     as_batch,
     tree_dims,
@@ -56,6 +59,8 @@ __all__ = [
     "Replace",
     "Batch",
     "check",
+    "checked",
+    "InstanceOf",
     "as_batch",
     "Struct",
     "schema",

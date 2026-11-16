@@ -20,6 +20,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+checking = [
+    "beartype>=0.23.1",
+]
 safetensors = [
     "safetensors[numpy]",
 ]
