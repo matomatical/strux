@@ -406,6 +406,16 @@ def _set_memo(memo):
     set_shape_memo(*memo)
 
 
+def _publish_memo(memo):
+    from jaxtyping._storage import get_shape_memo
+
+    # Jaxtyping's error formatter retains these dictionary objects. Publish
+    # into them so both subsequent checks and diagnostics see the bindings.
+    for current, updated in zip(get_shape_memo(), memo):
+        current.clear()
+        current.update(updated)
+
+
 def _diagnostic_parts(spec, scope=""):
     if isinstance(spec, _ScopedSpec):
         return _diagnostic_parts(spec.element, spec.scope)
@@ -698,7 +708,7 @@ def _check_description(value, annotation, *, publish):
             }
             for part in result[:2]
         )
-        _set_memo((*exported, result[2], result[3]))
+        _publish_memo((*exported, result[2], result[3]))
 
 
 def check(value, annotation=None):

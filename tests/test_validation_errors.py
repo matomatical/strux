@@ -4,7 +4,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jaxtyping import Array, Float, Int, jaxtyped
+from beartype import beartype
+from jaxtyping import Array, Float, Int, TypeCheckError, jaxtyped
 
 import strux
 
@@ -182,3 +183,52 @@ def test_diagnostic_probes_do_not_publish_failed_bindings_under_jit():
 
     result = probe(jnp.ones((4, 2, 3)), jnp.ones((3, 2, 2)))
     assert result.shape == (3, 2, 2)
+
+
+@pytest.mark.parametrize("form", [strux.Struct, strux.Batch])
+@pytest.mark.parametrize(
+    "dims, batch, wrong_batch, binding",
+    [
+        ("members", (3,), (2,), "members=3"),
+        ("*members", (3, 2), (3, 1), "members=(3, 2)"),
+    ],
+)
+def test_boundary_errors_include_published_batch_bindings(
+    form, dims, batch, wrong_batch, binding
+):
+    @strux.struct
+    class Model:
+        weights: Float[Array, "hidden"]
+
+    @jaxtyped(typechecker=beartype)
+    def forward(
+        context: Float[Array, "context"],
+        models: form[Model, dims],
+        inputs: Float[Array, f"{dims} features"],
+    ):
+        return inputs
+
+    models = Model(jnp.ones((*batch, 4)))
+    with pytest.raises(TypeCheckError) as caught:
+        forward(jnp.ones(5), models, jnp.ones((*wrong_batch, 4)))
+    message = str(caught.value)
+    assert "parameter 'inputs'" in message
+    assert binding in message
+    assert "context=5" in message
+    assert "hidden=" not in message
+    assert "struxexternal_" not in message
+    assert "struxlocal" not in message
+    assert forward(jnp.ones(5), models, jnp.ones((*batch, 4))).shape == (*batch, 4)
+
+
+def test_return_errors_include_bindings_from_struct_arguments():
+    @jaxtyped(typechecker=beartype)
+    def shorten(particles: strux.Batch[Particle, "n"]) -> Float[Array, "n"]:
+        return particles.mass[:-1]
+
+    particles = Particle(jnp.ones((3, 2)), jnp.ones((3, 2)), jnp.ones(3))
+    with pytest.raises(TypeCheckError) as caught:
+        shorten(particles)
+    message = str(caught.value)
+    assert "return value" in message
+    assert "n=3" in message
