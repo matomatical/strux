@@ -29,7 +29,7 @@ def checked(fn=None, *, typechecker=_DEFAULT):
     and Batch descriptions keep their explicit transformations; InstanceOf
     requests only class membership. Constructors and replace are unaffected.
 
-    Beartype is the default backend, installed with ``strux[checking]``.
+    Beartype is the default backend, installed with ``strux[beartype]``.
     Supply another jaxtyping-compatible decorator with ``typechecker=...``,
     or None to establish a jaxtyping context without automatic checks.
 
@@ -55,7 +55,7 @@ def checked(fn=None, *, typechecker=_DEFAULT):
         except ImportError as error:
             raise ImportError(
                 "strux.checked requires the optional beartype dependency; "
-                "install 'strux[checking]' or pass typechecker explicitly"
+                "install 'strux[beartype]' or pass typechecker explicitly"
             ) from error
         typechecker = beartype
     return _decorate(fn, typechecker, localns)

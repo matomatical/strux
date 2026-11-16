@@ -382,7 +382,7 @@ try:
     def f(value: Item):
         return value
 except ImportError as error:
-    assert "strux[checking]" in str(error)
+    assert "strux[beartype]" in str(error)
 else:
     raise AssertionError("default backend must require the extra")
 @strux.checked(typechecker=lambda fn: fn)

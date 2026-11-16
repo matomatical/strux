@@ -20,7 +20,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-checking = [
+beartype = [
     "beartype>=0.23.1",
 ]
 safetensors = [
