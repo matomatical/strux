@@ -15,6 +15,7 @@ import typing
 import jax
 import jaxtyping
 
+from strux.diagnostics import _Axis, _Failure, _leaf_failure, _union_failure
 from strux.schema import (
     SchemaError,
     ValidationError,
@@ -405,13 +406,47 @@ def _set_memo(memo):
     set_shape_memo(*memo)
 
 
+def _diagnostic_parts(spec, scope=""):
+    if isinstance(spec, _ScopedSpec):
+        return _diagnostic_parts(spec.element, spec.scope)
+    if isinstance(spec, _BatchSpec):
+        leaf, axes = _diagnostic_parts(spec.element, scope)
+        batch_scope = spec.scope if spec.scope is not None else scope
+        prefix = tuple(
+            _Axis(name, key, batch=True)
+            for name, key in zip(
+                spec.dims.split(), _qualify(spec.dims, batch_scope).split()
+            )
+        )
+        return leaf, prefix + axes
+    if isinstance(spec, _ArraySpec):
+        dims = spec.jaxtype.dim_str
+        axes = tuple(
+            _Axis(name, key)
+            for name, key in zip(dims.split(), _qualify(dims, scope).split())
+        )
+        return spec, axes
+    return spec, ()
+
+
+def _explain_leaf(value, spec, path, initial):
+    # Diagnostic probes must not change bindings, including while a union
+    # generator is suspended or a partition search is being unwound.
+    _set_memo(tuple(dict(part) for part in initial))
+    try:
+        leaf, axes = _diagnostic_parts(spec)
+        return _leaf_failure(value, leaf, axes, path, initial[0])
+    finally:
+        _set_memo(initial)
+
+
 def _matches(value, spec, path, inherited=()):
     spec = _normalise_batch(spec)
     if isinstance(spec, _ClassSpec):
         if not isinstance(value, spec.cls):
-            raise ValidationError(
-                f"{path}: expected {spec.cls.__name__}, got {type(value).__name__}"
-            )
+            raise _Failure(
+                path, "type", spec.cls.__name__, type(value).__name__
+            ).error()
         if not dataclasses.is_dataclass(value):
             raise SchemaError(
                 f"{path}: checking requires an annotated dataclass pytree"
@@ -457,22 +492,18 @@ def _matches(value, spec, path, inherited=()):
             dict if spec.kind == "dict" else list if spec.kind == "list" else tuple
         )
         if not isinstance(value, expected):
-            raise ValidationError(
-                f"{path}: expected {expected.__name__}, got {type(value).__name__}"
-            )
+            raise _Failure(
+                path, "type", expected.__name__, type(value).__name__
+            ).error()
         if spec.kind == "tuple":
             if len(value) != len(spec.elems):
-                raise ValidationError(
-                    f"{path}: expected {len(spec.elems)} tuple entries"
-                )
+                raise _Failure(path, "length", len(spec.elems), len(value)).error()
             items = [(i, v, s) for i, (v, s) in enumerate(zip(value, spec.elems))]
         else:
             if spec.kind == "dict":
                 for key in value:
                     if not _key_matches(key, spec.keytype):
-                        raise ValidationError(
-                            f"{path}: key {key!r} does not match {spec.keytype!r}"
-                        )
+                        raise _Failure(path, "key", repr(spec.keytype), key).error()
             entries = value.items() if spec.kind == "dict" else enumerate(value)
             items = [(k, v, spec.elems[0]) for k, v in entries]
         yield from _sequence(
@@ -489,13 +520,13 @@ def _matches(value, spec, path, inherited=()):
                     matched = True
                     yield
             except ValidationError as error:
-                failures.append(str(error))
+                failures.append(error)
         _set_memo(initial)
         if not matched:
-            raise ValidationError(f"{path}: no arm matches; " + "; ".join(failures))
+            raise _union_failure(path, failures)
     elif isinstance(spec, _NoneSpec):
         if value is not None:
-            raise ValidationError(f"{path}: expected None")
+            raise _Failure(path, "type", "None", type(value).__name__).error()
         yield
     else:
         initial = _memo()
@@ -507,12 +538,7 @@ def _matches(value, spec, path, inherited=()):
             yield from _partitioned_matches(value, spec, path)
             return
         if hint is None or not isinstance(value, hint):
-            _set_memo(initial)
-            shape = getattr(value, "shape", None)
-            dtype = getattr(value, "dtype", type(value).__name__)
-            raise ValidationError(
-                f"{path}: expected {_as_hint(spec)!r}, got {dtype} with shape {shape}"
-            )
+            raise _explain_leaf(value, spec, path, initial)
         try:
             yield
         finally:
@@ -547,7 +573,8 @@ def _sequence(items):
     stack = []
     depth = 0
     matched = False
-    last_error = None
+    best_error = None
+    failure_depth = -1
     try:
         while depth >= 0:
             if depth == len(items):
@@ -561,12 +588,13 @@ def _sequence(items):
                 next(stack[depth])
                 depth += 1
             except (StopIteration, ValidationError) as error:
-                if isinstance(error, ValidationError):
-                    last_error = error
+                if isinstance(error, ValidationError) and depth > failure_depth:
+                    best_error = error
+                    failure_depth = depth
                 stack.pop().close()
                 depth -= 1
-        if not matched and last_error is not None:
-            raise last_error
+        if not matched and best_error is not None:
+            raise best_error
     finally:
         for choices in reversed(stack):
             choices.close()
@@ -585,9 +613,10 @@ def _shape_parts(spec, scope=""):
 
 def _partitioned_matches(value, spec, path):
     """Match separate variadic batch/element segments with backtracking."""
+    initial = _memo()
     hint, parts = _shape_parts(spec)
     if not isinstance(value, hint.dtype[hint.array_type, "..."]):
-        raise ValidationError(f"{path}: expected {_as_hint(spec)!r}")
+        raise _explain_leaf(value, spec, path, initial)
 
     def partitions(shape, remaining):
         if not remaining:
@@ -615,9 +644,7 @@ def _partitioned_matches(value, spec, path):
         matched = True
         yield
     if not matched:
-        raise ValidationError(
-            f"{path}: shape {value.shape} does not match {_as_hint(spec)!r}"
-        )
+        raise _explain_leaf(value, spec, path, initial)
 
 
 def _check_description(value, annotation, *, publish):

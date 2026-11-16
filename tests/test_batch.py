@@ -235,7 +235,7 @@ class TestSchemaSolver:
         assert Opt(momentum=jnp.zeros(5), count=jnp.int32(0)).shape == ()
         batched = Opt(momentum=jnp.zeros((8, 5)), count=jnp.zeros(8, jnp.int32))
         assert batched.shape == (8,)
-        with pytest.raises(strux.ValidationError, match="no arm"):
+        with pytest.raises(strux.ValidationError, match="no alternative matches"):
             Opt(momentum="hello", count=jnp.int32(0)).check(strux.Struct[Opt, "..."])
 
     def test_rank_ambiguous_union_disambiguated_by_sibling(self):
@@ -289,7 +289,7 @@ class TestSchemaSolver:
         assert batched.shape == (4,)
         assert isinstance(batched, strux.Struct[Bank, "batch"])
         assert not isinstance(bank, strux.Struct[Bank, "batch"])
-        with pytest.raises(strux.ValidationError, match="expected"):
+        with pytest.raises(strux.ValidationError, match=r"Bank.layers\[1\]: shape"):
             Bank(
                 layers=(jnp.zeros((4, 3)), jnp.zeros((3, 5))),
                 table={},

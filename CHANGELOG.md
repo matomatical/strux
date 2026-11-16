@@ -51,6 +51,11 @@ development (0.0.x) is untracked; see the git history.
 
 ### Fixed
 
+* Explicit validation errors identify field paths and common type, dtype,
+  rank and dimension mismatches. Scalar shorthand reports the relevant
+  array failure instead of listing incompatible representations. Union
+  alternatives retain distinct explanations, and backtracking preserves
+  the failure reached furthest through the fields.
 * README tests have a bounded execution time and report original source
   locations, earlier output mismatches, and tracebacks when examples fail
   or hang.
