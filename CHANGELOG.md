@@ -3,7 +3,7 @@
 Versions and breaking changes are tracked here from 0.1.0 onward. Earlier
 development (0.0.x) is untracked; see the git history.
 
-## Unreleased
+## 0.5.0 (2026-11-16)
 
 ### Added
 
@@ -25,6 +25,12 @@ development (0.0.x) is untracked; see the git history.
 * `.check(annotation)` checks a value without changing it. `.check()` uses
   the exact default element description. Explicit `Struct` annotations
   also work with jaxtyping/beartype function-boundary checking.
+* `@strux.checked` checks function arguments and returns, interpreting plain
+  strux class annotations as recursive element descriptions. Supports Self,
+  forward references, transformed descriptions, and vanilla JAX transforms.
+  Beartype is the default backend, available through `strux[beartype]`.
+* `InstanceOf[Class]` requests class membership without field validation,
+  including at checked function boundaries and in explicit checks.
 * `.as_batch(shape=...)` provides an explicit indexing interpretation for
   values whose element shapes have changed. Views keep the value classes
   and share arrays. Indexing updates hints, while replacement and generic
@@ -48,9 +54,15 @@ development (0.0.x) is untracked; see the git history.
 * Element dimension names are local to each struct occurrence. Outer batch
   names can connect function arguments and returns, and failed checks and
   union alternatives do not leave dimension bindings behind.
+* Restoration preserves recorded literal static values. Instance templates
+  and supplied `statics=` must agree with saved configuration; `statics=`
+  fills missing values rather than overriding recorded values. Unrecorded
+  statics still come from the instance template or supplied values/defaults.
 
 ### Fixed
 
+* Distributions include the `py.typed` marker so static checkers can use
+  the package's annotations after installation.
 * Jaxtyping function-boundary errors include batch-axis bindings established
   by struct annotations. Publishing bindings preserves the dictionary
   objects used by jaxtyping's error formatter.

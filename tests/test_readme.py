@@ -18,8 +18,7 @@ import re
 import subprocess
 import sys
 
-# The working API specification lives in the independent draft during the rebuild.
-README = pathlib.Path(__file__).parent.parent / "README-draft.md"
+README = pathlib.Path(__file__).parent.parent / "README.md"
 
 _FENCE = re.compile(r"(\s*)(`{3,})(\w*)\s*$")
 _ILLUSTRATIVE = "<!--output:illustrative-->"
