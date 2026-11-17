@@ -3,7 +3,19 @@
 Versions and breaking changes are tracked here from 0.1.0 onward. Earlier
 development (0.0.x) is untracked; see the git history.
 
+Release attributions refer to the changes described in each section, based
+on the commits' Co-Authored-By trailers.
+
 ## 0.5.0 (2026-11-16)
+
+This release separates struct construction, annotation, and validation.
+Structs remain ordinary JAX pytrees while composable annotations describe
+batches, masks, summaries, and other transformed contents. Batch indexing
+supports explicit shape hints, and runtime checking is opt-in through
+`.check` and `@strux.checked`. The release also improves validation errors
+and checkpoint restoration, and includes a rewritten, executable README.
+
+This release was developed by MFR and Codex (GPT-6 Astra).
 
 ### Added
 
@@ -80,6 +92,8 @@ development (0.0.x) is untracked; see the git history.
 Stacked sub-struct fields: `Struct[Cls, dims]` means something in field
 position.
 
+This release was developed by MFR and Claude Opus 5 (1M context).
+
 ### Added
 
 * A `Struct[Cls, dims]` **field** annotation now declares that a nested
@@ -122,6 +136,8 @@ position.
 
 Solver v2: symbolic dim names mean something.
 
+This release was developed by MFR and Claude Fable 5.
+
 ### Added
 
 * `Struct`-form isinstance on plain batched annotations (dim strings only)
@@ -151,6 +167,8 @@ Solver v2: symbolic dim names mean something.
 
 The batch view becomes a first-class, safe API: bounds-aware indexing,
 length and iteration, no scalar broadcasting, and cached batch solving.
+
+This release was developed by MFR and Claude Fable 5.
 
 ### Added
 
@@ -192,6 +210,8 @@ length and iteration, no scalar broadcasting, and cached batch solving.
 ## 0.1.0 (2026-08-14)
 
 Serialisation v2: saved files become self-describing.
+
+This release was developed by MFR and Claude Fable 5.
 
 ### Added
 
