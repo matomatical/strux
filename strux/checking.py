@@ -40,7 +40,10 @@ def checked(fn=None, *, typechecker=_DEFAULT):
 
     Supports synchronous functions, methods, and property accessors. Place
     jax.jit outside checked so checks run during tracing. Async functions and
-    generators are not supported.
+    generators are not supported. Applying checked again to its own wrapper
+    replaces its checking configuration instead of nesting checking contexts.
+    This decorator owns its jaxtyping context; do not supply it as the
+    typechecker of another jaxtyped wrapper.
     """
     if fn is None:
         return functools.partial(checked, typechecker=typechecker)
@@ -74,6 +77,10 @@ def _decorate(fn, typechecker, localns):
         )
     if not inspect.isfunction(fn):
         raise TypeError("strux.checked decorates functions, not classes or values")
+    no_type_check = getattr(fn, "__no_type_check__", False)
+    if getattr(fn, "_strux_checked_code", None) is fn.__code__:
+        localns = fn._strux_checked_localns
+        fn = fn.__wrapped__
     if (
         inspect.iscoroutinefunction(fn)
         or inspect.isgeneratorfunction(fn)
@@ -95,7 +102,13 @@ def _decorate(fn, typechecker, localns):
             return fn(*args, **kwargs)
         receiver = _receiver_class(fn, args, kwargs)
         if receiver not in cache:
-            namespace = dict(localns)
+            # Class type parameters occupy an annotation scope outside the
+            # class dictionary. get_type_hints(function) only supplies the
+            # function's own type parameters, so retain the enclosing ones.
+            namespace = {
+                param.__name__: param for param in localns.get("__type_params__", ())
+            }
+            namespace.update(localns)
             if receiver is not None:
                 namespace.update(
                     {cls.__name__: cls for cls in reversed(receiver.__mro__)}
@@ -144,6 +157,12 @@ def _decorate(fn, typechecker, localns):
             cache[receiver] = jaxtyping.jaxtyped(proxy, typechecker=typechecker)
         return cache[receiver](*args, **kwargs)
 
+    # Code identity distinguishes this wrapper from other decorators which
+    # copy its attributes with functools.wraps.
+    wrapper._strux_checked_code = wrapper.__code__
+    wrapper._strux_checked_localns = localns
+    if no_type_check:
+        wrapper.__no_type_check__ = True
     return wrapper
 
 

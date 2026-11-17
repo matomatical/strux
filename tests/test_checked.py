@@ -1,5 +1,6 @@
 """The public decorator preserves values while checking recursive descriptions."""
 
+import functools
 import inspect
 import subprocess
 import sys
@@ -427,3 +428,53 @@ def test_rejects_unsupported_decorator_targets():
     for target in (asynchronous, generator, Layer):
         with pytest.raises(TypeError):
             strux.checked(target)
+
+
+def test_repeated_checking_replaces_configuration_and_preserves_opt_outs():
+    @strux.checked(typechecker=None)
+    @strux.checked
+    def unchecked(value: Layer) -> Layer:
+        return value
+
+    assert unchecked(42) == 42
+    assert not hasattr(unchecked.__wrapped__, "__wrapped__")
+
+    @strux.checked
+    @no_type_check
+    @strux.checked
+    def excluded(value: Layer) -> Layer:
+        return value
+
+    assert excluded(42) == 42
+
+
+def test_repeated_checking_keeps_other_decorators_and_original_local_names():
+    def make_function():
+        LocalAlias = Layer
+
+        @strux.checked
+        def identity(value: "LocalAlias") -> "LocalAlias":
+            return value
+
+        return identity
+
+    LocalAlias = int
+    original = make_function()
+    rechecked = strux.checked(original)
+    assert rechecked(layer()).weights.shape == (3, 2)
+    with pytest.raises(TypeCheckError):
+        rechecked(42)
+
+    @strux.checked
+    def keep(value: Layer) -> Layer:
+        return value
+
+    @functools.wraps(keep)
+    def change_result(*args, **kwargs):
+        keep(*args, **kwargs)
+        return Layer(True, False)
+
+    # functools.wraps copies the private marker as well as annotations.
+    # Checking must preserve this intervening decorator and check its output.
+    with pytest.raises(TypeCheckError, match="return value"):
+        strux.checked(change_result)(layer())
