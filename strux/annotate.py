@@ -10,6 +10,7 @@ import dataclasses
 import functools
 import itertools
 import re
+import threading
 import typing
 
 import jax
@@ -28,6 +29,25 @@ from strux.schema import (
     _ContainerSpec,
     _UnionSpec,
 )
+
+_description_counts = {}
+_description_lock = threading.Lock()
+
+
+def _make_description(metaclass, name, attributes):
+    """Give distinct descriptions distinct compound-annotation representations.
+
+    Runtime checkers may use repr(annotation) as a cache key. GenericAlias
+    renders class arguments using their qualified names, not their metaclass's
+    repr, so the qualified name must distinguish descriptions even when their
+    human-readable names coincide. Every base name ends in a closing bracket;
+    a numbered suffix cannot collide with another base name.
+    """
+    with _description_lock:
+        count = _description_counts.get(name, 0) + 1
+        _description_counts[name] = count
+    qualname = name if count == 1 else f"{name}#{count}"
+    return metaclass(name, (), {**attributes, "__qualname__": qualname})
 
 
 @dataclasses.dataclass(frozen=True, init=False)
@@ -75,8 +95,10 @@ class _InstanceAnnotationMeta(type):
 
 @functools.lru_cache(maxsize=None)
 def _make_instance_annotation(target):
-    return _InstanceAnnotationMeta(
-        f"InstanceOf[{target.__name__}]", (), {"_instance_type": target}
+    return _make_description(
+        _InstanceAnnotationMeta,
+        f"InstanceOf[{target.__name__}]",
+        {"_instance_type": target},
     )
 
 
@@ -162,9 +184,9 @@ def _make_batch_annotation(annotation, dims):
     parts = _struct_parts(annotation)
     if parts is not None:
         _fields(*parts)
-    return _BatchAnnotationMeta(
+    return _make_description(
+        _BatchAnnotationMeta,
         f"Batch[{getattr(annotation, '__name__', repr(annotation))}, {dims!r}]",
-        (),
         {"annotation": annotation, "dims": dims},
     )
 
@@ -173,9 +195,9 @@ def _make_batch_annotation(annotation, dims):
 def _make_struct_annotation(cls, operations):
     # Check field names and annotation syntax when the description is declared.
     _fields(cls, operations)
-    return _StructAnnotationMeta(
+    return _make_description(
+        _StructAnnotationMeta,
         f"Struct[{cls.__name__}, {', '.join(map(repr, operations))}]",
-        (),
         {"_struct_type": cls, "_functors": operations},
     )
 

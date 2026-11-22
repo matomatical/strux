@@ -66,3 +66,33 @@ def test_hang_reports_active_block_and_earlier_mismatch(tmp_path):
     assert "timed out after 2s" in message
     assert "output mismatch" in message
     assert f"Executing {readme}:9" in message
+
+
+def test_illustrative_setup_is_skipped_without_skipping_following_code(tmp_path):
+    readme = tmp_path / "README.md"
+    readme.write_text(
+        "<!--code:illustrative-->\n"
+        "```python\nimport nonexistent_example_package\n```\n"
+        "```console\nillustrative output\n```\n"
+        "```python\nprint('executed')\n```\n"
+        "```console\nexecuted\n```\n"
+    )
+    _check_readme(readme)
+
+
+def test_import_hook_checks_undecorated_readme_definitions(tmp_path):
+    readme = tmp_path / "README.md"
+    readme.write_text(
+        "```python\n"
+        "import strux\n"
+        "@strux.struct\n"
+        "class Item:\n"
+        "    value: int\n"
+        "def identity(value: Item) -> Item:\n"
+        "    return value\n"
+        "identity(Item('wrong'))\n"
+        "```\n"
+    )
+    _check_readme(readme, checking=False)
+    with pytest.raises(AssertionError, match="TypeCheckError"):
+        _check_readme(readme, checking=True)

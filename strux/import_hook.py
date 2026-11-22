@@ -1,13 +1,14 @@
-"""Apply recursive function checking to selected filesystem source imports.
+"""Enable recursive function checking for package source modules.
 
-Install before importing application modules::
+Enable in a package's __init__.py before importing its other modules::
 
-    with strux.install_import_hook("my_package", exclude=("my_package.vendor",)):
-        import my_package
+    strux.enable_checking(__name__)
 
-The imported functions remain checked after the context exits. A persistent
-installation can instead be removed with the returned handle's uninstall().
-Already imported modules are unaffected; removal does not unwrap functions.
+This covers ordinary imports and entrypoints launched with python -m. Direct
+file execution does not initialise the containing package and is not covered.
+The returned handle can be used as a context manager or removed with uninstall().
+Existing functions remain checked after removal; already loaded modules and
+the initializer currently executing are unaffected by enabling checking.
 
 Only synchronous, non-generator function definitions are instrumented,
 including methods and nested functions. Checking is placed inside existing
@@ -38,13 +39,13 @@ import sys
 from strux.checking import _DEFAULT, checked
 
 
-def install_import_hook(
+def enable_checking(
     modules: str | Sequence[str],
     *,
     exclude: str | Sequence[str] = (),
     typechecker=_DEFAULT,
 ):
-    """Install checked boundaries for named modules and their submodules.
+    """Enable function checking for named modules and their submodules.
 
     ``modules`` and ``exclude`` are dotted module names, not filesystem paths
     or arbitrary string prefixes. Exclusions take precedence within this hook.
@@ -52,6 +53,7 @@ def install_import_hook(
     (install strux[beartype]), and None establishes contexts without automatic
     checks. Returns a context manager with an idempotent uninstall() method.
 
+    Applies to subsequent imports and python -m execution of source modules.
     Installation is immediate. A context manager removes the hook on exit,
     including exceptional exits. It does not undo wrappers already installed.
     For overlapping strux hooks, the first installed matching hook wins.
@@ -126,10 +128,12 @@ class _Finder(MetaPathFinder):
 class _Loader(SourceFileLoader):
     def __init__(self, fullname, path, typechecker):
         super().__init__(fullname, path)
-        self.typechecker = typechecker
+        self._checked = functools.partial(checked, typechecker=typechecker)
 
-    def exec_module(self, module):
-        source = self.get_source(self.name)
+    def get_code(self, fullname):
+        # Both normal imports and runpy (python -m) request code here.
+        # Compile source directly so instrumented bytecode is never cached.
+        source = self.get_source(fullname)
         # A single underscore avoids class-name mangling. Choosing a name absent
         # from the source keeps the helper separate from user bindings.
         helper = "_strux_import_checked"
@@ -137,12 +141,28 @@ class _Loader(SourceFileLoader):
             helper += "_"
         tree = ast.parse(source, filename=self.path)
         tree = _Transformer(helper).visit(tree)
+        # Imports and runpy both supply __spec__. Bind the configured decorator
+        # inside the code object so execution does not depend on exec_module.
+        binding = ast.parse(f"{helper} = __spec__.loader._checked").body[0]
+        position = 0
+        if (
+            tree.body
+            and isinstance(tree.body[0], ast.Expr)
+            and isinstance(tree.body[0].value, ast.Constant)
+            and isinstance(tree.body[0].value.value, str)
+        ):
+            position = 1
+        while position < len(tree.body):
+            statement = tree.body[position]
+            if not (
+                isinstance(statement, ast.ImportFrom)
+                and statement.module == "__future__"
+            ):
+                break
+            position += 1
+        tree.body.insert(position, binding)
         ast.fix_missing_locations(tree)
-        module.__dict__[helper] = functools.partial(
-            checked, typechecker=self.typechecker
-        )
-        code = compile(tree, self.path, "exec", dont_inherit=True)
-        exec(code, module.__dict__)
+        return compile(tree, self.path, "exec", dont_inherit=True)
 
 
 def _no_type_check(node):

@@ -6,6 +6,48 @@ development (0.0.x) is untracked; see the git history.
 Release attributions refer to the changes described in each section, based
 on the commits' Co-Authored-By trailers.
 
+## 0.5.1 (2026-11-22)
+
+This release adds package-wide runtime checking, makes scalar annotation
+conventions consistent across struct fields and function boundaries, and fixes
+checker cache collisions between descriptions of distinct same-named classes.
+
+This release was developed by MFR and Codex (GPT-6 Astra).
+
+### Added
+
+* `strux.enable_checking(__name__)` enables checking from a package's
+  `__init__.py`, covering subsequently imported submodules and entry points
+  launched with `python -m`. Supports module exclusions, `@typing.no_type_check`
+  opt-outs, and the same checker backends as `@strux.checked`.
+* The README explains annotation conventions and package-owned checking.
+  Its executable examples are tested both with explicit decorators alone
+  and with automatic checking throughout.
+
+### Changed
+
+* Numeric value annotations (`bool`, `int`, `float`, and `complex`) accept
+  corresponding Python scalars, NumPy scalars, and zero-dimensional JAX or
+  NumPy arrays at checked function boundaries, including under JAX tracing.
+* Scalar shorthand applies uniformly inside unions and supported containers,
+  as well as to struct fields. This broadens scalar branches introduced by
+  jaxtyping's `ArrayLike` annotations; use concrete array types for strict
+  precision requirements. NumPy scalar acceptance follows the declared numeric
+  kind instead of accepting arbitrary `numpy.number` instances.
+* The development API `install_import_hook` is renamed to `enable_checking`.
+
+### Fixed
+
+* Function arguments, bodies, and returns share one checking scope under
+  automatic instrumentation. Explicit `@strux.checked` decorators override
+  automatic checking configuration without introducing duplicate scopes.
+* Distinct `Struct`, `Batch`, and `InstanceOf` descriptions have distinct
+  qualified names, preventing runtime-checker cache collisions even when
+  their class names or transformation display strings coincide.
+* Automatic checking covers entry-point functions in both
+  `python -m package.module` and `python -m package`, including when ordinary
+  bytecode caches already exist.
+
 ## 0.5.0 (2026-11-16)
 
 This release separates struct construction, annotation, and validation.

@@ -271,24 +271,22 @@ def _parse_hint(hint, context):
     # None (as a union arm or a bare annotation)
     if hint is None or hint is type(None):
         return _NoneSpec()
-    # unions (including Optional and jaxtyping-over-ArrayLike expansions);
-    # scalar classes as explicit union arms are plain scalar arms (the
-    # ArrayLike sugar below applies only to a bare scalar annotation)
+    # Unions compose the same value conventions as standalone annotations.
     if origin is typing.Union or isinstance(hint, types.UnionType):
+        arms = tuple(_parse_hint(arm, context) for arm in typing.get_args(hint))
+        # Scalar shorthand can introduce unions; retain a flat set of
+        # alternatives for structural operations such as serialisation.
         return _UnionSpec(
             arms=tuple(
-                (
-                    _PyScalarSpec(cls=arm)
-                    if arm in (bool, int, float, complex)
-                    else _parse_hint(arm, context)
-                )
-                for arm in typing.get_args(hint)
+                child
+                for arm in arms
+                for child in (arm.arms if isinstance(arm, _UnionSpec) else (arm,))
             ),
         )
     # jaxtyping array annotations
     if _is_jaxtype(hint):
         return _parse_jaxtype(hint, context)
-    # plain scalar annotations are sugar for jaxtyping over ArrayLike
+    # Plain scalar annotations also accept scalar arrays of the matching kind.
     if hint in (bool, int, float, complex):
         return _scalar_spec(hint)
     # containers of specs
@@ -407,14 +405,29 @@ _SCALAR_DTYPE_CLASSNAMES = {
     complex: "Complex",
 }
 
+_SCALAR_NUMPY_CLASSES = {
+    bool: np.bool_,
+    int: np.signedinteger,
+    float: np.floating,
+    complex: np.complexfloating,
+}
+
+
+def _scalar_annotation(scalar_cls):
+    """The scalar-value contract shared by fields and function boundaries."""
+    dtype_cls = getattr(jaxtyping, _SCALAR_DTYPE_CLASSNAMES[scalar_cls])
+    return (
+        dtype_cls[jax.Array | np.ndarray, ""]
+        | scalar_cls
+        | _SCALAR_NUMPY_CLASSES[scalar_cls]
+    )
+
 
 @functools.lru_cache(maxsize=None)
 def _scalar_spec(scalar_cls):
-    # a plain scalar annotation is sugar for the corresponding
-    # jaxtyping-over-ArrayLike union: the python scalar itself, or an
-    # array (of any batch shape) of the matching dtype kind
-    dtype_cls = getattr(jaxtyping, _SCALAR_DTYPE_CLASSNAMES[scalar_cls])
-    hint = dtype_cls[jax.typing.ArrayLike, ""]
+    # Compile the generated scalar arms directly: parsing them through
+    # _parse_hint would expand the Python scalar shorthand again.
+    hint = _scalar_annotation(scalar_cls)
     context = f"scalar {scalar_cls.__name__}"
     arms = tuple(
         _parse_jaxtype(arm, context) if _is_jaxtype(arm) else _PyScalarSpec(cls=arm)

@@ -20,7 +20,7 @@ from strux.annotate import (
     check,
 )
 from strux.checking import checked
-from strux.import_hook import install_import_hook
+from strux.import_hook import enable_checking
 
 if typing.TYPE_CHECKING:
     # Both forms are typing.Annotated to static checkers (import-as, since
@@ -61,7 +61,7 @@ __all__ = [
     "Batch",
     "check",
     "checked",
-    "install_import_hook",
+    "enable_checking",
     "InstanceOf",
     "as_batch",
     "Struct",

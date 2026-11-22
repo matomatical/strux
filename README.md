@@ -35,9 +35,13 @@ Contents:
   - [Batching as an annotation transformation](#batching-as-an-annotation-transformation)
   - [Inserting structs at leaves](#inserting-structs-at-leaves)
   - [Composing annotations](#composing-annotations)
+- [Summary of non-standard annotation conventions](#summary-of-non-standard-annotation-conventions)
+  - [Structure classes](#structure-classes)
+  - [Python scalars](#python-scalars)
 - [Type-checking](#type-checking)
   - [Checking an instance](#checking-an-instance)
   - [Checking a function](#checking-a-function)
+  - [Checking a package](#checking-a-package)
   - [Static type checking](#static-type-checking)
 - [Serialisation](#serialisation)
   - [Saving structs to disk](#saving-structs-to-disk)
@@ -1101,6 +1105,83 @@ EnsembleHistory1 = Struct[MLP, "members", "time"]
 EnsembleHistory2 = Struct[MLP, "time members"]
 ```
 
+Summary of non-standard annotation conventions
+----------------------------------------------
+
+Strux adopts the following conventions regarding the interpretation of
+annotations. When using annotations as documentation, these are merely
+conventions. However, when using runtime type checking, strux enforces the
+following interpretations. (Support during static type checking is limited.)
+
+### Structure classes
+
+Strux interprets a plain struct class name such as `Particle` as
+`Struct[Particle, ""]`: one instance with fields matching its declared
+annotations.
+
+This differs from Python's conventional interpretation of a class name like
+`Particle` used as an annotation. Such an annotation would usually suggest only
+that the object is an instance of the class (or perhaps also that its fields
+are instances of their annotated classes, depending on the exact type checker).
+In particular, this would not impose any constraints on the shapes or dtypes of
+arrays. An instance of `Particle` could have batched arrays, arrays with
+different data types, or potentially even non-arrays for field values.
+Sometimes this broader polymorphic type is useful to annotate. In which case,
+use `strux.InstanceOf`, as in `InstanceOf[Particle]`.
+
+### Python scalars
+
+An ordinary `isinstance` check against `bool`, `int`, `float`, or `complex`
+requires an instance of that builtin class.
+
+However, during array programming, it's convenient to use these types as
+shorthands for any scalar of that type, encompassing both these builtin
+instances and also:
+
+* zero-dimensional JAX arrays of a corresponding dtype,
+* zero-dimensional NumPy arrays of a corresponding dtype, and
+* NumPy scalars of the corresponding kind.
+
+Therefore, strux adopts this broader interpretation of the builtin numeric type
+annotations by convention. For example, inside value annotations, including
+within unions and supported containers, strux interprets `float` as the
+following union:
+
+```python
+import numpy as np
+
+FloatingScalar = Float[jax.Array | np.ndarray, ""] | float | np.floating
+```
+
+Note that we don't literally apply this expansion to `float` on the RHS. That
+one has the usual Python meaning. We could alternatively annotate the Python
+meaning as `InstanceOf[float]`.
+
+Note also that we impose no precision restriction (for precision restrictions,
+use more specific type annotations, like `Float32[Array, ""]`).
+
+> ### Comparison to `jaxtyping.ArrayLike`
+>
+> Strux's interpretation of Python's numeric types is similar to the use of
+> jaxtyping's `ArrayLike` union. However, `ArrayLike` is actually more
+> expansive, for example `Float[ArrayLike, ""]` includes `np.number`, and
+> therefore allows NumPy's integer scalars, whereas strux interprets `float` to
+> exclude integers.
+
+> ### Interaction with `jaxtyping.ArrayLike`
+>
+> Moreover, strux's interpretation of scalars includes expanding the builtin
+> types arising in the union that jaxtyping uses for `ArrayLike`. When used
+> with imprecise types, as in `Float[ArrayLike, ""]`, this doesn't add anything
+> that wasn't already included by `ArrayLike`. However, beware that when used
+> with precise types, as in `Float32[ArrayLike, ""]`, the expansion includes
+> `Float[Array, ""]`, weakening the precision constraint.
+>
+> I wouldn't recommend using `Float32[ArrayLike, ""]` anyway, since this already
+> allows arbitrary NumPy numeric scalars with no precision constraint. If you want to
+> annotate "32-bit floats, but they don't have to be JAX values already" I
+> recommend `Float32[jax.Array | np.ndarray, ""] | np.float32`.
+
 Type-checking
 -------------
 
@@ -1237,6 +1318,59 @@ array annotations.
 
 When `jax.jit` wraps a function, checks on internal function boundaries occur
 at trace time only, rather than on every invocation.
+
+### Checking a package
+
+When developing a package, we can enable runtime checking throughout it with
+`strux.enable_checking`. This effectively applies `strux.checked` to its
+functions and methods automatically, without decorating each definition
+individually. Automatic checking uses the same annotation conventions and
+optional `strux[beartype]` dependency as `@strux.checked`.
+
+For example, suppose our network definitions live in `package/networks.py`.
+We can enable checking by adding the following at the top of the package's
+`package/__init__.py`, before importing any of its other modules:
+
+<!--code:illustrative-->
+```python
+# package/__init__.py
+import strux
+
+strux.enable_checking(__name__)
+```
+
+Here, `__name__` is the package's name, `"package"`. All ordinary functions and
+methods defined in submodules that are subsequently imported are checked.
+Specifically:
+
+* Submodules already imported, or definitions in the `__init__.py` file that is
+  currently executing, are not marked checked.
+* Assuming for example that the `networks` module defines `.init` and
+  `.forward` methods as in our readme example above, these are marked checked.
+* Checks are applied inside existing `jax.jit` decorators, so they run during
+  tracing.
+* Constructors and constructor hooks (`__init__`, `__new__`, and
+  `__post_init__`) are not automatically checked.
+* Generated struct methods, including `.replace`, remain unchecked.
+* Async functions and generators are not checked (these are unsupported even
+  for `@strux.checked`).
+* To leave part of a package unchecked, pass its module name with the `exclude`
+  argument, for example `exclude=("package.vendor",)`. An exclusion also covers
+  that module's submodules.
+
+Ordinary functions and methods that aren't automatically included can still be
+explicitly decorated with `@strux.checked`. Conversely, individual functions or
+classes can opt out using `@typing.no_type_check`.
+
+Once enabled, checks apply to calls both within the package and from outside
+it. This also covers entry-point functions when running `python -m package`
+or `python -m package.submodule`.
+
+Unfortunately, running a file directly, as in `python package/submodule.py`,
+does not initialise its containing package and cannot enable checking for
+`submodule.py`. However, subsequent imports such as `import package.networks`
+from within `submodule.py` would be checked as these give `__init__.py` a
+chance to enable checking.
 
 ### Static type checking
 
@@ -1525,12 +1659,10 @@ Other
 Features we implemented already but I haven't gotten around to documenting
 properly:
 
-* The `InstanceOf[S]` annotation if you want `.check` or `@strux.checked` to
-  check only `isinstance(value, S)`, without checking the fields.
 * `Map` callbacks that change a leaf's dtype while preserving its shape, or
   change its shape while preserving its dtype.
-* Struct fields containing lists, tuples, dictionaries, optional values, or
-  batches of other structs.
+* Struct fields containing lists, tuples, dictionaries, optional values,
+  unions, or batches of other structs.
 * Checking methods with `Self` annotations, choosing a backend with
   `@strux.checked(typechecker=...)`, and disabling automatic checks with
   `typechecker=None`.
@@ -1544,5 +1676,3 @@ properly:
 Possible future additions:
 
 * Dedicated shape and dtype transformation helpers.
-* An import hook for enabling `strux.checked` across a codebase, like in
-  jaxtyping.

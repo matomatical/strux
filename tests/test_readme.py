@@ -1,5 +1,5 @@
 """
-Execute the README's Python blocks in order, in one shared namespace, and
+Import the README's Python blocks in order, in one shared namespace, and
 compare their stdout with adjacent console blocks or blocks introduced by
 ``Output:`` lines.
 Run the examples in a subprocess with a time limit so an integration hang
@@ -7,21 +7,32 @@ fails with block locations and a traceback instead of stalling pytest.
 
 An output block preceded by an ``<!--output:illustrative-->`` comment is
 not compared (used for outputs that cannot be deterministic, such as ones
-containing temporary paths).
+containing temporary paths). ``<!--code:illustrative-->`` excludes a code
+block describing setup in a separate file. Executed blocks are assembled
+into a source module so the public import hook can instrument them.
 """
 
 import contextlib
 import faulthandler
+import importlib
 import io
 import pathlib
 import re
 import subprocess
 import sys
+import tempfile
+import traceback
+import types
+
+import pytest
+
+import strux
 
 README = pathlib.Path(__file__).parent.parent / "README.md"
 
 _FENCE = re.compile(r"(\s*)(`{3,})(\w*)\s*$")
 _ILLUSTRATIVE = "<!--output:illustrative-->"
+_ILLUSTRATIVE_CODE = "<!--code:illustrative-->"
 
 
 def _parse(lines):
@@ -52,8 +63,10 @@ def _parse(lines):
         i += 1
         text = "\n".join(content)
         if syntax == "python":
-            events.append(("code", start_line, text))
-            pending_code = True
+            illustrative = any(_ILLUSTRATIVE_CODE in line for line in prose)
+            if not illustrative:
+                events.append(("code", start_line, text))
+            pending_code = not illustrative
         else:
             labelled = any("Output:" in line for line in prose)
             adjacent = syntax == "console" and not "".join(prose).strip()
@@ -65,37 +78,77 @@ def _parse(lines):
     return events
 
 
-def _run_examples(readme):
-    events = _parse(readme.read_text().splitlines())
-    namespace = {"__name__": "__main__"}
-    captured = None
+def _run_examples(readme, *, checking=True):
+    lines = readme.read_text().splitlines()
+    events = _parse(lines)
+    expected = {}
     code_line = None
-    mismatches = []
     for kind, lineno, text in events:
         if kind == "code":
-            print(f"Executing {readme}:{lineno}", file=sys.stderr, flush=True)
-            with contextlib.redirect_stdout(io.StringIO()) as buffer:
-                source = "\n" * (lineno - 1) + text
-                exec(compile(source, str(readme), "exec"), namespace)
-            captured = buffer.getvalue()
             code_line = lineno
-        elif captured is not None:
-            if captured.rstrip("\n") != text.rstrip("\n"):
+        else:
+            expected[code_line] = lineno, text
+
+    mismatches = []
+
+    @contextlib.contextmanager
+    def block(lineno):
+        print(f"Executing {readme}:{lineno}", file=sys.stderr, flush=True)
+        with contextlib.redirect_stdout(io.StringIO()) as buffer:
+            yield
+        if lineno in expected:
+            output_line, text = expected[lineno]
+            actual = buffer.getvalue()
+            if actual.rstrip("\n") != text.rstrip("\n"):
                 message = (
-                    f"{readme}:{lineno} output mismatch (code at "
-                    f"line {code_line}):\nshown:\n{text}\nactual:\n"
-                    f"{captured}"
+                    f"{readme}:{output_line} output mismatch (code at "
+                    f"line {lineno}):\nshown:\n{text}\nactual:\n{actual}"
                 )
                 mismatches.append(message)
                 print(message, file=sys.stderr, flush=True)
-            captured = None
+
+    support_name = "_strux_readme_harness"
+    support = types.ModuleType(support_name)
+    support.block = block
+    source = [""] * len(lines)
+    for kind, lineno, text in events:
+        if kind == "code":
+            # A with block preserves module scope and the README's line numbers.
+            source[lineno - 2] = f"with __import__({support_name!r}).block({lineno}):"
+            if not text.strip():
+                source[lineno - 2] += " pass"
+            for offset, line in enumerate(text.splitlines()):
+                source[lineno - 1 + offset] = "    " + line
+
+    with tempfile.TemporaryDirectory(prefix="strux-readme-") as directory:
+        module_path = pathlib.Path(directory, "__main__.py")
+        module_path.write_text("\n".join(source) + "\n")
+        previous_main = sys.modules.pop("__main__", None)
+        sys.modules[support_name] = support
+        sys.path.insert(0, directory)
+        hook = (
+            strux.enable_checking("__main__") if checking else contextlib.nullcontext()
+        )
+        try:
+            with hook:
+                importlib.import_module("__main__")
+        except BaseException:
+            diagnostic = traceback.format_exc().replace(str(module_path), str(readme))
+            print(diagnostic, file=sys.stderr)
+            raise SystemExit(1) from None
+        finally:
+            sys.path.remove(directory)
+            sys.modules.pop(support_name, None)
+            sys.modules.pop("__main__", None)
+            if previous_main is not None:
+                sys.modules["__main__"] = previous_main
     assert not mismatches, (
         f"{len(mismatches)} README output(s) do not match what the code "
         "prints:\n\n" + "\n---\n".join(mismatches)
     )
 
 
-def _check_readme(readme, *, timeout=60):
+def _check_readme(readme, *, timeout=60, checking=True):
     try:
         result = subprocess.run(
             [
@@ -103,6 +156,7 @@ def _check_readme(readme, *, timeout=60):
                 str(pathlib.Path(__file__).resolve()),
                 str(readme),
                 str(timeout),
+                str(int(checking)),
             ],
             capture_output=True,
             text=True,
@@ -119,13 +173,14 @@ def _check_readme(readme, *, timeout=60):
         )
 
 
-def test_readme_outputs():
-    _check_readme(README)
+@pytest.mark.parametrize("checking", [False, True], ids=["explicit", "import-hook"])
+def test_readme_outputs(checking):
+    _check_readme(README, checking=checking)
 
 
 if __name__ == "__main__":
     faulthandler.dump_traceback_later(float(sys.argv[2]) * 0.8)
     try:
-        _run_examples(pathlib.Path(sys.argv[1]))
+        _run_examples(pathlib.Path(sys.argv[1]), checking=bool(int(sys.argv[3])))
     finally:
         faulthandler.cancel_dump_traceback_later()

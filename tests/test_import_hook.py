@@ -5,6 +5,8 @@ import importlib
 import inspect
 from pathlib import Path
 import py_compile
+import runpy
+import subprocess
 import sys
 import textwrap
 import uuid
@@ -55,7 +57,7 @@ def checked_module(request, source_modules):
         name = prefix + ".example"
         write(name, source)
         context = (
-            strux.install_import_hook(prefix)
+            strux.enable_checking(prefix)
             if request.param == "hook"
             else contextlib.nullcontext()
         )
@@ -334,7 +336,7 @@ def test_hook_skips_constructors_unsupported_functions_and_opt_outs(source_modul
                 return value
     """,
     )
-    with strux.install_import_hook(prefix):
+    with strux.enable_checking(prefix):
         module = importlib.import_module(name)
     assert module.Item("wrong").replace(value="also wrong").value == "also wrong"
     assert module.Custom("wrong").value == "wrong"
@@ -368,7 +370,7 @@ def test_hook_scope_removal_existing_imports_and_bytecode(source_modules):
     bytecode = Path(py_compile.compile(str(paths[names[1]]), doraise=True))
     cached = bytecode.read_bytes()
     with pytest.raises(RuntimeError, match="exit"):
-        with strux.install_import_hook(prefix, exclude=names[2]) as hook:
+        with strux.enable_checking(prefix, exclude=names[2]) as hook:
             during, excluded, unrelated = (
                 importlib.import_module(name) for name in (names[1], names[2], names[4])
             )
@@ -411,7 +413,7 @@ def test_explicit_checker_overrides_hook_without_duplicate_contexts(
             return value
     """,
     )
-    with strux.install_import_hook(prefix):
+    with strux.enable_checking(prefix):
         module = importlib.import_module(name)
     assert module.unchecked("wrong") == "wrong"
     assert not hasattr(module.body.__wrapped__, "__wrapped__")
@@ -439,7 +441,7 @@ def test_hook_context_only_backend(source_modules):
             assert isinstance(jnp.ones(3), Float[Array, "n"])
     """,
     )
-    with strux.install_import_hook(prefix, typechecker=None):
+    with strux.enable_checking(prefix, typechecker=None):
         module = importlib.import_module(name)
     assert module.identity(2) == 2
     assert module.identity(3) == 3
@@ -450,9 +452,167 @@ def test_hook_context_only_backend(source_modules):
 @pytest.mark.parametrize("modules", [[], "", "pkg/child", ["pkg", 42]])
 def test_invalid_module_selection(modules):
     with pytest.raises(ValueError):
-        strux.install_import_hook(modules)
+        strux.enable_checking(modules)
 
 
 def test_invalid_backend():
     with pytest.raises(TypeError, match="typechecker"):
-        strux.install_import_hook("example", typechecker="strux.checked")
+        strux.enable_checking("example", typechecker="strux.checked")
+
+
+def test_package_can_enable_checking_in_its_initializer(source_modules):
+    prefix, write = source_modules
+    write(
+        prefix + ".__init__",
+        """
+        import strux
+        hook = strux.enable_checking(__name__)
+
+        def initializer_function(value: int):
+            return value
+    """,
+    )
+    write(
+        prefix + ".networks",
+        """
+        def identity(value: int) -> int:
+            return value
+    """,
+    )
+    package = importlib.import_module(prefix)
+    try:
+        module = importlib.import_module(prefix + ".networks")
+        assert module.identity(1) == 1
+        with pytest.raises(TypeCheckError):
+            module.identity("wrong")
+        # Installing a hook does not change the module already executing it.
+        assert package.initializer_function("wrong") == "wrong"
+    finally:
+        package.hook.uninstall()
+
+
+@pytest.mark.parametrize("entrypoint", ["cli", "__main__"])
+@pytest.mark.parametrize("cached", [False, True])
+def test_package_entrypoints_are_checked(source_modules, entrypoint, cached):
+    prefix, write = source_modules
+    write(
+        prefix + ".__init__",
+        """
+        import strux
+        strux.enable_checking(__name__, exclude=__name__ + '.excluded')
+        """,
+    )
+    write(prefix + ".worker", "def identity(value: int) -> int: return value\n")
+    write(prefix + ".excluded", "def identity(value: int) -> int: return value\n")
+    path = write(
+        prefix + "." + entrypoint,
+        '''
+        """Checked package entrypoint."""
+        from __future__ import annotations
+        from typing import no_type_check
+        import jax
+        import jax.numpy as jnp
+        from jaxtyping import TypeCheckError
+        from . import excluded, worker
+
+        _strux_import_checked = "user binding"
+
+        def identity(value: int) -> int:
+            return value
+
+        def wrong_return() -> int:
+            return "wrong"
+
+        @jax.jit
+        def compiled(value: int) -> int:
+            return value
+
+        @no_type_check
+        def unchecked(value: int) -> int:
+            return value
+
+        if __name__ == "__main__":
+            assert __doc__ == "Checked package entrypoint."
+            assert __spec__.name == __package__ + "." + ENTRYPOINT
+            assert _strux_import_checked == "user binding"
+            assert identity(1) == 1
+            assert compiled(jnp.array(1)) == 1
+            assert unchecked("wrong") == "wrong"
+            assert excluded.identity("wrong") == "wrong"
+            for function, args in (
+                (identity, ("wrong",)),
+                (wrong_return, ()),
+                (worker.identity, ("wrong",)),
+                (compiled, (jnp.array(1.5),)),
+            ):
+                try:
+                    function(*args)
+                except TypeCheckError:
+                    pass
+                else:
+                    raise AssertionError(f"{function.__name__} was not checked")
+            print("checked entrypoint")
+        '''.replace("ENTRYPOINT", repr(entrypoint)),
+    )
+    bytecode = Path(importlib.util.cache_from_source(str(path)))
+    if cached:
+        py_compile.compile(str(path), doraise=True)
+    original_bytecode = bytecode.read_bytes() if cached else None
+    module = prefix if entrypoint == "__main__" else prefix + ".cli"
+    result = subprocess.run(
+        [sys.executable, "-m", module],
+        cwd=path.parent.parent,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout == "checked entrypoint\n"
+    if cached:
+        assert bytecode.read_bytes() == original_bytecode
+    else:
+        assert not bytecode.exists()
+
+
+@pytest.mark.parametrize("custom_backend", [False, True])
+def test_run_module_retains_configured_backend(source_modules, custom_backend):
+    prefix, write = source_modules
+    name = prefix + ".configured"
+    write(name, "def identity(value: int) -> int: return value\n")
+    checked_functions = []
+
+    def typechecker(function):
+        checked_functions.append(function.__name__)
+        return function
+
+    with strux.enable_checking(
+        prefix, typechecker=typechecker if custom_backend else None
+    ):
+        namespace = runpy.run_module(name, run_name="__main__", alter_sys=True)
+    # The backend is retained even when the module's functions are called
+    # after the checking context exits and runpy restores __main__.
+    assert namespace["identity"]("wrong") == "wrong"
+    assert bool(checked_functions) == custom_backend
+
+
+def test_direct_file_execution_does_not_initialize_package(source_modules):
+    prefix, write = source_modules
+    write(prefix + ".__init__", "raise AssertionError('package was imported')\n")
+    path = write(
+        prefix + ".cli",
+        """
+        def identity(value: int) -> int:
+            return value
+        assert identity("wrong") == "wrong"
+        print("direct file")
+        """,
+    )
+    result = subprocess.run(
+        [sys.executable, str(path)],
+        cwd=path.parent.parent,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout == "direct file\n"

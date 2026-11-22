@@ -1,5 +1,6 @@
 """Function-boundary checking with recursive strux class annotations."""
 
+import collections.abc
 import dataclasses
 import functools
 import inspect
@@ -9,9 +10,33 @@ import typing
 import jaxtyping
 
 from strux.annotate import Struct, _DescriptionMeta, _InstanceAnnotationMeta
+from strux.schema import _scalar_annotation
 
 _DEFAULT = object()
 _Function = typing.TypeVar("_Function", bound=typing.Callable)
+
+# These arguments describe values, rather than a user-defined generic's
+# nominal type parameters. Class-object annotations are handled separately.
+_VALUE_ARGUMENT_ORIGINS = {
+    typing.Annotated,
+    typing.Union,
+    types.UnionType,
+    list,
+    tuple,
+    dict,
+    set,
+    frozenset,
+    collections.abc.Callable,
+    collections.abc.Collection,
+    collections.abc.Iterable,
+    collections.abc.Iterator,
+    collections.abc.Sequence,
+    collections.abc.MutableSequence,
+    collections.abc.Mapping,
+    collections.abc.MutableMapping,
+    collections.abc.Set,
+    collections.abc.MutableSet,
+}
 
 
 @typing.overload
@@ -28,6 +53,14 @@ def checked(fn=None, *, typechecker=_DEFAULT):
     Plain strux classes request their declared fields recursively. Struct
     and Batch descriptions keep their explicit transformations; InstanceOf
     requests only class membership. Constructors and replace are unaffected.
+    Scalar value annotations bool, int, float and complex accept matching
+    Python and NumPy scalars or zero-dimensional arrays, including JAX tracers,
+    using the same scalar convention as struct fields, including inside unions
+    and containers. InstanceOf requests a strict Python instance check.
+    Class objects and nominal generic type arguments
+    retain their scalar class annotations. Scalar branches introduced by
+    jaxtyping ArrayLike annotations expand too; use concrete array types to
+    require a particular dtype.
 
     Beartype is the default backend, installed with ``strux[beartype]``.
     Supply another jaxtyping-compatible decorator with ``typechecker=...``,
@@ -178,11 +211,11 @@ def _receiver_class(fn, args, kwargs):
     return None
 
 
-def _translate(hint, receiver, aliases=()):
+def _translate(hint, receiver, aliases=(), *, scalar_values=True):
     """Translate instance annotations while retaining class objects and metadata."""
 
     def translate(child):
-        return _translate(child, receiver, aliases)
+        return _translate(child, receiver, aliases, scalar_values=scalar_values)
 
     if hint is typing.Self:
         if receiver is None:
@@ -192,6 +225,8 @@ def _translate(hint, receiver, aliases=()):
         return translate(receiver)
     if isinstance(hint, (_DescriptionMeta, _InstanceAnnotationMeta)):
         return hint
+    if scalar_values and hint in (bool, int, float, complex):
+        return _scalar_annotation(hint)
     origin = typing.get_origin(hint)
     alias = origin or hint
     if isinstance(alias, typing.TypeAliasType):
@@ -205,7 +240,9 @@ def _translate(hint, receiver, aliases=()):
             return _map_arguments(child, substitute)
 
         expanded = substitute(alias.__value__)
-        return _translate(expanded, receiver, (*aliases, alias))
+        return _translate(
+            expanded, receiver, (*aliases, alias), scalar_values=scalar_values
+        )
     if isinstance(hint, typing.TypeVar):
         bound = hint.__bound__
         constraints = hint.__constraints__
@@ -237,7 +274,15 @@ def _translate(hint, receiver, aliases=()):
         and hasattr(target, "_data_fields")
     ):
         return Struct[hint, ""]
-    return _map_arguments(hint, translate)
+    return _map_arguments(
+        hint,
+        lambda child: _translate(
+            child,
+            receiver,
+            aliases,
+            scalar_values=scalar_values and origin in _VALUE_ARGUMENT_ORIGINS,
+        ),
+    )
 
 
 def _map_arguments(hint, transform):
